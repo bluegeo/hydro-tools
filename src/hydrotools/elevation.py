@@ -171,6 +171,7 @@ def z_align(
 
             delta = from_raster(delta_dst)
 
+            # TODO: During resampling, some fill area may end up as no data
         else:
             delta = interp(delta, fill_area)
 

@@ -50,16 +50,10 @@ def warp(
         csy = csx
 
     cmd = (
-        ["gdalwarp", "-te"] + []
-        if bounds is None
-        else list(map(str, bounds)) + []
-        if csx is None
-        else ["-tr", str(csx), str(csy)] + []
-        if t_srs is None
-        else [
-            "-t_srs",
-            t_srs,
-        ]
+        ["gdalwarp"]
+        + ([] if bounds is None else ["-te"] + list(map(str, bounds)))
+        + ([] if csx is None else ["-tr", str(csx), str(csy)])
+        + ([] if t_srs is None else ["-t_srs", t_srs])
         + [
             "-r",
             resample_method,
@@ -429,8 +423,6 @@ def from_raster(src: Union[Raster, str], chunks: tuple = CHUNKS) -> da.Array:
     Returns:
         (da.Array): Masked dask array in the shape (bands, rows, cols)
     """
-    print(chunks)
-
     if not isinstance(src, Raster):
         src = Raster(src)
 

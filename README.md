@@ -10,6 +10,12 @@ libraries into single abstractions. Libraries include:
 - scipy
 - dask
 
+## Installation
+
+1. Install GDAL with the python bindings (conda is recommended)
+2. Install [GRASS GIS](https://grass.osgeo.org/download/)
+3. Install the hydrotools and its dependencies using `pip install .` from the project root.
+
 ## Usage notes
 
 Most raster operations allow any GDAL-supported format as an input, but the format of
