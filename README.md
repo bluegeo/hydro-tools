@@ -18,8 +18,10 @@ libraries into single abstractions. Libraries include:
 
 ## Usage notes
 
-Most raster operations allow any GDAL-supported format as an input, but the format of
-ouput datasets is limited to Cloud-Optimized GeoTiffs.
+* Most raster operations allow any GDAL-supported format as an input, but the format of
+output datasets is limited to Cloud-Optimized GeoTiffs.
+* Most vector operations allow any OGR-supported format as an input, but the format of
+output datasets is limited to the geopackage format.
 
 ## Examples
 
@@ -28,7 +30,7 @@ ouput datasets is limited to Cloud-Optimized GeoTiffs.
 ```python
 from hydrotools.watershed import auto_basin
 
-# A Digital Elevation Model in a project coordinate system (m)
+# A Digital Elevation Model in a projected coordinate system (m)
 dem = "/data/dem.tif"
 output_basins = "/data/basins.tif"
 
@@ -92,7 +94,7 @@ to_raster(a, output_flow_accumulation, output_streams)
 
 ## Configuration
 
-Most constants referenced by the library are hosted in the `config` module.
+Most constants referenced by the library are hosted in the `config` module. These constants can be mutated in any transitive modules at runtime or after they are imported.
 
 Defaults include:
 

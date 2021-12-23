@@ -20,7 +20,18 @@ warnings.filterwarnings("ignore")
 
 
 class GrassRunner(Session):
+    """Run GRASS GIS commands using the grass-session library and simplified
+    control over mapset and external dataset abstraction.
+    """
     def __init__(self, dataset: str):
+        """Initialize GRASS with a dataset. The dataset may be as simple as a spatial
+        reference, or a vector/raster dataset. When using vector -> raster commands
+        it is useful to initialize with a raster dataset, which will serve as the 
+        environment for all resulting data.
+
+        Args:
+            dataset (str): GRASS mapset initialization data.
+        """
         self.dataset = dataset
 
     def __enter__(self):
@@ -38,9 +49,15 @@ class GrassRunner(Session):
         """Run a grass command
 
         Args:
-            cmd (str): Grass command
-            args (tuple): Dataset and key pairs to read into the GRASS env
-            kwargs (dict): Arguments for the grass command
+            cmd (str): Grass command. Example `r.watershed`.
+            args (tuple): External data to use within the GRASS comand. This is a
+            3-tuple with the following form:
+                ("name", "/path/to/data...", "vector | raster").
+            The "name" attribute is used for GRASS inputs as kwargs, as described in the
+            documentation.
+            kwargs (dict): Arguments for the grass command, for example:
+                https://grass.osgeo.org/grass76/manuals/r.watershed.html
+
         """
         for dataset, key, _type in args:
             if _type.lower() == "vector":

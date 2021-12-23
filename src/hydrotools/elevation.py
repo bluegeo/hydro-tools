@@ -142,7 +142,7 @@ def z_align(
                 source,
                 csx=resample_interpolation,
                 csy=resample_interpolation,
-                add_overviews=False,
+                overviews=False,
             )
 
             # Fill area must be masked to reflect nodata, and changed from bool
@@ -158,7 +158,7 @@ def z_align(
                 source,
                 csx=resample_interpolation,
                 csy=resample_interpolation,
-                add_overviews=False,
+                overviews=False,
             )
 
             delta_a = interp(
@@ -167,7 +167,7 @@ def z_align(
 
             to_raster(delta_a, obs_dst, delta_tmp, overviews=False)
 
-            warp_like(delta_tmp, delta_dst, source, add_overviews=False)
+            warp_like(delta_tmp, delta_dst, source, overviews=False)
 
             delta = from_raster(delta_dst)
 

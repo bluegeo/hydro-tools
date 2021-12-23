@@ -23,7 +23,7 @@ def warp(
     t_srs: Union[None, str, int] = None,
     dtype: str = "Float32",
     resample_method: str = "cubicspline",
-    add_overviews: bool = False,
+    overviews: bool = False,
 ):
     """Warp a source or sources into a destination using a resolution and extent
 
@@ -36,7 +36,7 @@ def warp(
         t_srs (Union[str, int]): Target spatial reference. Defaults to None.
         dtype (str, optional): Target data type. Defaults to "Float32".
         resample_method (str, optional): Resample method. Defaults to "cubicspline".
-        add_overviews (bool, optional): Add overviews to destination. Defaults to False.
+        overviews (bool, optional): Add overviews to destination. Defaults to False.
     """
     # Ensure source is a list
     if not isinstance(source, (tuple, list)):
@@ -67,7 +67,7 @@ def warp(
 
     run(cmd, check=True)
 
-    if add_overviews:
+    if overviews:
         cmd = ["gdaladdo", destination]
         run(cmd, check=True)
 
@@ -77,7 +77,7 @@ def warp_like(
     destination: str,
     template: str,
     resample_method: str = "cubicspline",
-    add_overviews: bool = False,
+    overviews: bool = False,
     **kwargs,
 ):
     """Warp a raster into a destination using a template raster
@@ -106,7 +106,7 @@ def warp_like(
         kwargs.get("wkt", rs.wkt),
         kwargs.get("dtype", rs.dtype),
         resample_method,
-        add_overviews,
+        overviews,
     )
 
 
