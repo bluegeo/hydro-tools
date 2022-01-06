@@ -59,12 +59,16 @@ def auto_basin(dem: str, min_area: float, basin_dataset: str):
         min_area (float): Minimum basin area to constrain size
         basin_dataset (str): Output raster data containing labeled basins
     """
+    # Min Area needs to be converted to cells
+    r = Raster(dem)
+    min_area_cells = int(np.ceil(min_area / (r.csx * r.csy)))
+
     with GrassRunner(dem) as gr:
         gr.run_command(
             "r.watershed",
             (dem, "dem", "raster"),
             elevation="dem",
-            threshold=float(min_area),
+            threshold=min_area_cells,
             basin="b",
             flags="s",
         )

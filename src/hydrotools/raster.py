@@ -412,6 +412,17 @@ class Raster:
         yield ds
         ds.close()
 
+    def plot(self):
+        import matplotlib.pyplot as plt
+        from matplotlib.pyplot import figure
+
+        figure(figsize=(8, 6), dpi=80)
+
+        a = np.ma.masked_equal(np.squeeze(self[:]), self.nodata)
+
+        plt.imshow(a)
+        plt.show()
+
 
 def from_raster(src: Union[Raster, str], chunks: tuple = CHUNKS) -> da.Array:
     """Read a raster dataset into a dask array masked by the no data value
