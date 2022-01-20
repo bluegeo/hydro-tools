@@ -1,10 +1,11 @@
 from subprocess import run
-from typing import Union
+from typing import Union, overload
 
 import numpy as np
 import dask.array as da
 from scipy.ndimage import binary_erosion
 
+from hydrotools.utils import GrassRunner
 from hydrotools.raster import (
     TempRasterFile,
     from_raster,
@@ -62,6 +63,7 @@ def z_align(
     addition: str,
     destination: str,
     resample_interpolation: Union[float, None] = None,
+    **kwargs,
 ):
     """Merge rasters and align z-values using overlapping areas.
 
@@ -92,14 +94,13 @@ def z_align(
     # Area to be added - where the source has no data and the addition does
     fill_area = da.ma.getmaskarray(source_a) & ~da.ma.getmaskarray(addition_a)
 
-    def interp(obs: da.Array, pred: da.Array, n_neighbours: int = 10000) -> np.ndarray:
+    def interp(obs: da.Array, pred: da.Array, n_neighbours: int) -> np.ndarray:
         """Perform interpolation
 
         Args:
             obs (da.Array): Observed data
             pred (da.Array): Predicted points (must be boolean)
             n_neighbours (int): Number of neighbours to evaluate for IDW.
-            Defaults to 10000.
 
         Returns:
             np.ndarray
@@ -126,14 +127,7 @@ def z_align(
         )
 
     # Add interpolated deltas to the delta array
-    with (
-        TempRasterFile() as obs_tmp,
-        TempRasterFile() as pred_tmp,
-        TempRasterFile() as obs_dst,
-        TempRasterFile() as pred_dst,
-        TempRasterFile() as delta_tmp,
-        TempRasterFile() as delta_dst,
-    ):
+    with TempRasterFile() as obs_tmp, TempRasterFile() as pred_tmp, TempRasterFile() as obs_dst, TempRasterFile() as pred_dst, TempRasterFile() as delta_tmp, TempRasterFile() as delta_dst:
         if resample_interpolation is not None:
             to_raster(delta, source, obs_tmp, overviews=False)
             warp_like(
@@ -162,7 +156,9 @@ def z_align(
             )
 
             delta_a = interp(
-                from_raster(obs_dst), ~da.ma.getmaskarray(from_raster(pred_dst))
+                from_raster(obs_dst),
+                ~da.ma.getmaskarray(from_raster(pred_dst)),
+                kwargs.get("n_neighbours", 1000),
             )
 
             to_raster(delta_a, obs_dst, delta_tmp, overviews=False)
@@ -173,8 +169,69 @@ def z_align(
 
             # TODO: During resampling, some fill area may end up as no data
         else:
-            delta = interp(delta, fill_area)
+            delta = interp(
+                delta,
+                fill_area,
+                kwargs.get("n_neighbours", 1000),
+            )
 
         output = raster_where(~da.ma.getmaskarray(delta), addition_a + delta, source_a)
 
         to_raster(output, source, destination)
+
+
+def las_to_dtm(
+    las_path: str,
+    destination: str,
+    top: float,
+    bottom: float,
+    left: float,
+    right: float,
+    epsg: int,
+    csx: float,
+    csy: float,
+):
+    """Generate a Digital Terrain Model using a .las file. If data are provided in an
+    ascii format such as .xyz, they should be converted to .las. For example:
+
+    ```
+    txt2las -i lidar.xyz -o lidar.las
+    ```
+
+    Args:
+        las_path (str): [description]
+        destination (str): [description]
+        top (float): [description]
+        bottom (float): [description]
+        left (float): [description]
+        right (float): [description]
+        epsg (int): [description]
+        csx (float): [description]
+        csy (float): [description]
+    """
+    with GrassRunner(f"EPSG:{epsg}") as gs:
+        # Set the region
+        gs.run_command(
+            "g.region", n=top, s=bottom, w=left, e=right, nsres=csy, ewres=csx
+        )
+
+        # import
+        gs.run_command("v.in.lidar", input=las_path, output="points")
+
+        # detection
+        gs.run_command("v.lidar.edgedetection", input="points", output="edge")
+        gs.run_command(
+            "v.lidar.growing", input="edge", output="growing", first="points_first"
+        )
+        gs.run_command(
+            "v.lidar.correction",
+            input="growing",
+            output="correction",
+            terrain="only_terrain",
+        )
+
+        # interpolation
+        gs.run_command("v.surf.rst", input="only_terrain", elevation="terrain")
+
+        # save output
+        gs.save_raster("terrain", destination, overviews=True)

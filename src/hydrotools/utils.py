@@ -3,6 +3,7 @@ import shutil
 from tempfile import gettempdir
 from typing import List, Tuple, Union
 import warnings
+from subprocess import run
 
 import numpy as np
 import dask.array as da
@@ -23,10 +24,11 @@ class GrassRunner(Session):
     """Run GRASS GIS commands using the grass-session library and simplified
     control over mapset and external dataset abstraction.
     """
+
     def __init__(self, dataset: str):
         """Initialize GRASS with a dataset. The dataset may be as simple as a spatial
         reference, or a vector/raster dataset. When using vector -> raster commands
-        it is useful to initialize with a raster dataset, which will serve as the 
+        it is useful to initialize with a raster dataset, which will serve as the
         environment for all resulting data.
 
         Args:
@@ -52,7 +54,7 @@ class GrassRunner(Session):
             cmd (str): Grass command. Example `r.watershed`.
             args (tuple): External data to use within the GRASS comand. This is a
             3-tuple with the following form:
-                ("name", "/path/to/data...", "vector | raster").
+                ("name", "/path/to/data...", "vector | raster | None").
             The "name" attribute is used for GRASS inputs as kwargs, as described in the
             documentation.
             kwargs (dict): Arguments for the grass command, for example:
@@ -83,9 +85,19 @@ class GrassRunner(Session):
             dataset,
             format="GTiff",
             output=out_path,
-            createopt=["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=LZW", "BIGTIFF=YES"],
-            **kwargs
+            createopt=[
+                "TILED=YES",
+                "BLOCKXSIZE=512",
+                "BLOCKYSIZE=512",
+                "COMPRESS=LZW",
+                "BIGTIFF=YES",
+            ],
+            **kwargs,
         )
+
+        if kwargs.get("overviews", False):
+            cmd = ["gdaladdo", out_path]
+            run(cmd, check=True)
 
     def save_vector(self, dataset: str, out_path: str):
         """Save a dataset to a geopackage
@@ -100,6 +112,18 @@ class GrassRunner(Session):
         # Save to the output
         grass.run_command(
             "v.out.ogr", input=dataset, output=out_path, format="GPKG", overwrite=True
+        )
+
+
+def add_grass_extension(extension_name: str):
+    """Add a GRASS extension
+
+    Args:
+        extension_name (str): [description]
+    """
+    with GrassRunner("EPSG:4326") as gs:
+        grass.run_command(
+            "g.extension", extension=extension_name, operation="add"
         )
 
 
@@ -167,7 +191,9 @@ def indices_to_coords(
 
 
 def transform_points(
-    points: List[Tuple[float, float]], in_proj: Union[int, str], out_proj: Union[int, str]
+    points: List[Tuple[float, float]],
+    in_proj: Union[int, str],
+    out_proj: Union[int, str],
 ) -> List[Tuple[float, float]]:
     """Transform a list of points
 

@@ -1,6 +1,5 @@
 from typing import Union
 
-from dask_image.ndfilters import uniform_filter
 import dask.array as da
 
 from hydrotools.raster import (
@@ -24,6 +23,9 @@ def variance_filter(
         window (tuple): Variance filter kernel size. Defaults to (1, 3, 3).
         overviews (bool, optional): Build overviews. Defaults to True.
     """
+    # Optional dependency - only works with Python >= 3.9
+    from dask_image.ndfilters import uniform_filter
+
     a = from_raster(source, chunks=(1, 512, 512))
 
     # The ndimage library does not respect array masking.
