@@ -7,7 +7,7 @@ from scipy.ndimage import binary_erosion
 
 from hydrotools.utils import GrassRunner
 from hydrotools.raster import (
-    TempRasterFile,
+    TempRasterFiles,
     from_raster,
     raster_where,
     to_raster,
@@ -127,7 +127,15 @@ def z_align(
         )
 
     # Add interpolated deltas to the delta array
-    with TempRasterFile() as obs_tmp, TempRasterFile() as pred_tmp, TempRasterFile() as obs_dst, TempRasterFile() as pred_dst, TempRasterFile() as delta_tmp, TempRasterFile() as delta_dst:
+    with TempRasterFiles(7) as (
+        obs_tmp,
+        pred_tmp,
+        obs_dst,
+        pred_dst,
+        delta_interp,
+        delta_tmp,
+        delta_dst,
+    ):
         if resample_interpolation is not None:
             to_raster(delta, source, obs_tmp, overviews=False)
             warp_like(
@@ -161,13 +169,24 @@ def z_align(
                 kwargs.get("n_neighbours", 1000),
             )
 
-            to_raster(delta_a, obs_dst, delta_tmp, overviews=False)
+            to_raster(delta_a, obs_dst, delta_interp, overviews=False)
+
+            # Expand to ensure no gaps result from resampling
+            with GrassRunner(delta_interp) as gr:
+                gr.run_command(
+                    "r.fill.stats",
+                    (delta_interp, "r", "raster"),
+                    input="r",
+                    output="e",
+                    distance=2,
+                    flags="ks",
+                )
+                gr.save_raster("e", delta_tmp)
 
             warp_like(delta_tmp, delta_dst, source, overviews=False)
 
             delta = from_raster(delta_dst)
 
-            # TODO: During resampling, some fill area may end up as no data
         else:
             delta = interp(
                 delta,

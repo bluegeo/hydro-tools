@@ -54,7 +54,7 @@ class GrassRunner(Session):
             cmd (str): Grass command. Example `r.watershed`.
             args (tuple): External data to use within the GRASS comand. This is a
             3-tuple with the following form:
-                ("name", "/path/to/data...", "vector | raster | None").
+                ("/path/to/data...", "name", "vector | raster | None").
             The "name" attribute is used for GRASS inputs as kwargs, as described in the
             documentation.
             kwargs (dict): Arguments for the grass command, for example:
@@ -94,10 +94,6 @@ class GrassRunner(Session):
             ],
             **kwargs,
         )
-
-        if kwargs.get("overviews", False):
-            cmd = ["gdaladdo", out_path]
-            run(cmd, check=True)
 
     def save_vector(self, dataset: str, out_path: str):
         """Save a dataset to a geopackage

@@ -130,7 +130,10 @@ class PointInterpolator:
         """IDW interpolation"""
         n_neighbours = min(n_neighbours, self.obs_z.size)
 
-        knn = KNeighborsRegressor(n_neighbors=n_neighbours, weights="distance").fit(
+        def idw_callable(distance):
+            return 1 / (distance ** 2)
+
+        knn = KNeighborsRegressor(n_neighbors=n_neighbours, weights=idw_callable).fit(
             self.obs, self.obs_z
         )
 

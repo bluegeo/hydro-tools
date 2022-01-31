@@ -58,7 +58,7 @@ def warp(
             "-r",
             resample_method,
             "-ot",
-            dtype,
+            "Byte" if dtype == "uint8" else dtype,
         ]
         + GDAL_DEFAULT_ARGS
         + source
@@ -103,7 +103,7 @@ def warp_like(
         ),
         kwargs.get("csx", rs.csx),
         kwargs.get("csy", rs.csy),
-        kwargs.get("wkt", rs.wkt),
+        rs.wkt,
         kwargs.get("dtype", rs.dtype),
         resample_method,
         overviews,
@@ -513,3 +513,19 @@ class TempRasterFile:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if os.path.isfile(self.path):
             os.remove(self.path)
+
+
+class TempRasterFiles:
+    def __init__(self, num):
+        self.paths = [
+            os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
+            for _ in range(num)
+        ]
+
+    def __enter__(self):
+        return self.paths
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for path in self.paths:
+            if os.path.isfile(path):
+                os.remove(path)
