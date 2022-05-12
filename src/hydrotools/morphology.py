@@ -1,6 +1,12 @@
 from typing import Union
+from collections import OrderedDict
+from multiprocessing import cpu_count
+from multiprocessing.dummy import Pool
 
+import fiona
+from shapely.geometry import LineString, Point
 import dask.array as da
+import numpy as np
 
 from hydrotools.raster import (
     Raster,
@@ -12,33 +18,95 @@ from hydrotools.raster import (
 from hydrotools.utils import GrassRunner
 
 
-def variance_filter(
-    source: str, destination: str, window: tuple = (1, 3, 3), overviews: bool = True
+def sinuosity(
+    stream_vector: str, sinuosity_vector: str, sampling: Union[float, str] = 100
 ):
-    """Perform a variance filter
+    """Calculate sinuosity over a moving window using a line vector file
 
     Args:
-        source (str): Source Raster used to perform variance filter.
-        destination (str): Destination Raster for variance output.
-        window (tuple): Variance filter kernel size. Defaults to (1, 3, 3).
-        overviews (bool, optional): Build overviews. Defaults to True.
+        stream_vector (str): Input stream vector dataset.
+        Must jave a LineString or MultiLineString geometry
+        sinuosity_vector (str): Output vector dataset
+        sampling (Union[float, str], optional): A sinuosity sampling distance.
+        Should be one of either: a) A regular distance along streams, or b) "reach"
+        indicating that each feature is used in its entirety. Defaults to 100.
+
+    Raises:
+        ValueError: If the input vector is not a line
     """
-    # Optional dependency - only works with Python >= 3.9
-    from dask_image.ndfilters import uniform_filter
+    sampling = sampling.lower() if isinstance(sampling, str) else float(sampling)
 
-    a = from_raster(source, chunks=(1, 512, 512))
+    if sampling == "reach":
+        raise NotImplementedError("Not developed yet")
 
-    # The ndimage library does not respect array masking.
-    # The mask is changed to 0, which will yield incorrect values on the edges.
-    da.ma.set_fill_value(a, 0)
-    a_filled = da.ma.filled(a)
-    win_mean = uniform_filter(a_filled, window)
-    win_sqr_mean = uniform_filter(a_filled**2, window)
-    win_var = win_sqr_mean - win_mean**2
+    def apply(collection):
+        geom = collection["geometry"]
 
-    win_var = da.ma.masked_where(da.ma.getmaskarray(a), win_var)
+        if geom["type"] == "MultiLineString":
+            geoms = geom["coordinates"]
+        elif geom["type"] == "LineString":
+            geoms = [geom["coordinates"]]
+        else:
+            raise ValueError("Geometry must be of type MultiLineString or LineString")
 
-    to_raster(win_var, source, destination, overviews=overviews)
+        sinuosity = []
+        for geom in geoms:
+            base_line = LineString(geom)
+
+            # Interpolate points over the sample distance
+            points = (
+                [Point(geom[0])]
+                + [
+                    base_line.interpolate(dist)
+                    for dist in np.arange(
+                        1, int(np.ceil(base_line.length / sampling)), dtype="float32"
+                    )
+                    * sampling
+                ]
+                + [Point(geom[-1])]
+            )
+
+            # Calculate sinuosity for each point
+            sinuosity += [
+                (
+                    p.x,
+                    p.y,
+                    p.buffer(sampling / 2.0).intersection(base_line).length / sampling,
+                )
+                for p in points
+            ]
+
+        return sinuosity
+
+    with fiona.open(stream_vector) as vect:
+        p = Pool(cpu_count())
+
+        results = p.imap(apply, vect)
+
+        points = []
+        for result in results:
+            if result:
+                points += result
+
+        output_schema = {
+            "geometry": "Point",
+            "properties": OrderedDict([("sinuosity", "float")]),
+        }
+
+        with fiona.open(
+            sinuosity_vector, "w", driver="GPKG", crs=vect.crs, schema=output_schema,
+        ) as out_vect:
+
+            for point in points:
+                out_vect.write(
+                    {
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": (point[0], point[1]),
+                        },
+                        "properties": OrderedDict([("sinuosity", point[2])]),
+                    }
+                )
 
 
 def bankfull_width(
