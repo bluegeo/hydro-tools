@@ -1,7 +1,9 @@
+import os
 import pickle
 import gzip
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool as DummyPool
+from tempfile import TemporaryDirectory
 from typing import Union
 
 import numpy as np
@@ -112,6 +114,8 @@ class WatershedIndex:
             header_len = int.from_bytes(f.read(8), "big")
             self.__dict__.update(pickle.loads(f.read(header_len)))
 
+        self.inmem_idx = None
+
     @staticmethod
     def save(path, domain, idx):
         """Save the index and parameters to a file
@@ -138,12 +142,51 @@ class WatershedIndex:
         Returns:
             list: Watershed index graph of nested lists
         """
+        if self.inmem_idx is not None:
+            return self.inmem_idx
+
         with open(self.path, "rb") as f:
             header_len = int.from_bytes(f.read(8), "big")
-            f.seek(header_len)
+            f.seek(header_len + 8)
             idx = pickle.loads(gzip.decompress(f.read()))
 
+            self.inmem_idx = idx
+
         return idx
+
+    @classmethod
+    def index_from_dem(
+        cls, dem: str, index_path: str, minimum_area: float = 1e6, **kwargs
+    ):
+        """Compute flow direction and flow accumulation prior to creating a new index
+
+        Args:
+            dem (str): Path to an input Digital Elevation Model (DEM)
+            index_path: Path to save the Watershed Index
+            minimum_area (float, optional): Minimum contributing area used to classify
+            streams. Defaults to 1e6.
+
+        Kwargs:
+            Those passed to `flow_direction_accumulation`
+
+        Raises:
+            ValueError: _description_
+            e: _description_
+
+        Returns:
+            WatershedIndex: Instance of self
+        """
+        with TemporaryDirectory() as tmp_dir:
+            direction_grid = os.path.join(tmp_dir, "direction.tif")
+            accumulation_grid = os.path.join(tmp_dir, "accumulation.tif")
+
+            flow_direction_accumulation(
+                dem, direction_grid, accumulation_grid, **kwargs
+            )
+
+            return cls.create_index(
+                direction_grid, accumulation_grid, index_path, minimum_area
+            )
 
     @classmethod
     def create_index(
@@ -173,15 +216,18 @@ class WatershedIndex:
             index_path (str): Path to create a new index
             minimum_area (float, optional): Minimum area to simulate stream locations.
             Defaults to 1E6.
+
+        Returns:
+            WatershedIndex: Instance of self
         """
-        domain_spec = Raster(accumulation_raster)
+        domain_spec = Raster.raster_specs(accumulation_raster)
 
         # Load the rasters into memory because the complexity may exceed benefits from dask
-        fa = from_raster(accumulation_raster).compute()
-        fd = from_raster(direction_raster).compute()
+        fa = np.squeeze(from_raster(accumulation_raster).compute())
+        fd = np.squeeze(from_raster(direction_raster).compute())
 
         # Create a boolean mask of simulated streams
-        threshold_cells = minimum_area / (domain_spec.csx * domain_spec.csy)
+        threshold_cells = minimum_area / (domain_spec["csx"] * domain_spec["csy"])
         streams = fa >= threshold_cells
 
         # Initialize an array for the stack
@@ -268,14 +314,16 @@ class WatershedIndex:
         return cls(index_path)
 
     def calculate_stats(
-        self, raster_source: str, destination: str, output: str = "csv", stats: Union[list, str] = ["min", "max", "sum", "mean"], **kwargs
+        self,
+        raster_source: str,
+        destination: str,
+        **kwargs,
     ):
         """Use a generated index to calculate stats at stream locations
 
         Args:
             raster_source (str): Raster dataset to collect stats from
-            destination (str): Destination file for results
-            output (str, optional): Output type. Choose from "csv", "tif". Defaults to "csv".
+            destination (str): Destination .tif path or .csv file for results
 
         Kwargs:
             apply_async (bool): Calculate asyncronously. Defaults to False.
@@ -356,19 +404,19 @@ class WatershedIndex:
         else:
             res = [summarize((ci, ni)) for ci, ni in idx]
 
-        if output == "csv":
+        if destination.lower().endswith(".csv"):
             table = []
             for coords, _min, _max, _sum, _mean in res:
                 y, x = indices_to_coords(
                     ([_i for _i, _j in coords], [_j for _i, _j in coords]),
-                    self.fa.top,
-                    self.fa.left,
-                    self.fa.csx,
-                    self.fa.csy,
+                    self.top,
+                    self.left,
+                    self.csx,
+                    self.csy,
                 )
                 if kwargs.get("output_crs", None) is not None:
                     pts = transform_points(
-                        list(zip(x, y)), self.fa.projection, kwargs.get("output_crs")
+                        list(zip(x, y)), self.wkt, kwargs.get("output_crs")
                     )
                     x, y = [pt[0] for pt in pts], [pt[1] for pt in pts]
                 _min = _min.tolist()
@@ -382,16 +430,15 @@ class WatershedIndex:
 
                 table += list(zip(x, y, _min, _max, _sum, _mean))
 
-            if not destination.lower().endswith(".csv"):
-                destination += ".csv"
             with open(destination, "wb") as f:
                 f.write(
-                    "\n".join([",".join(map(str, line)) for line in table]).encode(
-                        "utf-8"
-                    )
+                    "\n".join(
+                        ["x,y,min,max,sum,mean"]
+                        + [",".join(map(str, line)) for line in table]
+                    ).encode("utf-8")
                 )
 
-        elif output == "raster":
+        else:
             if destination.lower().endswith(".tif"):
                 destination = destination[:-4]
 
