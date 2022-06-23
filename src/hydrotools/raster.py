@@ -529,3 +529,34 @@ class TempRasterFiles:
         for path in self.paths:
             if os.path.isfile(path):
                 os.remove(path)
+
+
+def reset_corrupt_blocks(src: str, dst: str):
+    """Traverse a raster and replace corrupt blocks
+
+    Args:
+        src (str): Input raster
+        dst (str): Output raster
+    """
+    out_rast = Raster.empty_like(dst, src)
+    nodata = out_rast.nodata
+    dtype = out_rast.dtype
+
+    unreadable_blocks = 0
+    total_blocks = 0
+
+    with rasterio.open(dst, "r+") as dst_ds:
+        with rasterio.open(src) as src_ds:
+            for band in range(1, src_ds.count + 1):
+                for _, window in src_ds.block_windows(band):
+                    total_blocks += 1
+                    try:
+                        a = src_ds.read(band, window=window)
+                    except:
+                        unreadable_blocks += 1
+                        a = np.full((window.height, window.width), nodata, dtype)
+
+                    dst_ds.write(a, indexes=band, window=window)
+
+    if unreadable_blocks > 0:
+        print(f"Filled {unreadable_blocks} of {total_blocks} blocks with no data")

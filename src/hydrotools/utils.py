@@ -8,7 +8,7 @@ from subprocess import run
 import numpy as np
 import dask.array as da
 from grass_session import Session
-from pyproj import Transformer
+from pyproj import Transformer, CRS
 
 # Implicitly becomes available after importing grass_session
 from grass.script import core as grass  # noqa
@@ -184,6 +184,21 @@ def indices_to_coords(
     i, j = np.asarray(indices[0]), np.asarray(indices[1])
 
     return ((top - (csy / 2.0)) - (i * csy), (left + (csx / 2.0)) + (j * csx))
+
+
+def proj4_string(sr: Union[str, int]) -> str:
+    """Collect a PROJ 4 string representation of a spatial reference input. This is
+    primarily for `fiona`.
+
+    Args:
+        sr (Union[str, int]): Input spatial reference
+
+    Returns:
+        str: PROJ 4 string
+    """
+    sr_data = CRS.from_user_input(sr)
+
+    return sr_data.to_proj4()
 
 
 def transform_points(
