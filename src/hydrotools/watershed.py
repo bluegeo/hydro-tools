@@ -1,15 +1,21 @@
+from collections import OrderedDict
 import os
 import pickle
 import gzip
-from multiprocessing import cpu_count
-from multiprocessing.dummy import Pool as DummyPool
 from tempfile import TemporaryDirectory
 from typing import Union
 
 import numpy as np
 from numba import jit
+import fiona
+from fiona.crs import from_string
 
-from hydrotools.utils import GrassRunner, indices_to_coords, transform_points
+from hydrotools.utils import (
+    GrassRunner,
+    indices_to_coords,
+    transform_points,
+    proj4_string,
+)
 from hydrotools.raster import Raster, from_raster
 
 
@@ -53,6 +59,17 @@ def flow_direction_accumulation(
         gr.save_raster("fa", accumulation_grid)
 
 
+def area_to_cells(src: str, area: float):
+    """Convert an area into a number of raster cells
+
+    Args:
+        src (str): Input raster dataset
+        area (float): An area in the raster's spatial reference
+    """
+    r = Raster(src)
+    return int(np.ceil(area / (r.csx * r.csy)))
+
+
 def auto_basin(dem: str, min_area: float, basin_dataset: str):
     """Automatically generate basins throughout a dataset that are larger than a minimum area
 
@@ -62,8 +79,7 @@ def auto_basin(dem: str, min_area: float, basin_dataset: str):
         basin_dataset (str): Output raster data containing labeled basins
     """
     # Min Area needs to be converted to cells
-    r = Raster(dem)
-    min_area_cells = int(np.ceil(min_area / (r.csx * r.csy)))
+    min_area_cells = area_to_cells(dem, min_area)
 
     with GrassRunner(dem) as gr:
         gr.run_command(
@@ -75,6 +91,43 @@ def auto_basin(dem: str, min_area: float, basin_dataset: str):
             flags="s",
         )
         gr.save_raster("b", basin_dataset)
+
+
+def extract_streams(
+    dem: str,
+    accumulation_src: str,
+    direction_src: str,
+    stream_dst: str,
+    min_area: float = 1e6,
+    min_length: float = 0,
+):
+    """Extract simulated streams
+
+    Args:
+        dem (str): Path to a Digital Elevation Model (DEM)
+        accumulation_src (str): Flow Accumulation dataset derived from `flow_direction_accumulation`
+        direction_src (str): Flow Direction dataset derived from `flow_direction_accumulation`
+        stream_dst (str): Output Streams raster path
+        min_area (float, optional): Minimum watershed area for streams. Defaults to 1e6.
+        min_length (float, optional): Minimum stream length. Defaults to 0.
+    """
+    # Min Area needs to be converted to cells
+    min_area_cells = area_to_cells(dem, min_area)
+
+    with GrassRunner(dem) as gr:
+        gr.run_command(
+            "r.stream.extract",
+            (dem, "dem", "raster"),
+            (accumulation_src, "accum", "raster"),
+            (direction_src, "dir", "raster"),
+            elevation="dem",
+            accumulation="accum",
+            direction="dir",
+            stream_length=float(min_length),
+            threshold=min_area_cells,
+            stream_raster="streams",
+        )
+        gr.save_raster("streams", stream_dst)
 
 
 class WatershedIndex:
@@ -193,8 +246,8 @@ class WatershedIndex:
         cls,
         direction_raster: str,
         accumulation_raster: str,
+        stream_raster: str,
         index_path: str,
-        minimum_area: float = 1e6,
     ):
         """Create a new watershed index
 
@@ -213,9 +266,9 @@ class WatershedIndex:
             `hydrotools.watershed.flow_direction_accumulation`. Note: the `single`
             argument must be set to True
             accumulation_raster (str): Flow accumulation grid
+            stream_raster (str): Raster with streams using
+            `hydrotools.watershed.extract_streams`.
             index_path (str): Path to create a new index
-            minimum_area (float, optional): Minimum area to simulate stream locations.
-            Defaults to 1E6.
 
         Returns:
             WatershedIndex: Instance of self
@@ -226,9 +279,11 @@ class WatershedIndex:
         fa = np.squeeze(from_raster(accumulation_raster).compute())
         fd = np.squeeze(from_raster(direction_raster).compute())
 
-        # Create a boolean mask of simulated streams
-        threshold_cells = minimum_area / (domain_spec["csx"] * domain_spec["csy"])
-        streams = fa >= threshold_cells
+        # Create a boolean mask of streams
+        streams = (
+            np.squeeze(from_raster(stream_raster).compute())
+            != Raster(stream_raster).nodata
+        )
 
         # Initialize an array for the stack
         visited = np.zeros(streams.shape, "bool")
@@ -313,6 +368,66 @@ class WatershedIndex:
 
         return cls(index_path)
 
+    def save_locations(
+        self, dst: str, data: dict = None, output_crs: Union[str, int] = None
+    ):
+        """Save the underlying locations of the index to a vector file
+
+        Args:
+            dst (str): Path for the output geopackage
+        """
+        if not dst.lower().endswith("gpkg"):
+            dst += ".gpkg"
+
+        points = []
+        for coords, _ in self.idx:
+            y, x = indices_to_coords(
+                (
+                    [coord[0][0] for coord in coords],
+                    [coord[0][1] for coord in coords],
+                ),
+                self.top,
+                self.left,
+                self.csx,
+                self.csy,
+            )
+
+            points += list(zip(x, y))
+
+        if output_crs is not None:
+            points = transform_points(points, self.wkt, output_crs)
+
+        fields = [] if data is None else [(key, "float") for key in data.keys()]
+
+        schema = {
+            "geometry": "Point",
+            "properties": OrderedDict([("id", "int")] + fields),
+        }
+
+        crs = (
+            from_string(proj4_string(output_crs))
+            if output_crs is not None
+            else from_string(proj4_string(self.wkt))
+        )
+
+        records = [
+            {
+                "geometry": {"type": "Point", "coordinates": pnt},
+                "properties": OrderedDict(
+                    [("id", fid)]
+                    + (
+                        []
+                        if data is None
+                        else [(key, data[key][fid]) for key in data.keys()]
+                    )
+                ),
+            }
+            for fid, pnt in enumerate(points)
+        ]
+
+        with fiona.open(dst, "w", "GPKG", crs=crs, schema=schema) as layer:
+            layer.writerecords(records)
+
     def calculate_stats(
         self,
         raster_source: str,
@@ -323,10 +438,9 @@ class WatershedIndex:
 
         Args:
             raster_source (str): Raster dataset to collect stats from
-            destination (str): Destination .tif path or .csv file for results
+            destination (str): Destination path to save the output geopackage
 
         Kwargs:
-            apply_async (bool): Calculate asyncronously. Defaults to False.
             output_crs (Union[int, str]): Output coordinate reference system for points.
             Defaults to None, whereby the domain CRS will be used.
         """
@@ -389,89 +503,27 @@ class WatershedIndex:
             _max[_max == -float_boundary] *= -1
             _sum[nodata] = float_boundary
 
-            return [c[0] for c in ci], _min, _max, _sum, _mean
+            return _min, _max, _sum, _mean
 
-        if kwargs.get("apply_async", False):
-            p = DummyPool(cpu_count())
-            try:
-                res = p.map(summarize, [(ci, ni) for ci, ni in idx])
-                p.close()
-                p.join()
-            except Exception as e:
-                p.close()
-                p.join()
-                raise e
-        else:
-            res = [summarize((ci, ni)) for ci, ni in idx]
+        stat_output = {
+            "min": [],
+            "max": [],
+            "sum": [],
+            "mean": [],
+        }
 
-        if destination.lower().endswith(".csv"):
-            table = []
-            for coords, _min, _max, _sum, _mean in res:
-                y, x = indices_to_coords(
-                    ([_i for _i, _j in coords], [_j for _i, _j in coords]),
-                    self.top,
-                    self.left,
-                    self.csx,
-                    self.csy,
-                )
-                if kwargs.get("output_crs", None) is not None:
-                    pts = transform_points(
-                        list(zip(x, y)), self.wkt, kwargs.get("output_crs")
-                    )
-                    x, y = [pt[0] for pt in pts], [pt[1] for pt in pts]
-                _min = _min.tolist()
-                _min = [val if val != np.finfo("float32").max else "" for val in _min]
-                _max = _max.tolist()
-                _max = [val if val != np.finfo("float32").max else "" for val in _max]
-                _sum = _sum.tolist()
-                _sum = [val if val != np.finfo("float32").max else "" for val in _sum]
-                _mean = _mean.tolist()
-                _mean = [val if val != np.finfo("float32").max else "" for val in _mean]
+        def map_results(res):
+            return [
+                val if val != np.finfo("float32").max else None for val in res.tolist()
+            ]
 
-                table += list(zip(x, y, _min, _max, _sum, _mean))
+        for ci, ni in idx:
+            _min, _max, _sum, _mean = summarize((ci, ni))
+            stat_output["min"] += map_results(_min)
+            stat_output["max"] += map_results(_max)
+            stat_output["sum"] += map_results(_sum)
+            stat_output["mean"] += map_results(_mean)
 
-            with open(destination, "wb") as f:
-                f.write(
-                    "\n".join(
-                        ["x,y,min,max,sum,mean"]
-                        + [",".join(map(str, line)) for line in table]
-                    ).encode("utf-8")
-                )
-
-        else:
-            if destination.lower().endswith(".tif"):
-                destination = destination[:-4]
-
-            i, j, _min, _max, _sum, _mean = [], [], [], [], [], []
-
-            for coords, min_subset, max_subset, sum_subset, mean_subset in res:
-                i += [_i for _i, _j in coords]
-                j += [_j for _i, _j in coords]
-
-                _min += min_subset.tolist()
-                _max += max_subset.tolist()
-                _sum += sum_subset.tolist()
-                _mean += mean_subset.tolist()
-
-            coords = (np.array(i, dtype="uint64"), np.array(j, dtype="uint64"))
-
-            for stat, data in zip(
-                ["min", "max", "sum", "mean"], [_min, _max, _sum, _mean]
-            ):
-                a = np.full(self.shape, float_boundary, "float32")
-                a[coords] = data
-
-                dst = destination + f"-{stat}.tif"
-
-                r = Raster.empty(
-                    dst,
-                    self.top,
-                    self.left,
-                    self.csx,
-                    self.csy,
-                    self.wkt,
-                    self.shape,
-                    "float32",
-                    float_boundary,
-                )
-                r[:] = a
+        self.save_locations(
+            destination, data=stat_output, output_crs=kwargs.get("output_crs", None)
+        )
