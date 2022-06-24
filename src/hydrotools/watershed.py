@@ -96,7 +96,6 @@ def auto_basin(dem: str, min_area: float, basin_dataset: str):
 def extract_streams(
     dem: str,
     accumulation_src: str,
-    direction_src: str,
     stream_dst: str,
     min_area: float = 1e6,
     min_length: float = 0,
@@ -106,7 +105,6 @@ def extract_streams(
     Args:
         dem (str): Path to a Digital Elevation Model (DEM)
         accumulation_src (str): Flow Accumulation dataset derived from `flow_direction_accumulation`
-        direction_src (str): Flow Direction dataset derived from `flow_direction_accumulation`
         stream_dst (str): Output Streams raster path
         min_area (float, optional): Minimum watershed area for streams. Defaults to 1e6.
         min_length (float, optional): Minimum stream length. Defaults to 0.
@@ -119,10 +117,8 @@ def extract_streams(
             "r.stream.extract",
             (dem, "dem", "raster"),
             (accumulation_src, "accum", "raster"),
-            (direction_src, "dir", "raster"),
             elevation="dem",
             accumulation="accum",
-            direction="dir",
             stream_length=float(min_length),
             threshold=min_area_cells,
             stream_raster="streams",
