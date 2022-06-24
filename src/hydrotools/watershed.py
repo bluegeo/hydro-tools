@@ -241,7 +241,6 @@ class WatershedIndex:
     def create_index(
         cls,
         direction_raster: str,
-        accumulation_raster: str,
         stream_raster: str,
         index_path: str,
     ):
@@ -261,7 +260,6 @@ class WatershedIndex:
             direction_raster (str): Flow direction raster generated using
             `hydrotools.watershed.flow_direction_accumulation`. Note: the `single`
             argument must be set to True
-            accumulation_raster (str): Flow accumulation grid
             stream_raster (str): Raster with streams using
             `hydrotools.watershed.extract_streams`.
             index_path (str): Path to create a new index
@@ -269,10 +267,9 @@ class WatershedIndex:
         Returns:
             WatershedIndex: Instance of self
         """
-        domain_spec = Raster.raster_specs(accumulation_raster)
+        domain_spec = Raster.raster_specs(direction_raster)
 
-        # Load the rasters into memory because the complexity may exceed benefits from dask
-        fa = np.squeeze(from_raster(accumulation_raster).compute())
+        # Load into memory
         fd = np.squeeze(from_raster(direction_raster).compute())
 
         # Create a boolean mask of streams
@@ -282,15 +279,48 @@ class WatershedIndex:
         )
 
         # Initialize an array for the stack
-        visited = np.zeros(streams.shape, "bool")
+        visited = fd == domain_spec["nodata"]
 
-        def next_fa():
-            candidates = np.where(streams & ~visited)
-            try:
-                i = np.argmax(fa[candidates])
-                return candidates[0][i], candidates[1][i]
-            except ValueError:
+        @jit(nopython=True)
+        def traverse(fd, streams, i, j):
+            directions = [
+                None,
+                [-1, 1],
+                [-1, 0],
+                [-1, -1],
+                [0, -1],
+                [1, -1],
+                [1, 0],
+                [1, 1],
+                [0, 1],
+            ]
+
+            while True:
+                # Off map
+                if fd[i, j] <= 0:
+                    break
+
+                # Collect the downstream cell
+                i_offset, j_offset = directions[fd[i, j]]
+                new_i, new_j = i + i_offset, j + j_offset
+
+                # If the dirs are only positive, end when not on a stream
+                if not streams[new_i, new_j]:
+                    break
+
+                i, j = new_i, new_j
+
+            return i, j
+
+        def next_ws():
+            candidates = streams & ~visited
+            if candidates.sum() == 0:
                 return
+
+            i, j = np.unravel_index(np.argmax(candidates), streams.shape)
+
+            # Traverse to the outlet
+            return traverse(fd, streams, i, j)
 
         @jit(nopython=True)
         def delineate(fd, streams, i, j, visited):
@@ -324,8 +354,10 @@ class WatershedIndex:
                 for row_offset in range(-1, 2):
                     for col_offset in range(-1, 2):
                         t_i, t_j = i + row_offset, j + col_offset
+
                         if visited[t_i, t_j]:
                             continue
+
                         # Check if the element at this offset contributes to the element being tested
                         if fd[t_i, t_j] == directions[row_offset + 1][col_offset + 1]:
                             # This element has now been visited
@@ -352,13 +384,13 @@ class WatershedIndex:
             return ci, [[j for j in i if j != -1] for i in ni]
 
         # Run the alg
-        coord = next_fa()
+        coord = next_ws()
         watersheds = []
         while coord is not None:
             i, j = coord
             ci, ni = delineate(fd, streams, i, j, visited)
             watersheds.append((ci, ni))
-            coord = next_fa()
+            coord = next_ws()
 
         cls.save(index_path, domain_spec, watersheds)
 
