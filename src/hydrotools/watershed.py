@@ -5,6 +5,7 @@ import gzip
 from tempfile import TemporaryDirectory
 from typing import Union
 
+import dask.array as da
 import numpy as np
 from numba import jit
 import fiona
@@ -273,13 +274,10 @@ class WatershedIndex:
         fd = np.squeeze(from_raster(direction_raster).compute())
 
         # Create a boolean mask of streams
-        streams = (
-            np.squeeze(from_raster(stream_raster).compute())
-            != Raster(stream_raster).nodata
-        )
+        streams = np.squeeze(~da.ma.getmaskarray(from_raster(stream_raster)).compute())
 
         # Initialize an array for the stack
-        visited = fd == domain_spec["nodata"]
+        visited = np.ma.getmaskarray(fd)
 
         @jit(nopython=True)
         def traverse(fd, streams, i, j):
