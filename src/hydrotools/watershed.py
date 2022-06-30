@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from copy import deepcopy
 import os
 import pickle
 import gzip
@@ -151,11 +152,14 @@ class WatershedIndex:
     Returned stats include "min", "max", "sum", and "mean"
     """
 
-    def __init__(self, idx_path: str):
+    def __init__(self, idx_path: str, idx=None):
         """Load an existing index from a path
 
         Args:
             idx_path (str): Path to previously created index
+            idx (list): Existing index, which avoids the need to re-read the index from
+            disk. This argument is reserved for the `create_index` classmethod and 
+            should not be used directly without caution.
         """
         self.path = idx_path
 
@@ -164,7 +168,7 @@ class WatershedIndex:
             header_len = int.from_bytes(f.read(8), "big")
             self.__dict__.update(pickle.loads(f.read(header_len)))
 
-        self.inmem_idx = None
+        self.inmem_idx = idx
 
     @staticmethod
     def save(path, domain, idx):
@@ -392,7 +396,7 @@ class WatershedIndex:
 
         cls.save(index_path, domain_spec, watersheds)
 
-        return cls(index_path)
+        return cls(index_path, idx=watersheds)
 
     def save_locations(
         self, dst: str, data: dict = None, output_crs: Union[str, int] = None
@@ -475,8 +479,6 @@ class WatershedIndex:
         if any([src.shape != self.shape, src.top != self.top, src.left != self.left]):
             raise ValueError("Input data must spatially match index domain")
 
-        idx = self.idx
-
         data = np.squeeze(from_raster(src).compute())
         m = (data != src.nodata) & ~np.isnan(data) & ~np.isinf(data)
         float_boundary = np.finfo("float32").max
@@ -504,6 +506,8 @@ class WatershedIndex:
 
         def summarize(args):
             ci, ni = args
+
+            ni = deepcopy(ni)
 
             # Assign output datasets
             _min = np.zeros(len(ci), np.float32) + float_boundary
@@ -543,7 +547,7 @@ class WatershedIndex:
                 val if val != np.finfo("float32").max else None for val in res.tolist()
             ]
 
-        for ci, ni in idx:
+        for ci, ni in self.idx:
             _min, _max, _sum, _mean = summarize((ci, ni))
             stat_output["min"] += map_results(_min)
             stat_output["max"] += map_results(_max)

@@ -24,7 +24,8 @@ def slope(
     scale: float = 1,
     overviews: bool = True,
 ):
-    """Calculate topographic slope
+    """Calculate topographic slope.
+    See [gdaldem](https://gdal.org/programs/gdaldem.html#slope).
 
     Args:
         dem (str): Digital Elevation model raster
@@ -50,6 +51,71 @@ def slope(
 
     if units.lower() == "percent":
         cmd += ["-p"]
+
+    run(cmd, check=True)
+
+    if overviews:
+        cmd = ["gdaladdo", destination]
+        run(cmd, check=True)
+
+
+def aspect(
+    dem: str,
+    destination: str,
+    overviews: bool = True,
+):
+    """Calculate aspect. See [gdaldem](https://gdal.org/programs/gdaldem.html#aspect).
+
+    Args:
+        dem (str): Digital Elevation model raster
+        destination (str): Output aspect raster destination
+        overviews (bool, optional): Build overviews for the output. Defaults to True.
+    """
+    gdal_args = [
+        arg
+        for arg in GDAL_DEFAULT_ARGS
+        if arg not in ["-multi", "-wo", "NUM_THREADS=ALL_CPUS"]
+    ]
+
+    cmd = [
+        "gdaldem",
+        "aspect",
+        dem,
+        destination,
+    ] + gdal_args
+
+    run(cmd, check=True)
+
+    if overviews:
+        cmd = ["gdaladdo", destination]
+        run(cmd, check=True)
+
+
+def terrain_ruggedness_index(
+    dem: str,
+    destination: str,
+    overviews: bool = True,
+):
+    """Calculate Terrain Ruggedness Index (TRI).
+    See [gdaldem](https://gdal.org/programs/gdaldem.html#tri).
+
+    Args:
+        dem (str): Digital Elevation model raster
+        destination (str): Output TRI raster destination
+        overviews (bool, optional): Build overviews for the output. Defaults to True.
+    """
+    gdal_args = [
+        arg
+        for arg in GDAL_DEFAULT_ARGS
+        if arg not in ["-multi", "-wo", "NUM_THREADS=ALL_CPUS"]
+    ]
+
+    cmd = [
+        "gdaldem",
+        "TRI",
+        dem,
+        destination,
+    ] + gdal_args
 
     run(cmd, check=True)
 
