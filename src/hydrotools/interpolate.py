@@ -23,7 +23,6 @@ def fill_nodata(raster_source: str, destination: str, method: str = "idw"):
                 (raster_source, "input", "raster"),
                 input="input",
                 output="output",
-                quiet=True,
             )
             gr.save_raster("output", destination)
 
@@ -55,7 +54,6 @@ def cubic_spline(
             column=column,
             method=method,
             raster_output="interpolated",
-            quiet=True,
         )
         gr.save_raster("interpolated", destination_raster)
 

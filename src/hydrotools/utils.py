@@ -14,7 +14,7 @@ from pyproj import Transformer, CRS
 from grass.script import core as grass  # noqa
 from grass.pygrass.modules.shortcuts import raster as graster  # noqa
 
-from hydrotools.config import GRASS_TMP, GRASS_LOCATION, GDAL_DEFAULT_ARGS
+from hydrotools.config import GRASS_TMP, GRASS_LOCATION, GRASS_FLAGS, GDAL_DEFAULT_ARGS
 
 
 warnings.filterwarnings("ignore")
@@ -62,12 +62,17 @@ class GrassRunner(Session):
 
         """
         for dataset, key, _type in args:
+            ds_kwargs = {"input": dataset, "output": key}
+            ds_kwargs.update(GRASS_FLAGS)
+            
             if _type.lower() == "vector":
-                grass.run_command("v.in.ogr", input=dataset, output=key)
+                grass.run_command("v.in.ogr", **ds_kwargs)
             elif _type.lower() == "raster":
-                graster.external(input=dataset, output=key)
+                graster.external(**ds_kwargs)
             else:
                 raise ValueError(f"Unknown data format {_type}")
+
+        kwargs.update(GRASS_FLAGS)
 
         grass.run_command(cmd, **kwargs)
 
@@ -80,6 +85,8 @@ class GrassRunner(Session):
         """
         if not out_path.lower().endswith(".tif"):
             out_path += ".tif"
+
+        kwargs.update(GRASS_FLAGS)
 
         graster.out_gdal(
             dataset,
@@ -95,19 +102,29 @@ class GrassRunner(Session):
             **kwargs,
         )
 
-    def save_vector(self, dataset: str, out_path: str):
+    def save_vector(self, dataset: str, out_path: str, layer: str = None):
         """Save a dataset to a geopackage
 
         Args:
             dataset (str): GRASS dataset name
             out_path (str): Output .gpkg path
+            layer (str): Layer name to export. Defaults to None.
         """
         if not out_path.lower().endswith(".gpkg"):
             out_path += ".gpkg"
 
+        kwargs = {}
+        if layer is not None:
+            kwargs["layer"] = layer
+
         # Save to the output
         grass.run_command(
-            "v.out.ogr", input=dataset, output=out_path, format="GPKG", overwrite=True
+            "v.out.ogr",
+            input=dataset,
+            output=out_path,
+            format="GPKG",
+            overwrite=True,
+            **GRASS_FLAGS,
         )
 
 
@@ -118,9 +135,7 @@ def add_grass_extension(extension_name: str):
         extension_name (str): [description]
     """
     with GrassRunner("EPSG:4326") as gs:
-        grass.run_command(
-            "g.extension", extension=extension_name, operation="add"
-        )
+        grass.run_command("g.extension", extension=extension_name, operation="add")
 
 
 def infer_nodata(

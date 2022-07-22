@@ -43,6 +43,7 @@ def slope(
     cmd = [
         "gdaldem",
         "slope",
+        "-compute_edges",
         "-s",
         str(scale),
         dem,
@@ -80,6 +81,7 @@ def aspect(
     cmd = [
         "gdaldem",
         "aspect",
+        "-compute_edges",
         dem,
         destination,
     ] + gdal_args
@@ -113,6 +115,7 @@ def terrain_ruggedness_index(
     cmd = [
         "gdaldem",
         "TRI",
+        "-compute_edges",
         dem,
         destination,
     ] + gdal_args

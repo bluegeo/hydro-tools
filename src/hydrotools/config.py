@@ -11,6 +11,8 @@ GRASS_LOCATION: str = "hydro-tools-grass"
 
 GRASS_TMP: str = gettempdir()
 
+GRASS_FLAGS: dict = {"quiet": True}
+
 GDAL_DEFAULT_ARGS = [
     "-of",
     "GTiff",

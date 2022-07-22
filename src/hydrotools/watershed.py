@@ -21,6 +21,20 @@ from hydrotools.utils import (
 from hydrotools.raster import Raster, from_raster
 
 
+def condition_dem(dem: str, dem_cnd_dst: str):
+    """Apply a hydrological conditioning to remove sinks.
+
+    Args:
+        dem (str): Digital Elevation Model raster.
+        dem_cnd_dst (str): Output conditioned Digital Elevation Model.
+    """
+    with GrassRunner(dem) as gr:
+        gr.run_command(
+            "r.hydrodem", (dem, "dem", "raster"), input="dem", output="dem_cnd"
+        )
+        gr.save_raster("dem_cnd", dem_cnd_dst)
+
+
 def flow_direction_accumulation(
     dem: str,
     direction_grid: str,
@@ -99,6 +113,7 @@ def extract_streams(
     dem: str,
     accumulation_src: str,
     stream_dst: str,
+    direction_dst: str,
     min_area: float = 1e6,
     min_length: float = 0,
 ):
@@ -106,8 +121,10 @@ def extract_streams(
 
     Args:
         dem (str): Path to a Digital Elevation Model (DEM)
-        accumulation_src (str): Flow Accumulation dataset derived from `flow_direction_accumulation`
+        accumulation_src (str): Flow Accumulation dataset derived from
+        `flow_direction_accumulation`
         stream_dst (str): Output Streams raster path
+        direction_dst (str): Output flow direction raster path
         min_area (float, optional): Minimum watershed area for streams. Defaults to 1e6.
         min_length (float, optional): Minimum stream length. Defaults to 0.
     """
@@ -124,8 +141,87 @@ def extract_streams(
             stream_length=float(min_length),
             threshold=min_area_cells,
             stream_raster="streams",
+            direction="direction",
         )
         gr.save_raster("streams", stream_dst)
+        gr.save_raster("direction", direction_dst)
+
+
+def stream_order(
+    dem: str,
+    stream_src: str,
+    direction_src: str,
+    accumulation_src: str,
+    order_dst: str,
+    use_accum: bool = False,
+    zero_bg: bool = False,
+    mem_manage: bool = False,
+):
+    """Calculate stream order using the following data:
+
+    * Streams and flow direction derived from `hydrotools.watershed.extract_streams`
+
+        ::Note:: The flow direction from
+        `hydrotools.watershed.flow_direction_accumulation` may not be used in
+        conjunction with streams derived from `hydrotools.watershed.extract_streams`!
+
+    * Flow Accumulation derived from `hydrotools.watershed.flow_direction_accumulation`
+
+    Args:
+        dem (str): An input Digital Elevation Model.
+        stream_src (str): Streams derived using `extract_streams`.
+        direction_src (str): Flow Direction derived from `extract_streams`.
+        accumulation_src (str): Flow Accumulation derived from
+        `flow_direction_accumulation`.
+        order_dst (str): An output stream order dataset. If the extension `.tif` is
+        used, a Strahler stream order is output, otherwise a geopackage vector is
+        created.
+        use_accum (bool): Use flow accumulation to trace Horton and Hack orders.
+        zero_bg (bool): Use a background value of 0 instead of nodata
+        mem_manage (bool): Manage memory while computing stream order.
+    """
+    if order_dst.lower().endswith(".tif"):
+        kwargs = {"strahler": "stream_o"}
+    else:
+        kwargs = {"stream_vect": "stream_o"}
+
+    flags = ""
+    if zero_bg:
+        flags += "z"
+    if mem_manage:
+        flags += "m"
+    if use_accum:
+        flags += "a"
+
+    with GrassRunner(dem) as gr:
+        gr.run_command(
+            "r.stream.order",
+            (dem, "dem", "raster"),
+            (stream_src, "streams", "raster"),
+            (direction_src, "direction", "raster"),
+            (accumulation_src, "accum", "raster"),
+            elevation="dem",
+            stream_rast="streams",
+            direction="direction",
+            accumulation="accum",
+            flags=flags,
+            **kwargs,
+        )
+
+        if order_dst.lower().endswith(".tif"):
+            gr.save_raster("stream_o", order_dst)
+        else:
+            if not order_dst.lower().endswith(".gpkg"):
+                order_dst += ".gpkg"
+
+            gr.run_command(
+                "v.extract",
+                input="stream_o",
+                output="stream_order",
+                type="line",
+            )
+
+            gr.save_vector("stream_order", order_dst)
 
 
 class WatershedIndex:
@@ -158,7 +254,7 @@ class WatershedIndex:
         Args:
             idx_path (str): Path to previously created index
             idx (list): Existing index, which avoids the need to re-read the index from
-            disk. This argument is reserved for the `create_index` classmethod and 
+            disk. This argument is reserved for the `create_index` classmethod and
             should not be used directly without caution.
         """
         self.path = idx_path
@@ -410,7 +506,11 @@ class WatershedIndex:
             dst += ".gpkg"
 
         points = []
+        networks = []
+        network_id = 0
         for coords, _ in self.idx:
+            networks += [network_id] * len(coords)
+            network_id += 1
             y, x = indices_to_coords(
                 (
                     [coord[0][0] for coord in coords],
@@ -427,7 +527,11 @@ class WatershedIndex:
         if output_crs is not None:
             points = transform_points(points, self.wkt, output_crs)
 
-        fields = [] if data is None else [(key, "float") for key in data.keys()]
+        # If data are not provided, this saves the base attributes
+        if data is None:
+            fields = [("networkid", "int")]
+        else:
+            fields = [(key, "float") for key in data.keys()]
 
         schema = {
             "geometry": "Point",
@@ -446,7 +550,7 @@ class WatershedIndex:
                 "properties": OrderedDict(
                     [("id", fid)]
                     + (
-                        []
+                        [("networkid", networks[fid])]
                         if data is None
                         else [(key, data[key][fid]) for key in data.keys()]
                     )
