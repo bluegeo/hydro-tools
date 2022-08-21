@@ -11,11 +11,14 @@ import numpy as np
 from hydrotools.raster import (
     Raster,
     TempRasterFile,
+    TempRasterFiles,
     raster_where,
     from_raster,
     to_raster,
 )
 from hydrotools.utils import GrassRunner
+from hydrotools.watershed import extract_streams, flow_direction_accumulation
+from hydrotools.elevation import slope
 
 
 def sinuosity(
@@ -94,7 +97,11 @@ def sinuosity(
         }
 
         with fiona.open(
-            sinuosity_vector, "w", driver="GPKG", crs=vect.crs, schema=output_schema,
+            sinuosity_vector,
+            "w",
+            driver="GPKG",
+            crs=vect.crs,
+            schema=output_schema,
         ) as out_vect:
 
             for point in points:
@@ -141,7 +148,7 @@ def bankfull_width(
 
     precip_cm = from_raster(precip).astype("float32") / 10
 
-    bankfull_width = 0.196 * (contrib_area ** 0.280) * (precip_cm ** 0.355)
+    bankfull_width = 0.196 * (contrib_area**0.280) * (precip_cm**0.355)
 
     to_raster(
         da.ma.masked_where(
@@ -167,7 +174,7 @@ def bankfull_mask(dem: str, bankfull_width: str):
     # Mask areas where distance exceeds interpolated bankfull
 
     # return mask
-    pass
+    raise NotImplementedError("Method not complete")
 
 
 def topographic_wetness(
@@ -226,3 +233,85 @@ def topographic_wetness(
         cs_inverted = cs_inverted.astype("float32")
 
         to_raster(cs_inverted, slope, destination)
+
+
+def riparian_connectivity(dem: str, connectivity_dst, min_ws_area: float, **kwargs):
+    """Calculate regions of riparian connectivity surrounding streams
+
+    Args:
+        dem (str): Input Digital Elevation Model raster
+    """
+    with TempRasterFiles(6) as (
+        accumulation_dst,
+        direction_dst,
+        stream_dst,
+        slope_dst,
+        cost_dst,
+        lcp_dst,
+    ):
+        # Derive streams
+        flow_direction_accumulation(
+            dem,
+            direction_dst,
+            accumulation_dst,
+            False,
+            False,
+        )
+
+        extract_streams(
+            dem,
+            accumulation_dst,
+            stream_dst,
+            direction_dst,
+            min_ws_area,
+            kwargs.get("min_length", 0),
+        )
+
+        # Create a cost surface
+        slope(dem, slope_dst, overviews=False)
+
+        cost = raster_where(
+            da.ma.getmaskarray(from_raster(stream_dst)),
+            da.clip(from_raster(slope_dst), 0.0, 90.0) / 90.0,
+            0,
+        )
+
+        to_raster(cost, slope_dst, cost_dst, False)
+
+        with GrassRunner(cost_dst) as gr:
+            gr.run_command(
+                "r.cost",
+                (cost_dst, "cost", "raster"),
+                (stream_dst, "streams", "raster"),
+                input="cost",
+                output="conn",
+                start_raster="streams",
+            )
+            # gr.save_raster("conn", lcp_dst)
+            gr.save_raster("conn", connectivity_dst)
+
+        # Classify connectivity region
+        # conn_threshold = kwargs.get("lcp_threshold", 1)
+        # conn_region = from_raster(lcp_dst) < conn_threshold
+
+        # Calculate other variables and interpolate to the connectivity region
+        # Channel density
+        # convolve(stream_dst, np.ones((10, 10, 1), dtype="bool"), "sum")
+
+        # Inverse of normalized channel slope
+        # to_raster(raster_where(da.ma.getmaskarray(from_raster(stream_dst)), from_raster(dem), None))
+        # slope(strem_elev_dst, stream_slope_dst, overviews=False)
+        # 1 - da.clip(from_raster(stream_slope_dst), 0.0, 90.0) / 90
+
+        # Bankfull width
+        # contrib_area = fa.astype("float32") * (ca_specs.csx * ca_specs.csy / 1e6)
+        # contrib_area = da.ma.masked_where(contrib_area < min_area / 1e6, contrib_area)
+
+        # precip_cm = from_raster(precip).astype("float32") / 10
+
+        # bankfull_width = 0.196 * (contrib_area**0.280) * (precip_cm**0.355)
+
+        # Cost (already distributed)
+        # 1 - da.clip(raster_where(from_raster(connectivity_dst), 0, conn_threshold) / conn_threshold
+
+        # Classify into 3 zones based on distribution
