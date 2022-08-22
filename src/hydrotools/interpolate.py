@@ -1,30 +1,171 @@
 from multiprocessing.dummy import Pool as DummyPool
 from multiprocessing import cpu_count
+from typing import Union
 
 import numpy as np
+import dask.array as da
 from numba import jit
 from sklearn.neighbors import KNeighborsRegressor, BallTree
 
+from hydrotools.raster import Raster, from_raster, to_raster
 from hydrotools.utils import GrassRunner
 
 
-def fill_nodata(raster_source: str, destination: str, method: str = "idw"):
-    """Interpolate regions with no data in a raster
+def raster_filter(
+    raster_source: str,
+    kernel: Union[np.ndarray, tuple],
+    method: str,
+    filter_dst: str,
+    **kwargs,
+):
+    """Filter a raster using a defined kernel and method
 
     Args:
-        raster_source (str): [description]
-        destination (str): Destination raster dataset
-        method (str, optional): [description]. Defaults to "linear".
+        raster_source (str): Input raster
+        kernel (Union[np.ndarray, tuple]): Kernel to create the moving window sample.
+        The kernal may be a 2-length tuple to define the size of a rectangular window
+        or a boolean numpy array that defines the locations of the sample for the
+        window.
+        method (str): Method used to apply the filter. Choose one of:
+            [
+                "sum",
+                "min",
+                "max",
+                "diff",
+                "mean",
+                "median",
+                "std",
+                "variance",
+                "percentile",
+                "quantile"
+            ]
+            When choosing percentil or quantile, the `q` kwarg should be specified.
+        filter_dst (str): Path to the output filtered raster
+
+    Kwargs:
+        q: Percentile or quantile to use if `method` is percentile or quantile
     """
-    if method == "idw":
-        with GrassRunner(raster_source) as gr:
-            gr.run_command(
-                "r.fill.stats",
-                (raster_source, "input", "raster"),
-                input="input",
-                output="output",
+
+    @jit(nopython=True, nogil=True)
+    def apply_filter(a, kernel, nodata, i_start, j_start, i_end, j_end, method, q):
+        output = np.full(a.shape, nodata, np.float32)
+
+        for i in range(i_start, a.shape[1] - i_end):
+            for j in range(j_start, a.shape[2] - j_end):
+
+                sample = np.full(kernel.shape, np.nan, np.float32)
+                for k_i in range(kernel.shape[0]):
+                    for k_j in range(kernel.shape[1]):
+                        if kernel[k_i, k_j]:
+                            val = a[0, i + k_i - i_start, j + k_j - j_start]
+                            if val != nodata:
+                                sample[k_i, k_j] = val
+
+                if method == "sum":
+                    output_val = np.nansum(sample)
+                elif method == "min":
+                    output_val = np.nanmin(sample)
+                elif method == "max":
+                    output_val = np.nanmax(sample)
+                elif method == "diff":
+                    output_val = np.nanmax(sample) - np.nanmin(sample)
+                elif method == "mean":
+                    output_val = np.nanmean(sample)
+                elif method == "median":
+                    output_val = np.nanmedian(sample)
+                elif method == "std":
+                    output_val = np.nanstd(sample)
+                elif method == "variance":
+                    output_val = np.nanvar(sample)
+                elif method == "percentile":
+                    output_val = np.nanpercentile(sample, q)
+                elif method == "quantile":
+                    output_val = np.nanquantile(sample, q)
+
+                output[0, i, j] = nodata if np.isnan(output_val) else output_val
+
+        return output
+
+    nodata = Raster(raster_source).nodata
+    src = from_raster(raster_source)
+
+    if isinstance(kernel, tuple):
+        if len(kernel) != 2:
+            raise IndexError(
+                f"Input kernel {kernel} does not have values for two dimensions"
             )
-            gr.save_raster("output", destination)
+
+        kernel = np.ones(kernel, bool)
+    else:
+        if kernel.ndim != 2:
+            raise IndexError(
+                f"Input kernel of shape {kernel.shape} does not have two dimensions"
+            )
+
+        kernel = np.array(kernel, dtype=bool)
+
+    i_start = int(np.ceil((kernel.shape[0] - 1) / 2.0))
+    i_end = kernel.shape[0] - 1 - i_start
+    j_start = int(np.ceil(kernel.shape[1] - 1) / 2.0)
+    j_end = kernel.shape[1] - 1 - j_start
+
+    depth = {
+        0: 0,
+        1: i_start,
+        2: j_start,
+    }
+
+    filter_result = da.map_overlap(
+        apply_filter,
+        src,
+        depth=depth,
+        boundary=nodata,
+        dtype=np.float32,
+        kernel=kernel,
+        nodata=nodata,
+        i_start=i_start,
+        j_start=j_start,
+        i_end=i_end,
+        j_end=j_end,
+        method=method,
+        q=kwargs.get("q", 25),
+    )
+
+    to_raster(
+        da.ma.masked_where(filter_result == nodata, filter_result),
+        raster_source,
+        filter_dst,
+    )
+
+
+def fill_stats(raster_source: str, destination: str, method: str = "wmean", **kwargs):
+    """Interpolate small regions with no data in a raster.
+
+    See https://grass.osgeo.org/grass82/manuals/r.fill.stats.html
+
+    Args:
+        raster_source (str): Input raster dataset to interpolate
+        destination (str): Destination raster dataset
+        method (str, optional): Interpolation method. Choose one of:
+        [
+             "wmean", "mean", "median", mode"
+        ]
+        Defaults to "linear".
+
+    Kwargs:
+        distance (int): Number of cells to fill surrounding regions with data.
+        Defaults to 3.
+    """
+    with GrassRunner(raster_source) as gr:
+        gr.run_command(
+            "r.fill.stats",
+            (raster_source, "input", "raster"),
+            input="input",
+            output="output",
+            mode=method,
+            distance=kwargs.get("distance", 3),
+        )
+        gr.save_raster("output", destination)
 
 
 def cubic_spline(
@@ -129,7 +270,7 @@ class PointInterpolator:
         n_neighbours = min(n_neighbours, self.obs_z.size)
 
         def idw_callable(distance):
-            return 1 / (distance ** 2)
+            return 1 / (distance**2)
 
         knn = KNeighborsRegressor(n_neighbors=n_neighbours, weights=idw_callable).fit(
             self.obs, self.obs_z
@@ -261,7 +402,7 @@ def full_idw(args):
                 coincident = obs_z[obs_row]
                 break
             else:
-                weight = 1 / distance ** 2
+                weight = 1 / distance**2
 
             weights[obs_row] = weight
             weights_sum += weight
