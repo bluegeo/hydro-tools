@@ -19,6 +19,7 @@ from hydrotools.raster import (
 from hydrotools.utils import GrassRunner
 from hydrotools.watershed import extract_streams, flow_direction_accumulation
 from hydrotools.elevation import slope
+from hydrotools.interpolate import fill_nodata, distance_transform
 
 
 def sinuosity(
@@ -117,7 +118,12 @@ def sinuosity(
 
 
 def bankfull_width(
-    accumulation: str, precip: str, bankfull: str, min_area: float = 1e6
+    accumulation: str,
+    precip: str,
+    bankfull: str,
+    min_area: float = 1e6,
+    streams: Union[str, None] = None,
+    distribute: bool = False,
 ):
     """Estimate theoretical bankfull width using:
 
@@ -140,41 +146,66 @@ def bankfull_width(
         bankfull (str): Destination raster for bankfull grid
         min_area (float, optional): Minimum contributing area for streams in m.
         Defaults to 1E6.
+        streams (Union[str, None], optional): Input streams raster. Defaults to None.
+        distribute (bool, optional): Expand bankfull width to the calculated width
+        surrounding streams. Defaults to False.
     """
     ca_specs = Raster(accumulation)
     fa = from_raster(accumulation)
-    contrib_area = fa.astype("float32") * (ca_specs.csx * ca_specs.csy / 1e6)
-    contrib_area = da.ma.masked_where(contrib_area < min_area / 1e6, contrib_area)
+    contrib_area = fa.astype("float32") * ((ca_specs.csx * ca_specs.csy) / 1e6)
+
+    if streams is not None:
+        stream_mask = da.ma.getmaskarray(from_raster(streams))
+    else:
+        stream_mask = contrib_area < min_area / 1e6
+
+    contrib_area = da.ma.masked_where(stream_mask, contrib_area)
 
     precip_cm = from_raster(precip).astype("float32") / 10
 
     bankfull_width = 0.196 * (contrib_area**0.280) * (precip_cm**0.355)
 
-    to_raster(
-        da.ma.masked_where(
-            da.isinf(bankfull_width) | da.isnan(bankfull_width), bankfull_width
-        ),
-        precip,
-        bankfull,
-    )
+    if distribute:
+        with TempRasterFiles(4) as (distance_dst, bf_dst, interp_dst, stream_dst):
+            if streams is None:
+                to_raster(
+                    ~stream_mask,
+                    accumulation,
+                    stream_dst,
+                    overviews=False,
+                )
+            else:
+                stream_dst = streams
+            # Distance to streams
+            distance_transform(stream_dst, distance_dst)
 
+            # Interpolated Bankfull width
+            to_raster(
+                bankfull_width,
+                accumulation,
+                bf_dst,
+                overviews=False,
+            )
+            fill_nodata(
+                bf_dst,
+                interp_dst,
+            )
 
-def bankfull_mask(dem: str, bankfull_width: str):
-    """Generate a mask around streams guided by a distance derived from bankfull width,
-     which is calculated using `morphology.bankfull`.
+            output_bankfull = from_raster(interp_dst)
+            output_bankfull = da.ma.masked_where(
+                from_raster(distance_dst) > (output_bankfull / 2), output_bankfull
+            )
 
-    Args:
-        dem (str): [description]
-        bankfull_width (str): [description]
-    """
-    # Create distance transform to streams
+            to_raster(output_bankfull, accumulation, bankfull)
 
-    # Interpolate nodata for bankfull width
-
-    # Mask areas where distance exceeds interpolated bankfull
-
-    # return mask
-    raise NotImplementedError("Method not complete")
+    else:
+        to_raster(
+            da.ma.masked_where(
+                da.isinf(bankfull_width) | da.isnan(bankfull_width), bankfull_width
+            ),
+            accumulation,
+            bankfull,
+        )
 
 
 def topographic_wetness(
@@ -206,7 +237,7 @@ def topographic_wetness(
     cost = raster_where(da.ma.getmaskarray(streams), cost, 0)
 
     # Generate least cost surface
-    with TempRasterFile() as streams_path, TempRasterFile() as cost_path, TempRasterFile() as cost_surface:
+    with TempRasterFiles(3) as (streams_path, cost_path, cost_surface):
         to_raster(cost, slope, cost_path, False)
         to_raster(streams, slope, streams_path, False)
 
@@ -241,9 +272,10 @@ def riparian_connectivity(dem: str, connectivity_dst, min_ws_area: float, **kwar
     Args:
         dem (str): Input Digital Elevation Model raster
     """
-    with TempRasterFiles(6) as (
+    with TempRasterFiles(7) as (
         accumulation_dst,
-        direction_dst,
+        direction_dst1,
+        direction_dst2,
         stream_dst,
         slope_dst,
         cost_dst,
@@ -252,7 +284,7 @@ def riparian_connectivity(dem: str, connectivity_dst, min_ws_area: float, **kwar
         # Derive streams
         flow_direction_accumulation(
             dem,
-            direction_dst,
+            direction_dst1,
             accumulation_dst,
             False,
             False,
@@ -262,7 +294,7 @@ def riparian_connectivity(dem: str, connectivity_dst, min_ws_area: float, **kwar
             dem,
             accumulation_dst,
             stream_dst,
-            direction_dst,
+            direction_dst2,
             min_ws_area,
             kwargs.get("min_length", 0),
         )

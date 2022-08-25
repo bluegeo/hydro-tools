@@ -138,6 +138,50 @@ def raster_filter(
     )
 
 
+def distance_transform(raster_source: str, distance_dst: str):
+    """Calculate a distance transform where cells with values of nodata are given
+    values of distance to the nearest cell with valid data.
+
+    Args:
+        raster_source (str): Raster used to provide locations of valid data.
+        distance_dst (str): Output distance transform raster.
+    """
+    with GrassRunner(raster_source) as gr:
+        gr.run_command(
+            "r.grow.distance",
+            (raster_source, "input", "raster"),
+            input="input",
+            distance="output",
+        )
+        gr.save_raster("output", distance_dst)
+
+
+def fill_nodata(raster_source: str, destination: str, method: str = "rst"):
+    """Fill regions of no data in a raster with interpolated values.
+
+    Args:
+        raster_source (str): Input raster to be interpolated.
+        destination (str): Output raster with interpolated values replacing no data.
+        method (str, optional): Select one of:
+            ["bilinear", "bicubic", "rst"]
+        Defaults to "rst".
+    """
+    if method.lower() not in ["bilinear", "bicubic", "rst"]:
+        raise ValueError(
+            f"Method {method} not recognized as a valid interpolation method"
+        )
+
+    with GrassRunner(raster_source) as gr:
+        gr.run_command(
+            "r.fillnulls",
+            (raster_source, "input", "raster"),
+            input="input",
+            output="output",
+            method=method.lower(),
+        )
+        gr.save_raster("output", destination)
+
+
 def fill_stats(raster_source: str, destination: str, method: str = "wmean", **kwargs):
     """Interpolate small regions with no data in a raster.
 

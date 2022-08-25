@@ -1,6 +1,5 @@
 import os
 import shutil
-from tempfile import gettempdir
 from typing import List, Tuple, Union
 import warnings
 from subprocess import run
@@ -14,7 +13,7 @@ from pyproj import Transformer, CRS
 from grass.script import core as grass  # noqa
 from grass.pygrass.modules.shortcuts import raster as graster  # noqa
 
-from hydrotools.config import GRASS_TMP, GRASS_LOCATION, GRASS_FLAGS, GDAL_DEFAULT_ARGS
+from hydrotools.config import GRASS_TMP, GRASS_LOCATION, GRASS_FLAGS
 
 
 warnings.filterwarnings("ignore")
@@ -45,7 +44,10 @@ class GrassRunner(Session):
 
     def __exit__(self, exception_type, exception, traceback):
         super().__exit__(exception_type, exception, traceback)
-        shutil.rmtree(os.path.join(GRASS_TMP, GRASS_LOCATION))
+        try:
+            shutil.rmtree(os.path.join(GRASS_TMP, GRASS_LOCATION))
+        except:
+            print("Warning: unable to remove grass env")
 
     def run_command(self, cmd: str, *args, **kwargs):
         """Run a grass command
@@ -99,6 +101,7 @@ class GrassRunner(Session):
                 "COMPRESS=LZW",
                 "BIGTIFF=YES",
             ],
+            flags="c",
             **kwargs,
         )
 
