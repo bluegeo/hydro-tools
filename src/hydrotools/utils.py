@@ -2,7 +2,7 @@ import os
 import shutil
 from typing import List, Tuple, Union
 import warnings
-from subprocess import run
+from tempfile import _get_candidate_names
 
 import numpy as np
 import dask.array as da
@@ -13,7 +13,7 @@ from pyproj import Transformer, CRS
 from grass.script import core as grass  # noqa
 from grass.pygrass.modules.shortcuts import raster as graster  # noqa
 
-from hydrotools.config import GRASS_TMP, GRASS_LOCATION, GRASS_FLAGS
+from hydrotools.config import GRASS_TMP, GRASS_FLAGS
 
 
 warnings.filterwarnings("ignore")
@@ -34,10 +34,11 @@ class GrassRunner(Session):
             dataset (str): GRASS mapset initialization data.
         """
         self.dataset = dataset
+        self.grass_location = f"hydro-tools-grass-{next(_get_candidate_names())}"
 
     def __enter__(self):
         super().__init__(
-            gisdb=GRASS_TMP, location=GRASS_LOCATION, create_opts=self.dataset
+            gisdb=GRASS_TMP, location=self.grass_location, create_opts=self.dataset
         )
         super().__enter__()
         return self
@@ -45,7 +46,7 @@ class GrassRunner(Session):
     def __exit__(self, exception_type, exception, traceback):
         super().__exit__(exception_type, exception, traceback)
         try:
-            shutil.rmtree(os.path.join(GRASS_TMP, GRASS_LOCATION))
+            shutil.rmtree(os.path.join(GRASS_TMP, self.grass_location))
         except:
             print("Warning: unable to remove grass env")
 
@@ -66,7 +67,7 @@ class GrassRunner(Session):
         for dataset, key, _type in args:
             ds_kwargs = {"input": dataset, "output": key}
             ds_kwargs.update(GRASS_FLAGS)
-            
+
             if _type.lower() == "vector":
                 grass.run_command("v.in.ogr", **ds_kwargs)
             elif _type.lower() == "raster":

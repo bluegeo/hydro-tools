@@ -10,7 +10,6 @@ import numpy as np
 
 from hydrotools.raster import (
     Raster,
-    TempRasterFile,
     TempRasterFiles,
     raster_where,
     from_raster,
@@ -19,7 +18,7 @@ from hydrotools.raster import (
 from hydrotools.utils import GrassRunner
 from hydrotools.watershed import extract_streams, flow_direction_accumulation
 from hydrotools.elevation import slope
-from hydrotools.interpolate import fill_nodata, distance_transform
+from hydrotools.interpolate import fill_stats
 
 
 def sinuosity(
@@ -123,21 +122,25 @@ def bankfull_width(
     bankfull: str,
     min_area: float = 1e6,
     streams: Union[str, None] = None,
-    distribute: bool = False,
+    bw_coeff: float = 0.196,
+    a_exp: float = 0.280,
+    p_exp: float = 0.355,
 ):
-    """Estimate theoretical bankfull width using:
+    """Estimate bankfull width with empirically-derived constants using:
 
-    bankfull_depth = 0.196 * (contrib_area[km2] ** 0.280) * (precip[cm] ** 0.355)
+    bankfull_width = bw_coeff * (contrib_area[km2] ** a_exp) * (precip[cm/yr] ** p_exp)
 
-    Method from:
+    Method and defaults from:
 
-    Hall, J. E., D. M. Holzer, and T. J. Beechie. 2007. Predicting river floodplain and lateral channel migration
-        for salmon habitat conservation. Journal of the American Water Resources Association 43:786–797
+    Hall, J. E., D. M. Holzer, and T. J. Beechie. 2007. Predicting river floodplain and
+        lateral channel migration for salmon habitat conservation. Journal of the
+        American Water Resources Association 43:786-797.
 
     Note, ensure the spatial reference of the rasters is a projected system in metres.
 
-    For the best results, the average annual precipitation should be summarized for
-    every position on the streams using the result of a `WatershedIndex` mean grid.
+    For the best results, the total annual precipitation should be summarized for
+    every position on the streams using the result of a `WatershedIndex` statistical
+    summary where the maximum value is used.
 
     Args:
         accumulation (str): Flow accumulation grid
@@ -147,8 +150,6 @@ def bankfull_width(
         min_area (float, optional): Minimum contributing area for streams in m.
         Defaults to 1E6.
         streams (Union[str, None], optional): Input streams raster. Defaults to None.
-        distribute (bool, optional): Expand bankfull width to the calculated width
-        surrounding streams. Defaults to False.
     """
     ca_specs = Raster(accumulation)
     fa = from_raster(accumulation)
@@ -163,47 +164,83 @@ def bankfull_width(
 
     precip_cm = from_raster(precip).astype("float32") / 10
 
-    bankfull_width = 0.196 * (contrib_area**0.280) * (precip_cm**0.355)
+    bankfull_width = bw_coeff * (contrib_area**a_exp) * (precip_cm**p_exp)
 
-    if distribute:
-        with TempRasterFiles(4) as (distance_dst, bf_dst, interp_dst, stream_dst):
-            if streams is None:
-                to_raster(
-                    ~stream_mask,
-                    accumulation,
-                    stream_dst,
-                    overviews=False,
-                )
-            else:
-                stream_dst = streams
-            # Distance to streams
-            distance_transform(stream_dst, distance_dst)
+    to_raster(
+        da.ma.masked_where(
+            da.isinf(bankfull_width) | da.isnan(bankfull_width), bankfull_width
+        ),
+        accumulation,
+        bankfull,
+    )
 
-            # Interpolated Bankfull width
+
+def bankfull_depth(
+    bankfull_width: str,
+    bankfull: str,
+    b_d_coeff: float = 0.145,
+    b_w_exp: float = 0.607,
+    dem: str = None,
+    max_bankfull_width: float = 100.0,
+):
+    """Generate a bankfull depth dataset, or a bankfull extent dataset if a DEM is
+    optionally provided.
+
+    Method and defaults from:
+
+    Hall, J. E., D. M. Holzer, and T. J. Beechie. 2007. Predicting river floodplain and
+        lateral channel migration for salmon habitat conservation. Journal of the
+        American Water Resources Association 43:786-797.
+
+    Args:
+        bankfull_width (str): Bankfull width along streams derived from `bankfull_width`
+        bankfull (str): Output bankfull depth or bankfull mask dataset.
+        b_d_coeff (float, optional): Bankfull depth coefficient. Defaults to 0.145.
+        b_w_exp (float, optional): Bankfull width exponent. Defaults to 0.607.
+        dem (str, optional): Path to a Digital Elevation Model grid. Defaults to None.
+        max_bankfull_width (float, optional): If a DEM is provided, (meaning bankfull
+        extent is returned), set a maximum width for the bankfull extent. Larger numbers
+        will result in longer computation time. Defaults to 100m.
+    """
+    bankfull_depth = b_d_coeff * (from_raster(bankfull_width) ** b_w_exp)
+
+    if dem is not None:
+        with TempRasterFiles(2) as (bf_dst, interp_dst):
+            # Bankfull elevation
             to_raster(
+                from_raster(dem) + bankfull_depth,
                 bankfull_width,
-                accumulation,
                 bf_dst,
                 overviews=False,
             )
-            fill_nodata(
+
+            # Interpolate bankfull elevation around streams. This must be done
+            # piece-wise to ensure values are not collected from two different streams.
+            r_spec = Raster(bankfull_width)
+            iters = int(
+                np.ceil(
+                    float(max_bankfull_width)
+                    / np.sqrt(r_spec.csx**2 + r_spec.csy**2)
+                )
+            )
+
+            fill_stats(
                 bf_dst,
                 interp_dst,
+                distance=1,
+                cells=1,
+                iters=iters,
             )
 
-            output_bankfull = from_raster(interp_dst)
-            output_bankfull = da.ma.masked_where(
-                from_raster(distance_dst) > (output_bankfull / 2), output_bankfull
+            to_raster(
+                from_raster(interp_dst) >= from_raster(dem),
+                bankfull_width,
+                bankfull,
             )
-
-            to_raster(output_bankfull, accumulation, bankfull)
-
     else:
         to_raster(
-            da.ma.masked_where(
-                da.isinf(bankfull_width) | da.isnan(bankfull_width), bankfull_width
-            ),
-            accumulation,
+            bankfull_depth,
+            bankfull_width,
             bankfull,
         )
 
@@ -266,18 +303,34 @@ def topographic_wetness(
         to_raster(cs_inverted, slope, destination)
 
 
-def riparian_connectivity(dem: str, connectivity_dst, min_ws_area: float, **kwargs):
+def riparian_connectivity(
+    dem: str,
+    annual_precip: str,
+    connectivity_dst: str,
+    min_ws_area: float = 1e6,
+    **kwargs
+):
     """Calculate regions of riparian connectivity surrounding streams
 
     Args:
-        dem (str): Input Digital Elevation Model raster
+        dem (str): Input Digital Elevation Model raster.
+        annual_precip (str): Grid of annual precipitation in mm.
+        connectivity_dst (str): Output vector dataset with categorized riparian
+        connectivity zones ranging from 1 to 3.
+        min_ws_area: Minimum contributing area (m2) used to classify streams. Defaults
+        to 1e6 (1 km squared).
     """
-    with TempRasterFiles(7) as (
+    dem_rast = Raster(dem)
+    if not np.isclose(dem_rast.csx - dem_rast.csy, 0):
+        raise ValueError("Input grid must be isotropic")
+
+    with TempRasterFiles(8) as (
         accumulation_dst,
         direction_dst1,
         direction_dst2,
         stream_dst,
         slope_dst,
+        bankfull_dst,
         cost_dst,
         lcp_dst,
     ):
@@ -300,10 +353,19 @@ def riparian_connectivity(dem: str, connectivity_dst, min_ws_area: float, **kwar
         )
 
         # Create a cost surface
+        # Source regions are comprised of Bankfull Width
+        bankfull_width(
+            accumulation_dst,
+            annual_precip,
+            bankfull_dst,
+            streams=stream_dst,
+            distribute=True,
+        )
+
         slope(dem, slope_dst, overviews=False)
 
         cost = raster_where(
-            da.ma.getmaskarray(from_raster(stream_dst)),
+            da.ma.getmaskarray(from_raster(bankfull_dst)),
             da.clip(from_raster(slope_dst), 0.0, 90.0) / 90.0,
             0,
         )
@@ -334,10 +396,6 @@ def riparian_connectivity(dem: str, connectivity_dst, min_ws_area: float, **kwar
         # to_raster(raster_where(da.ma.getmaskarray(from_raster(stream_dst)), from_raster(dem), None))
         # slope(strem_elev_dst, stream_slope_dst, overviews=False)
         # 1 - da.clip(from_raster(stream_slope_dst), 0.0, 90.0) / 90
-
-        # Bankfull width
-        # contrib_area = fa.astype("float32") * (ca_specs.csx * ca_specs.csy / 1e6)
-        # contrib_area = da.ma.masked_where(contrib_area < min_area / 1e6, contrib_area)
 
         # precip_cm = from_raster(precip).astype("float32") / 10
 

@@ -86,16 +86,22 @@ def area_to_cells(src: str, area: float):
     return int(np.ceil(area / (r.csx * r.csy)))
 
 
-def auto_basin(dem: str, min_area: float, basin_dataset: str):
+def auto_basin(dem: str, min_area: float, basin_dataset: str, mem_manage: bool = False):
     """Automatically generate basins throughout a dataset that are larger than a minimum area
 
     Args:
-        dem (str): Digital Elevation Model raster
-        min_area (float): Minimum basin area to constrain size
-        basin_dataset (str): Output raster data containing labeled basins
+        dem (str): Digital Elevation Model raster.
+        min_area (float): Minimum basin area to constrain size.
+        basin_dataset (str): Output raster data containing labeled basins.
+        mem_manage (bool, optional): Manage memory during execution. Defaults to False.
     """
     # Min Area needs to be converted to cells
     min_area_cells = area_to_cells(dem, min_area)
+
+    flags = "s"
+
+    if mem_manage:
+        flags += "m"
 
     with GrassRunner(dem) as gr:
         gr.run_command(
@@ -104,7 +110,7 @@ def auto_basin(dem: str, min_area: float, basin_dataset: str):
             elevation="dem",
             threshold=min_area_cells,
             basin="b",
-            flags="s",
+            flags=flags,
         )
         gr.save_raster("b", basin_dataset)
 
