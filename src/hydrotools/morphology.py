@@ -239,43 +239,29 @@ def bankfull_extent(
         Defaults to 1.
     """
     # Bankfull elevation
-    elev = from_raster(dem)
-    bf_elevation = elev + from_raster(bankfull_depth) * flood_factor
+    elevation = from_raster(dem)
+    bf_elevation = elevation + from_raster(bankfull_depth) * flood_factor
+    da.ma.set_fill_value(elevation, -999)
+    da.ma.set_fill_value(bf_elevation, -999)
 
     # Load stream locations and DEM into memory
-    (_, i, j), data, elev = da.compute(
+    (_, i, j), bfe, elev = da.compute(
         da.where(~da.ma.getmaskarray(bf_elevation)),
-        bf_elevation[~da.ma.getmaskarray(bf_elevation)].astype("float32"),
-        elev,
+        da.ma.filled(bf_elevation),
+        da.ma.filled(elevation),
     )
 
     raster_specs = Raster.raster_specs(dem)
     shape = raster_specs["shape"][1], raster_specs["shape"][2]
     csx, csy = raster_specs["csx"], raster_specs["csy"]
-    stack = np.array([i, j]).T
+
+    stack = List(np.array([i, j]).T.tolist())
     del i, j
 
     @njit
-    def populate_data(stack, data, location_dict):
-        for idx in range(data.size):
-            i = stack[idx][0]
-            j = stack[idx][1]
-            try:
-                location_dict[i][j] = data[idx]
-            except:
-                location_dict[i] = {j: data[idx]}
-
-    data_j_dict = Dict.empty(key_type=types.int64, value_type=types.float32)
-    data_i_dict = Dict.empty(key_type=types.int64, value_type=typeof(data_j_dict))
-    populate_data(stack, data, data_i_dict)
-
-    @njit
-    def interpolate(stack, data, i_bound, j_bound, i_sampling, j_sampling, z_limit):
-        while True:
-            try:
-                i, j = stack.pop(0)
-            except:
-                break
+    def interpolate(stack, data, z_limit, i_bound, j_bound, i_sampling, j_sampling):
+        while len(stack) > 0:
+            i, j = stack.pop(0)
 
             data_values = []
             data_loc_i = []
@@ -291,13 +277,14 @@ def bankfull_extent(
                     if j_nbr == j_bound or j_nbr < 0:
                         continue
 
-                    try:
-                        data_values.append(data[i_nbr][j_nbr])
-                        data_loc_i.append(i_nbr)
-                        data_loc_j.append(j_nbr)
-                    except:
-                        i_new.append(i_nbr)
-                        j_new.append(j_nbr)
+                    if z_limit[0, i_nbr, j_nbr] != -999:
+                        if data[0, i_nbr, j_nbr] == -999:
+                            i_new.append(i_nbr)
+                            j_new.append(j_nbr)
+                        else:
+                            data_values.append(data[0, i_nbr, j_nbr])
+                            data_loc_i.append(i_nbr)
+                            data_loc_j.append(j_nbr)                            
 
             for idx in range(len(i_new)):
                 # Interpolate the new value using IDW
@@ -315,27 +302,13 @@ def bankfull_extent(
 
                 if z_limit[0, i_new[idx], j_new[idx]] < new_value:
                     stack.append([i_new[idx], j_new[idx]])
-                    try:
-                        data[i_new[idx]][j_new[idx]] = new_value
-                    except:
-                        data[i_new[idx]] = {j_new[idx]: new_value}
+                    data[0, i_new[idx], j_new[idx]] = new_value
 
-    stack = List(stack.tolist())
-    interpolate(stack, data_i_dict, shape[0], shape[1], csy, csx, elev)
-
-    # Assign the data locations to an array
-    @njit
-    def populate_result(data, result):
-        for i, j_dict in data.items():
-            for j in j_dict.keys():
-                result[0, i, j] = True
-
-    bf_extent = np.ones_like(elev, dtype="bool")
-    populate_result(data_i_dict, bf_extent)
+    interpolate(stack, bfe, elev, shape[0], shape[1], csy, csx)
 
     to_raster(
-        da.from_array(bf_extent),
-        bankfull_width,
+        da.from_array(bfe != -999),
+        bankfull_depth,
         bankfull_extent,
     )
 
