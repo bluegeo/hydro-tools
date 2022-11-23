@@ -7,7 +7,7 @@ import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
 from numba import njit, types, typeof
-from numba.typed import Dict
+from numba.typed import Dict, List
 import numpy as np
 
 from hydrotools.raster import (
@@ -20,7 +20,6 @@ from hydrotools.raster import (
 from hydrotools.utils import GrassRunner
 from hydrotools.watershed import extract_streams, flow_direction_accumulation
 from hydrotools.elevation import slope
-from hydrotools.interpolate import fill_stats
 
 
 def sinuosity(
@@ -243,41 +242,44 @@ def bankfull_extent(
     elev = from_raster(dem)
     bf_elevation = elev + from_raster(bankfull_depth) * flood_factor
 
-    (_, i, j), data = da.compute(
-        da.where(~da.ma.getmaskarray(bf_elevation)).astype("int32"),
-        bf_elevation[~da.ma.getmaskarray(bf_elevation)].astype("float32")
+    # Load stream locations and DEM into memory
+    (_, i, j), data, elev = da.compute(
+        da.where(~da.ma.getmaskarray(bf_elevation)),
+        bf_elevation[~da.ma.getmaskarray(bf_elevation)].astype("float32"),
+        elev,
     )
 
-    stack = np.array([i, j]).T.tolist()
+    raster_specs = Raster.raster_specs(dem)
+    shape = raster_specs["shape"][1], raster_specs["shape"][2]
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
+    stack = np.array([i, j]).T
+    del i, j
 
     @njit
-    def populate_data(loc_i, loc_j, data, location_dict):
-        for i in range(data.size):
+    def populate_data(stack, data, location_dict):
+        for idx in range(data.size):
+            i = stack[idx][0]
+            j = stack[idx][1]
             try:
-                location_dict[loc_i[i]][location_dict[loc_j[i]]] = data[i]
+                location_dict[i][j] = data[idx]
             except:
-                location_dict[loc_i[i]] = {location_dict[loc_j[i]]: data[i]}
+                location_dict[i] = {j: data[idx]}
 
-    data_j_dict = Dict.empty(
-        key_type=types.int32,
-        value_type=types.float32
-    )
-    data_i_dict = Dict.empty(
-        key_type=types.int32,
-        value_type=typeof(data_j_dict)
-    )
-    populate_data(i, j, data, data_i_dict)
+    data_j_dict = Dict.empty(key_type=types.int64, value_type=types.float32)
+    data_i_dict = Dict.empty(key_type=types.int64, value_type=typeof(data_j_dict))
+    populate_data(stack, data, data_i_dict)
 
     @njit
-    def interpolate(stack, data, i_bound, j_bound):
+    def interpolate(stack, data, i_bound, j_bound, i_sampling, j_sampling, z_limit):
         while True:
             try:
-                i, j = stack.pop()
+                i, j = stack.pop(0)
             except:
                 break
 
-            accum = 0
-            mode = 0
+            data_values = []
+            data_loc_i = []
+            data_loc_j = []
             i_new = []
             j_new = []
             for i_off in range(-1, 2):
@@ -290,24 +292,49 @@ def bankfull_extent(
                         continue
 
                     try:
-                        accum += data[i_nbr][j_nbr]
-                        mode += 1
+                        data_values.append(data[i_nbr][j_nbr])
+                        data_loc_i.append(i_nbr)
+                        data_loc_j.append(j_nbr)
                     except:
                         i_new.append(i_nbr)
                         j_new.append(j_nbr)
 
-            new_value = accum / mode # TODO: Add distance weightning to mean
             for idx in range(len(i_new)):
-                stack.append([i_new[idx], j_new[idx]])
-                try:
-                    data[i_new[idx]][j_new[idx]] = new_value
-                except:
-                    data[i_new[idx]] = {j_new[idx]: new_value}
+                # Interpolate the new value using IDW
+                accum = 0
+                total_distance = 0
+                for data_idx in range(len(data_values)):
+                    dist = 1 / np.sqrt(
+                        (i_new[idx] - data_loc_i[data_idx] * i_sampling) ** 2.0
+                        + (j_new[idx] - data_loc_j[data_idx] * j_sampling) ** 2.0
+                    )
+                    accum += data_values[data_idx] * dist
+                    total_distance += dist
 
-    interpolate(stack, data_i_dict, a.shape[1], a.shape[2])
+                new_value = accum / total_distance
+
+                if z_limit[0, i_new[idx], j_new[idx]] < new_value:
+                    stack.append([i_new[idx], j_new[idx]])
+                    try:
+                        data[i_new[idx]][j_new[idx]] = new_value
+                    except:
+                        data[i_new[idx]] = {j_new[idx]: new_value}
+
+    stack = List(stack.tolist())
+    interpolate(stack, data_i_dict, shape[0], shape[1], csy, csx, elev)
+
+    # Assign the data locations to an array
+    @njit
+    def populate_result(data, result):
+        for i, j_dict in data.items():
+            for j in j_dict.keys():
+                result[0, i, j] = True
+
+    bf_extent = np.ones_like(elev, dtype="bool")
+    populate_result(data_i_dict, bf_extent)
 
     to_raster(
-        bf_extent,
+        da.from_array(bf_extent),
         bankfull_width,
         bankfull_extent,
     )
