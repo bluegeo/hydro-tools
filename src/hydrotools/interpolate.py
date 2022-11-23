@@ -186,7 +186,6 @@ def fill_stats(
     raster_source: str,
     destination: str,
     method: str = "wmean",
-    iters: int = None,
     **kwargs,
 ):
     """Interpolate small regions with no data in a raster.
@@ -201,14 +200,22 @@ def fill_stats(
              "wmean", "mean", "median", mode"
         ]
         Defaults to "linear".
-        iters: Iterate the fill operation `n` times. Defaults to None.
 
     Kwargs:
         distance (int): Number of cells to fill surrounding regions with data.
         Defaults to 3.
+        use_map_units (bool): Interpret the distance as map units and not cells.
+        Defaults to False.
         cells (int): Minimum number of cells to use for interpolation sample.
         Defaults to 3.
+        smooth (bool): Smooth the grid while interpolating. Defaults to True.
     """
+    flags = "s"
+    if not kwargs.get("smooth", True):
+        flags += "k"
+    if kwargs.get("use_map_units", False):
+        flags += "m"
+
     with GrassRunner(raster_source) as gr:
         gr.run_command(
             "r.fill.stats",
@@ -218,21 +225,8 @@ def fill_stats(
             mode=method,
             distance=kwargs.get("distance", 3),
             cells=kwargs.get("cells", 3),
-            flags="ks"
+            flags=flags
         )
-
-        if iters is not None:
-            for _ in range(iters):
-                gr.run_command(
-                    "r.fill.stats",
-                    input="output",
-                    output="output",
-                    overwrite=True,
-                    mode=method,
-                    distance=kwargs.get("distance", 3),
-                    cells=kwargs.get("cells", 3),
-                    flags="ks"
-                )
 
         gr.save_raster("output", destination)
 

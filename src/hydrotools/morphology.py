@@ -6,6 +6,7 @@ from multiprocessing.dummy import Pool
 import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
+from numba import jit
 import numpy as np
 
 from hydrotools.raster import (
@@ -117,11 +118,10 @@ def sinuosity(
 
 
 def bankfull_width(
+    streams: str,
     accumulation: str,
     precip: str,
     bankfull: str,
-    min_area: float = 1e6,
-    streams: Union[str, None] = None,
     bw_coeff: float = 0.196,
     a_exp: float = 0.280,
     p_exp: float = 0.355,
@@ -138,30 +138,54 @@ def bankfull_width(
 
     Note, ensure the spatial reference of the rasters is a projected system in metres.
 
-    For the best results, the total annual precipitation should be summarized for
-    every position on the streams using the result of a `WatershedIndex` statistical
-    summary where the maximum value is used.
+    An example workflow that starts with a DEM and uses streams with a minumum
+    contributing area could look like this:
+
+    ```python
+    with TempRasterFile() as tmp_flow_direction:
+        # Compute flow accumulation. The resulting flow direction is not needed here
+        flow_direction_accumulation(
+            dem_path,
+            tmp_flow_direction,
+            accumulation_dst,
+            False,  # Multiple flow-direction
+            False,  # Allow negatives
+        )
+
+        # Compute streams with a minimum length of 0 while saving flow direction
+        extract_streams(
+            dem_path, accumulation_dst, stream_dst, flow_direction_dst, 1e6, 0
+        )
+
+        bankfull_width(
+            stream_dst,
+            accumulation_dst,
+            avg_annual_precip,
+            bankfull_dst,
+        )
+    ```
 
     Args:
-        accumulation (str): Flow accumulation grid
+        streams: Grid with stream locations
+        (generated using `watershed.extract_streams`),
+        accumulation (str): Flow accumulation dataset
         (generated using `watershed.flow_direction_accumulation`)
         precip (str): Mean annual precipitation grid in mm
         bankfull (str): Destination raster for bankfull grid
-        min_area (float, optional): Minimum contributing area for streams in m.
-        Defaults to 1E6.
         streams (Union[str, None], optional): Input streams raster. Defaults to None.
+        bw_coeff (float): Bankfull width coefficient. Defaults to 0.196.
+        a_exp (float): Area expenential scale. Defaults to 0.280.
+        p_exp (float): Precip expenential scale. Defaults to 0.355.
     """
+    # Contributing area in km**2
     ca_specs = Raster(accumulation)
     fa = from_raster(accumulation)
-    contrib_area = fa.astype("float32") * ((ca_specs.csx * ca_specs.csy) / 1e6)
+    contrib_area = da.ma.masked_where(
+        da.ma.getmaskarray(from_raster(streams)),
+        da.abs(fa.astype("float32")) * ((ca_specs.csx * ca_specs.csy) / 1e6),
+    )
 
-    if streams is not None:
-        stream_mask = da.ma.getmaskarray(from_raster(streams))
-    else:
-        stream_mask = contrib_area < min_area / 1e6
-
-    contrib_area = da.ma.masked_where(stream_mask, contrib_area)
-
+    # Convert precipitation to cm
     precip_cm = from_raster(precip).astype("float32") / 10
 
     bankfull_width = bw_coeff * (contrib_area**a_exp) * (precip_cm**p_exp)
@@ -176,17 +200,9 @@ def bankfull_width(
 
 
 def bankfull_depth(
-    bankfull_width: str,
-    bankfull: str,
-    b_d_coeff: float = 0.145,
-    b_w_exp: float = 0.607,
-    dem: str = None,
-    max_bankfull_width: float = 100.0,
+    bankfull_width: str, bankfull: str, b_d_coeff: float = 0.145, b_w_exp: float = 0.607
 ):
-    """Generate a bankfull depth dataset, or a bankfull extent dataset if a DEM is
-    optionally provided.
-
-    Method and defaults from:
+    """Generate a bankfull depth dataset. Method and defaults from:
 
     Hall, J. E., D. M. Holzer, and T. J. Beechie. 2007. Predicting river floodplain and
         lateral channel migration for salmon habitat conservation. Journal of the
@@ -197,52 +213,44 @@ def bankfull_depth(
         bankfull (str): Output bankfull depth or bankfull mask dataset.
         b_d_coeff (float, optional): Bankfull depth coefficient. Defaults to 0.145.
         b_w_exp (float, optional): Bankfull width exponent. Defaults to 0.607.
-        dem (str, optional): Path to a Digital Elevation Model grid. Defaults to None.
-        max_bankfull_width (float, optional): If a DEM is provided, (meaning bankfull
-        extent is returned), set a maximum width for the bankfull extent. Larger numbers
-        will result in longer computation time. Defaults to 100m.
     """
     bankfull_depth = b_d_coeff * (from_raster(bankfull_width) ** b_w_exp)
 
-    if dem is not None:
-        with TempRasterFiles(2) as (bf_dst, interp_dst):
-            # Bankfull elevation
-            to_raster(
-                from_raster(dem) + bankfull_depth,
-                bankfull_width,
-                bf_dst,
-                overviews=False,
-            )
+    to_raster(
+        bankfull_depth,
+        bankfull_width,
+        bankfull,
+    )
 
-            # Interpolate bankfull elevation around streams. This must be done
-            # piece-wise to ensure values are not collected from two different streams.
-            r_spec = Raster(bankfull_width)
-            iters = int(
-                np.ceil(
-                    float(max_bankfull_width)
-                    / np.sqrt(r_spec.csx**2 + r_spec.csy**2)
-                )
-            )
 
-            fill_stats(
-                bf_dst,
-                interp_dst,
-                distance=1,
-                cells=1,
-                iters=iters,
-            )
+def bankfull_extent(
+    bankfull_depth: str, dem: str, bankfull_extent: str, flood_factor: float = 1
+):
+    """Interpolate a bankfull extent surrounding streams using the bankfull elevation.
 
-            to_raster(
-                from_raster(interp_dst) >= from_raster(dem),
-                bankfull_width,
-                bankfull,
-            )
-    else:
-        to_raster(
-            bankfull_depth,
-            bankfull_width,
-            bankfull,
-        )
+    **Note**: This method is not memory-safe, as the DEM must be loaded entirely into
+    memory.
+
+    Args:
+        bankfull_depth (str): Bankfull Depth calculated using `bankfull_depth`.
+        dem (str): DEM Grid used to originally derive Bankfull Depth.
+        bankfull_extent (str): Output raster with the bankfull extent mask.
+        flood_factor (float, optional): A scaling factor to modify the bankfull depth.
+        Defaults to 1.
+    """
+    raise NotImplementedError("Method not yet complete")
+
+    # Bankfull elevation
+    elev = from_raster(dem)
+    bf_elevation = elev + from_raster(bankfull_depth) * flood_factor
+
+    bf_extent = da.zeros_like(bf_elevation, dtype=bool)
+
+    to_raster(
+        bf_extent,
+        bankfull_width,
+        bankfull_extent,
+    )
 
 
 def topographic_wetness(
