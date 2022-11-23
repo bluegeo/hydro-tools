@@ -6,7 +6,8 @@ from multiprocessing.dummy import Pool
 import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
-from numba import jit
+from numba import njit, types, typeof
+from numba.typed import Dict
 import numpy as np
 
 from hydrotools.raster import (
@@ -238,13 +239,72 @@ def bankfull_extent(
         flood_factor (float, optional): A scaling factor to modify the bankfull depth.
         Defaults to 1.
     """
-    raise NotImplementedError("Method not yet complete")
-
     # Bankfull elevation
     elev = from_raster(dem)
     bf_elevation = elev + from_raster(bankfull_depth) * flood_factor
 
-    bf_extent = da.zeros_like(bf_elevation, dtype=bool)
+    (_, i, j), data = da.compute(
+        da.where(~da.ma.getmaskarray(bf_elevation)).astype("int32"),
+        bf_elevation[~da.ma.getmaskarray(bf_elevation)].astype("float32")
+    )
+
+    stack = np.array([i, j]).T.tolist()
+
+    @njit
+    def populate_data(loc_i, loc_j, data, location_dict):
+        for i in range(data.size):
+            try:
+                location_dict[loc_i[i]][location_dict[loc_j[i]]] = data[i]
+            except:
+                location_dict[loc_i[i]] = {location_dict[loc_j[i]]: data[i]}
+
+    data_j_dict = Dict.empty(
+        key_type=types.int32,
+        value_type=types.float32
+    )
+    data_i_dict = Dict.empty(
+        key_type=types.int32,
+        value_type=typeof(data_j_dict)
+    )
+    populate_data(i, j, data, data_i_dict)
+
+    @njit
+    def interpolate(stack, data, i_bound, j_bound):
+        while True:
+            try:
+                i, j = stack.pop()
+            except:
+                break
+
+            accum = 0
+            mode = 0
+            i_new = []
+            j_new = []
+            for i_off in range(-1, 2):
+                i_nbr = i + i_off
+                if i_nbr == i_bound or i_nbr < 0:
+                    continue
+                for j_off in range(-1, 2):
+                    j_nbr = j + j_off
+                    if j_nbr == j_bound or j_nbr < 0:
+                        continue
+
+                    try:
+                        accum += data[i_nbr][j_nbr]
+                        mode += 1
+                    except:
+                        i_new.append(i_nbr)
+                        j_new.append(j_nbr)
+
+            new_value = accum / mode # TODO: Add distance weightning to mean
+            for idx in range(len(i_new)):
+                stack.append([i_new[idx], j_new[idx]])
+                try:
+                    data[i_new[idx]][j_new[idx]] = new_value
+                except:
+                    data[i_new[idx]] = {j_new[idx]: new_value}
+
+    interpolate(stack, data_i_dict, a.shape[1], a.shape[2])
 
     to_raster(
         bf_extent,
