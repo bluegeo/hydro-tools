@@ -7,7 +7,7 @@ import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
 from numba import njit, types, typeof
-from numba.typed import Dict, List
+from numba.typed import List
 import numpy as np
 
 from hydrotools.raster import (
@@ -228,8 +228,7 @@ def bankfull_extent(
 ):
     """Interpolate a bankfull extent surrounding streams using the bankfull elevation.
 
-    **Note**: This method is not memory-safe, as the DEM must be loaded entirely into
-    memory.
+    **Note**: This method is not memory-safe.
 
     Args:
         bankfull_depth (str): Bankfull Depth calculated using `bankfull_depth`.
@@ -238,16 +237,16 @@ def bankfull_extent(
         flood_factor (float, optional): A scaling factor to modify the bankfull depth.
         Defaults to 1.
     """
-    # Bankfull elevation
     elevation = from_raster(dem)
     bf_elevation = elevation + from_raster(bankfull_depth) * flood_factor
     da.ma.set_fill_value(elevation, -999)
     da.ma.set_fill_value(bf_elevation, -999)
 
     # Load stream locations and DEM into memory
-    (_, i, j), bfe, elev = da.compute(
+    (_, i, j), bfe, complete, elev = da.compute(
         da.where(~da.ma.getmaskarray(bf_elevation)),
         da.ma.filled(bf_elevation),
+        ~da.ma.getmaskarray(bf_elevation),
         da.ma.filled(elevation),
     )
 
@@ -258,53 +257,73 @@ def bankfull_extent(
     stack = List(np.array([i, j]).T.tolist())
     del i, j
 
-    @njit
-    def interpolate(stack, data, z_limit, i_bound, j_bound, i_sampling, j_sampling):
-        while len(stack) > 0:
-            i, j = stack.pop(0)
+    @njit(fastmath=True, parallel=True)
+    def interpolate(
+        stack, complete, data, z_limit, i_bound, j_bound, i_sampling, j_sampling
+    ):
+        offsets = [
+            [-1, -1],
+            [-1, 0],
+            [-1, 1],
+            [0, -1],
+            [0, 1],
+            [1, -1],
+            [1, 0],
+            [1, 1],
+        ]
 
-            data_values = []
-            data_loc_i = []
-            data_loc_j = []
-            i_new = []
-            j_new = []
-            for i_off in range(-1, 2):
-                i_nbr = i + i_off
-                if i_nbr == i_bound or i_nbr < 0:
-                    continue
-                for j_off in range(-1, 2):
+        stack_2 = List()
+        while len(stack) > 0:
+            while len(stack) > 0:
+                i, j = stack.pop()
+                for i_off, j_off in offsets:
+                    i_nbr = i + i_off
                     j_nbr = j + j_off
-                    if j_nbr == j_bound or j_nbr < 0:
+                    if i_nbr == i_bound or i_nbr < 0 or j_nbr == j_bound or j_nbr < 0:
                         continue
 
-                    if z_limit[0, i_nbr, j_nbr] != -999:
-                        if data[0, i_nbr, j_nbr] == -999:
-                            i_new.append(i_nbr)
-                            j_new.append(j_nbr)
-                        else:
-                            data_values.append(data[0, i_nbr, j_nbr])
-                            data_loc_i.append(i_nbr)
-                            data_loc_j.append(j_nbr)                            
+                    if (
+                        z_limit[0, i_nbr, j_nbr] != -999
+                        and data[0, i_nbr, j_nbr] == -999
+                        and not complete[0, i_nbr, j_nbr]
+                    ):
+                        stack_2.append([i_nbr, j_nbr])
+                        complete[0, i_nbr, j_nbr] = True
 
-            for idx in range(len(i_new)):
-                # Interpolate the new value using IDW
-                accum = 0
-                total_distance = 0
-                for data_idx in range(len(data_values)):
+            while len(stack_2) > 0:
+                i, j = stack_2.pop()
+                bf_accum = 0
+                elev_accum = 0
+                bf_distance = 0
+                elev_distance = 0
+                for i_off, j_off in offsets:
+                    i_nbr = i + i_off
+                    j_nbr = j + j_off
+
+                    if i_nbr == i_bound or i_nbr < 0 or j_nbr == j_bound or j_nbr < 0:
+                        continue
+
                     dist = 1 / np.sqrt(
-                        (i_new[idx] - data_loc_i[data_idx] * i_sampling) ** 2.0
-                        + (j_new[idx] - data_loc_j[data_idx] * j_sampling) ** 2.0
+                        (i - i_nbr * i_sampling) ** 2.0
+                        + (j - j_nbr * j_sampling) ** 2.0
                     )
-                    accum += data_values[data_idx] * dist
-                    total_distance += dist
 
-                new_value = accum / total_distance
+                    if z_limit[0, i_nbr, j_nbr] != -999:
+                        elev_accum += z_limit[0, i_nbr, j_nbr] * dist
+                        elev_distance += dist
 
-                if z_limit[0, i_new[idx], j_new[idx]] < new_value:
-                    stack.append([i_new[idx], j_new[idx]])
-                    data[0, i_new[idx], j_new[idx]] = new_value
+                    if data[0, i_nbr, j_nbr] != -999:
+                        bf_accum += data[0, i_nbr, j_nbr] * dist
+                        bf_distance += dist
 
-    interpolate(stack, bfe, elev, shape[0], shape[1], csy, csx)
+                elev_value = elev_accum / elev_distance
+                bf_value = bf_accum / bf_distance
+                limit = z_limit[0, i, j]
+                if bf_value >= limit and elev_value <= limit:
+                    stack.append([i, j])
+                    data[0, i, j] = bf_value
+
+    interpolate(stack, complete, bfe, elev, shape[0], shape[1], csy, csx)
 
     to_raster(
         da.from_array(bfe != -999),
