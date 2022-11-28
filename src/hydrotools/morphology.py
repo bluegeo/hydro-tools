@@ -239,15 +239,18 @@ def bankfull_extent(
     """
     elevation = from_raster(dem)
     bf_elevation = elevation + from_raster(bankfull_depth) * flood_factor
+    stream_elevation = da.ma.masked_where(da.ma.getmaskarray(bf_elevation), elevation)
     da.ma.set_fill_value(elevation, -999)
     da.ma.set_fill_value(bf_elevation, -999)
+    da.ma.set_fill_value(stream_elevation, -999)
 
     # Load stream locations and DEM into memory
-    (_, i, j), bfe, complete, elev = da.compute(
+    (_, i, j), bfe, elev, str_elev, complete = da.compute(
         da.where(~da.ma.getmaskarray(bf_elevation)),
         da.ma.filled(bf_elevation),
-        ~da.ma.getmaskarray(bf_elevation),
         da.ma.filled(elevation),
+        da.ma.filled(stream_elevation),
+        ~da.ma.getmaskarray(bf_elevation),
     )
 
     raster_specs = Raster.raster_specs(dem)
@@ -259,7 +262,7 @@ def bankfull_extent(
 
     @njit(fastmath=True, parallel=True)
     def interpolate(
-        stack, complete, data, z_limit, i_bound, j_bound, i_sampling, j_sampling
+        stack, complete, data, z_data, z_limit, i_bound, j_bound, i_sampling, j_sampling
     ):
         offsets = [
             [-1, -1],
@@ -294,8 +297,7 @@ def bankfull_extent(
                 i, j = stack_2.pop()
                 bf_accum = 0
                 elev_accum = 0
-                bf_distance = 0
-                elev_distance = 0
+                distance = 0
                 for i_off, j_off in offsets:
                     i_nbr = i + i_off
                     j_nbr = j + j_off
@@ -308,25 +310,22 @@ def bankfull_extent(
                         + (j - j_nbr * j_sampling) ** 2.0
                     )
 
-                    if z_limit[0, i_nbr, j_nbr] != -999:
-                        elev_accum += z_limit[0, i_nbr, j_nbr] * dist
-                        elev_distance += dist
-
                     if data[0, i_nbr, j_nbr] != -999:
                         bf_accum += data[0, i_nbr, j_nbr] * dist
-                        bf_distance += dist
+                        elev_accum += z_data[0, i_nbr, j_nbr] * dist
+                        distance += dist
 
-                elev_value = elev_accum / elev_distance
-                bf_value = bf_accum / bf_distance
+                elev_value = elev_accum / distance
+                bf_value = bf_accum / distance
                 limit = z_limit[0, i, j]
                 if bf_value >= limit and elev_value <= limit:
                     stack.append([i, j])
                     data[0, i, j] = bf_value
+                    z_data[0, i, j] = elev_value
 
-    interpolate(stack, complete, bfe, elev, shape[0], shape[1], csy, csx)
+    interpolate(stack, complete, bfe, str_elev, elev, shape[0], shape[1], csy, csx)
 
-    to_raster(
-        da.from_array(bfe != -999),
+    to_raster(da.from_array(bfe != -999),
         bankfull_depth,
         bankfull_extent,
     )
