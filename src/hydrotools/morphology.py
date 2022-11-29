@@ -6,6 +6,7 @@ from multiprocessing.dummy import Pool
 import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
+from dask_image.ndmorph import binary_dilation
 from numba import njit, types, typeof
 from numba.typed import List
 import numpy as np
@@ -329,6 +330,23 @@ def bankfull_extent(
         bankfull_depth,
         bankfull_extent,
     )
+
+
+def valley_confinement(bankfull_width: str, bankfull_extent: str, valley_confinement_dst: str):
+    """Calculate a valley confinement index - the ratio of valley width to possible
+    bankfull width.
+
+    Args:
+        bankfull_width (str): Bankfull width data source calculated using
+        `morphology.bankfull_width`.
+        bankfull_extent (str): Bankfull extent data source calculated using
+        `morphology.bankfull_extent`.
+        valley_confinement_dst (str): Output raster with valley confinement index
+        values.
+    """
+    extent = from_raster(bankfull_extent)
+
+    binary_dilation(da.ma.getmaskarray(extent)) & ~da.ma.getmaskarray(extent)
 
 
 def topographic_wetness(

@@ -6,6 +6,7 @@ from tempfile import gettempdir, _get_candidate_names
 
 import numpy as np
 import dask.array as da
+from dask.diagnostics import ProgressBar
 import rasterio
 from rasterio.windows import Window
 
@@ -467,7 +468,8 @@ def to_raster(data: da.Array, template: str, destination: str, overviews: bool =
 
     output_raster = Raster.empty_like(destination, template, dtype=dtype, nodata=nodata)
 
-    da.store([da.ma.filled(data)], [output_raster])
+    with ProgressBar():
+        da.store([da.ma.filled(data)], [output_raster])
 
     if overviews:
         cmd = ["gdaladdo", destination]

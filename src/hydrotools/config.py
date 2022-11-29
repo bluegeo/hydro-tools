@@ -25,7 +25,7 @@ GDAL_DEFAULT_ARGS = [
     "-co",
     "BLOCKYSIZE=512",
     "-co",
-    "BIGTIFF=IF_NEEDED",
+    "BIGTIFF=YES",
     "-q",
     "-multi",
     "-wo",
