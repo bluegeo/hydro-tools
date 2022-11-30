@@ -201,7 +201,10 @@ def bankfull_width(
 
 
 def bankfull_depth(
-    bankfull_width: str, bankfull: str, b_d_coeff: float = 0.145, b_w_exp: float = 0.607
+    bankfull_width_src: str,
+    bankfull_depth_dst: str,
+    b_d_coeff: float = 0.145,
+    b_w_exp: float = 0.607,
 ):
     """Generate a bankfull depth dataset. Method and defaults from:
 
@@ -210,25 +213,26 @@ def bankfull_depth(
         American Water Resources Association 43:786-797.
 
     Args:
-        bankfull_width (str): Bankfull width along streams derived from `bankfull_width`
-        bankfull (str): Output bankfull depth or bankfull mask dataset.
+        bankfull_width_src (str): Bankfull width along streams derived from
+        `morphology.bankfull_width`.
+        bankfull_depth_dst (str): Output bankfull depth or bankfull mask dataset.
         b_d_coeff (float, optional): Bankfull depth coefficient. Defaults to 0.145.
         b_w_exp (float, optional): Bankfull width exponent. Defaults to 0.607.
     """
-    bankfull_depth = b_d_coeff * (from_raster(bankfull_width) ** b_w_exp)
+    bankfull_depth = b_d_coeff * (from_raster(bankfull_width_src) ** b_w_exp)
 
     to_raster(
         bankfull_depth,
-        bankfull_width,
-        bankfull,
+        bankfull_width_src,
+        bankfull_depth_dst,
     )
 
 
 def bankfull_extent(
-    bankfull_width: str,
-    bankfull_depth: str,
+    bankfull_width_src: str,
+    bankfull_depth_src: str,
     dem: str,
-    bankfull_extent: str,
+    bankfull_extent_dst: str,
     flood_factor: float = 1,
 ):
     """Interpolate a bankfull extent surrounding streams using the bankfull elevation.
@@ -236,15 +240,17 @@ def bankfull_extent(
     **Note**: This method is not memory-safe.
 
     Args:
-        bankfull_width (str): Bankfull Depth calculated using `bankfull_width`.
-        bankfull_depth (str): Bankfull Depth calculated using `bankfull_depth`.
+        bankfull_width_src (str): Bankfull Depth calculated using
+        `morphology.bankfull_width`.
+        bankfull_depth_src (str): Bankfull Depth calculated using
+        `morphology.bankfull_depth`.
         dem (str): DEM Grid used to originally derive Bankfull Depth.
-        bankfull_extent (str): Output raster with the bankfull extent mask.
+        bankfull_extent_dst (str): Output raster with the bankfull extent mask.
         flood_factor (float, optional): A scaling factor to modify the bankfull depth.
         Defaults to 1.
     """
     elevation = from_raster(dem)
-    bf_elevation = elevation + from_raster(bankfull_depth) * flood_factor
+    bf_elevation = elevation + from_raster(bankfull_depth_src) * flood_factor
     da.ma.set_fill_value(elevation, -999)
     da.ma.set_fill_value(bf_elevation, -999)
 
@@ -253,7 +259,7 @@ def bankfull_extent(
         da.where(~da.ma.getmaskarray(bf_elevation)),
         ~da.ma.getmaskarray(bf_elevation),
         da.ma.filled(bf_elevation),
-        from_raster(bankfull_width),
+        from_raster(bankfull_width_src),
         da.zeros_like(elevation, dtype="float32"),
         da.ma.filled(elevation),
     )
@@ -355,13 +361,13 @@ def bankfull_extent(
 
     to_raster(
         da.from_array(bfe != -999),
-        bankfull_depth,
-        bankfull_extent,
+        bankfull_depth_src,
+        bankfull_extent_dst,
     )
 
 
 def valley_confinement(
-    bankfull_width: str, bankfull_extent: str, valley_confinement_dst: str
+    bankfull_width_src: str, slope_src: str, valley_confinement_dst: str
 ):
     """Calculate a valley confinement index - the ratio of valley width to possible
     bankfull width.
@@ -374,43 +380,38 @@ def valley_confinement(
         valley_confinement_dst (str): Output raster with valley confinement index
         values.
     """
-    extent = from_raster(bankfull_extent)
+    with TempRasterFiles(1) as twi_dst:
+        topographic_wetness(bankfull_width_src, slope_src, twi_dst)
 
-    binary_dilation(da.ma.getmaskarray(extent)) & ~da.ma.getmaskarray(extent)
+        binary_dilation(da.ma.getmaskarray(extent)) & ~da.ma.getmaskarray(extent)
 
 
 def topographic_wetness(
-    accumulation: str,
-    slope: str,
-    destination: str,
-    min_area: float = 1e6,
+    streams: str,
+    slope_src: str,
+    topographic_wetness_dst: str,
     cutoff: Union[float, None] = None,
 ):
     """Calculate a topographic wetness index
 
     Args:
-        accumulation (str): Flow accumulation grid
+        streams (str): Grid with stream locations
         (generated using `watershed.flow_direction_accumulation`)
-        slope (str): Topographic slope in Degrees.
-        destination (str): Output TWI grid
-        min_area (float, optional): Minimum contributing area for simulated streams.
-        Defaults to 1e6.
+        slope_src (str): Topographic slope in Degrees.
+        topographic_wetness_dst (str): Output TWI grid
         cutoff (Union[float, None]): Return the index up to a defined threshold. Defaults to None.
     """
-    ca_specs = Raster(accumulation)
-    fa = from_raster(accumulation)
-
-    streams = da.ma.masked_where(fa < min_area / (ca_specs.csx * ca_specs.csy), fa)
+    streams = ~da.ma.getmaskarray(from_raster(streams))
 
     # Generate cost surface (normalized slope)
-    cost = da.clip(from_raster(slope), 0.0, 90.0) / 90.0
+    cost = da.clip(from_raster(slope_src), 0.0, 90.0) / 90.0
     # Make cost 0 where simulated streams exist
-    cost = raster_where(da.ma.getmaskarray(streams), cost, 0)
+    cost = raster_where(~streams, cost, 0)
 
     # Generate least cost surface
     with TempRasterFiles(3) as (streams_path, cost_path, cost_surface):
-        to_raster(cost, slope, cost_path, False)
-        to_raster(streams, slope, streams_path, False)
+        to_raster(cost, slope_src, cost_path, False)
+        to_raster(streams, slope_src, streams_path, False)
 
         with GrassRunner(cost_path) as gr:
             gr.run_command(
@@ -434,7 +435,7 @@ def topographic_wetness(
 
         cs_inverted = cs_inverted.astype("float32")
 
-        to_raster(cs_inverted, slope, destination)
+        to_raster(cs_inverted, slope_src, topographic_wetness_dst)
 
 
 def riparian_connectivity(
