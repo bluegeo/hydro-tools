@@ -225,13 +225,18 @@ def bankfull_depth(
 
 
 def bankfull_extent(
-    bankfull_depth: str, dem: str, bankfull_extent: str, flood_factor: float = 1
+    bankfull_width: str,
+    bankfull_depth: str,
+    dem: str,
+    bankfull_extent: str,
+    flood_factor: float = 1,
 ):
     """Interpolate a bankfull extent surrounding streams using the bankfull elevation.
 
     **Note**: This method is not memory-safe.
 
     Args:
+        bankfull_width (str): Bankfull Depth calculated using `bankfull_width`.
         bankfull_depth (str): Bankfull Depth calculated using `bankfull_depth`.
         dem (str): DEM Grid used to originally derive Bankfull Depth.
         bankfull_extent (str): Output raster with the bankfull extent mask.
@@ -240,18 +245,17 @@ def bankfull_extent(
     """
     elevation = from_raster(dem)
     bf_elevation = elevation + from_raster(bankfull_depth) * flood_factor
-    stream_elevation = da.ma.masked_where(da.ma.getmaskarray(bf_elevation), elevation)
     da.ma.set_fill_value(elevation, -999)
     da.ma.set_fill_value(bf_elevation, -999)
-    da.ma.set_fill_value(stream_elevation, -999)
 
     # Load stream locations and DEM into memory
-    (_, i, j), bfe, elev, str_elev, complete = da.compute(
+    (_, i, j), complete, bfe, bfw, str_dist, elev = da.compute(
         da.where(~da.ma.getmaskarray(bf_elevation)),
-        da.ma.filled(bf_elevation),
-        da.ma.filled(elevation),
-        da.ma.filled(stream_elevation),
         ~da.ma.getmaskarray(bf_elevation),
+        da.ma.filled(bf_elevation),
+        from_raster(bankfull_width),
+        da.zeros_like(elevation, dtype="float32"),
+        da.ma.filled(elevation),
     )
 
     raster_specs = Raster.raster_specs(dem)
@@ -263,7 +267,16 @@ def bankfull_extent(
 
     @njit(fastmath=True, parallel=True)
     def interpolate(
-        stack, complete, data, z_data, z_limit, i_bound, j_bound, i_sampling, j_sampling
+        stack,
+        complete,
+        bfe,
+        bfw,
+        str_dist,
+        elev,
+        i_bound,
+        j_bound,
+        i_sampling,
+        j_sampling,
     ):
         offsets = [
             [-1, -1],
@@ -287,8 +300,8 @@ def bankfull_extent(
                         continue
 
                     if (
-                        z_limit[0, i_nbr, j_nbr] != -999
-                        and data[0, i_nbr, j_nbr] == -999
+                        elev[0, i_nbr, j_nbr] != -999
+                        and bfe[0, i_nbr, j_nbr] == -999
                         and not complete[0, i_nbr, j_nbr]
                     ):
                         stack_2.append([i_nbr, j_nbr])
@@ -296,9 +309,12 @@ def bankfull_extent(
 
             while len(stack_2) > 0:
                 i, j = stack_2.pop()
-                bf_accum = 0
-                elev_accum = 0
+                bfe_accum = 0
+                bfw_accum = 0
+                dist_accum = 0
+                modal = 0.0
                 distance = 0
+                inverse_distance = 0
                 for i_off, j_off in offsets:
                     i_nbr = i + i_off
                     j_nbr = j + j_off
@@ -306,33 +322,47 @@ def bankfull_extent(
                     if i_nbr == i_bound or i_nbr < 0 or j_nbr == j_bound or j_nbr < 0:
                         continue
 
-                    dist = 1 / np.sqrt(
+                    dist = np.sqrt(
                         (i - i_nbr * i_sampling) ** 2.0
                         + (j - j_nbr * j_sampling) ** 2.0
                     )
+                    inverse_dist = 1 / dist
 
-                    if data[0, i_nbr, j_nbr] != -999:
-                        bf_accum += data[0, i_nbr, j_nbr] * dist
-                        elev_accum += z_data[0, i_nbr, j_nbr] * dist
+                    if bfe[0, i_nbr, j_nbr] != -999:
+                        bfe_accum += bfe[0, i_nbr, j_nbr] * inverse_dist
+                        bfw_accum += bfw[0, i_nbr, j_nbr] * inverse_dist
+                        dist_accum += str_dist[0, i_nbr, j_nbr] * inverse_dist
+                        inverse_distance += inverse_dist
+
                         distance += dist
+                        modal += 1
 
-                elev_value = elev_accum / distance
-                bf_value = bf_accum / distance
-                limit = z_limit[0, i, j]
-                if bf_value >= limit and elev_value <= limit:
+                bfe_accum /= inverse_distance
+                bfw_accum /= inverse_distance
+                dist_accum /= inverse_distance
+
+                avg_width = distance / modal
+                dist_accum += avg_width
+                limit = elev[0, i, j]
+
+                if bfe_accum >= limit and dist_accum <= bfw_accum:
                     stack.append([i, j])
-                    data[0, i, j] = bf_value
-                    z_data[0, i, j] = elev_value
+                    bfe[0, i, j] = bfe_accum
+                    bfw[0, i, j] = bfw_accum
+                    str_dist[0, i, j] = dist_accum
 
-    interpolate(stack, complete, bfe, str_elev, elev, shape[0], shape[1], csy, csx)
+    interpolate(stack, complete, bfe, bfw, str_dist, elev, shape[0], shape[1], csy, csx)
 
-    to_raster(da.from_array(bfe != -999),
+    to_raster(
+        da.from_array(bfe != -999),
         bankfull_depth,
         bankfull_extent,
     )
 
 
-def valley_confinement(bankfull_width: str, bankfull_extent: str, valley_confinement_dst: str):
+def valley_confinement(
+    bankfull_width: str, bankfull_extent: str, valley_confinement_dst: str
+):
     """Calculate a valley confinement index - the ratio of valley width to possible
     bankfull width.
 
