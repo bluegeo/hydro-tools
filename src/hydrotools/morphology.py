@@ -409,7 +409,7 @@ def valley_confinement(
         while len(stack) > 0:
             next_i, next_j = stack.pop()
             searched = {next_i: {next_j: True}}
-            search_stack = List([next_i, next_j])
+            search_stack = List([[next_i, next_j]])
 
             while True:
                 i, j = search_stack.pop(0)
