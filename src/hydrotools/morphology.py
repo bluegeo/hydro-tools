@@ -430,10 +430,10 @@ def valley_confinement(
                             searched[i_nbr][j_nbr] = True
                         except:
                             searched[i_nbr] = {j_nbr: True}
-                        if ve[i_nbr, j_nbr]:
+                        if ve[0, i_nbr, j_nbr]:
                             continue
-                        if bfw[i_nbr, j_nbr]:
-                            vw[i_nbr, j_nbr] += np.sqrt(
+                        if bfw[0, i_nbr, j_nbr] == 0:
+                            vw[0, i_nbr, j_nbr] += np.sqrt(
                                 (next_i - i_nbr) ** 2 + (next_j - j_nbr) ** 2
                             )
                             found = True
@@ -450,13 +450,17 @@ def valley_confinement(
     valley_edges = valleys & binary_dilation(~valleys, np.ones((1, 3, 3), dtype=bool))
 
     bf_width = from_raster(bankfull_width_src)
+    da.ma.set_fill_value(bf_width, 0)
     valley_width = da.zeros_like(bf_width)
 
     (_, i, j), bfw, ve, vw = da.compute(
-        da.where(valley_edges), bf_width, valley_edges, valley_width
+        da.where(valley_edges), da.ma.filled(bf_width), valley_edges, valley_width
     )
 
-    vci = da.from_array(calc_vci(List(np.array([i, j]).T.tolist()), bfw, ve, vw))
+    stack = List(np.array([i, j]).T.tolist())
+    del i, j
+
+    vci = da.from_array(calc_vci(stack, bfw, ve, vw))
     vci = da.ma.masked_where(vci == 0, vci)
 
     to_raster(vci, bankfull_width_src, valley_confinement_dst)
