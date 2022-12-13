@@ -7,8 +7,8 @@ import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
 from dask_image.ndmorph import binary_dilation
-from numba import njit, types, typeof
-from numba.typed import List
+from numba import njit, types
+from numba.typed import List, Dict
 import numpy as np
 
 from hydrotools.raster import (
@@ -367,23 +367,99 @@ def bankfull_extent(
 
 
 def valley_confinement(
-    bankfull_width_src: str, slope_src: str, valley_confinement_dst: str
+    bankfull_width_src: str,
+    twi_src: str,
+    valley_confinement_dst: str,
+    twi_threshold: float = 3500,
 ):
-    """Calculate a valley confinement index - the ratio of valley width to possible
+    """Calculate a valley confinement index - the ratio of valley width to estimated
     bankfull width.
 
     Args:
-        bankfull_width (str): Bankfull width data source calculated using
+        bankfull_width_src (str): Bankfull width data source calculated using
         `morphology.bankfull_width`.
-        bankfull_extent (str): Bankfull extent data source calculated using
-        `morphology.bankfull_extent`.
+        twi_src (str): Topographic Wetness Index data source calculated using
+        `morphology.topographic_wetness`.
         valley_confinement_dst (str): Output raster with valley confinement index
         values.
+        twi_threshold (float): The maximum topographic wetness used to constrain the
+        valley bottom. Defaults to 3500.
     """
-    with TempRasterFiles(1) as twi_dst:
-        topographic_wetness(bankfull_width_src, slope_src, twi_dst)
 
-        binary_dilation(da.ma.getmaskarray(extent)) & ~da.ma.getmaskarray(extent)
+    @njit(fastmath=True)
+    def calc_vci(
+        stack,
+        bfw,
+        ve,
+        vw,
+    ):
+        i_bound, j_bound = bfw.shape[1:]
+
+        offsets = [
+            [-1, -1],
+            [-1, 0],
+            [-1, 1],
+            [0, -1],
+            [0, 1],
+            [1, -1],
+            [1, 0],
+            [1, 1],
+        ]
+
+        while len(stack) > 0:
+            next_i, next_j = stack.pop()
+            searched = {next_i: {next_j: True}}
+            search_stack = List([next_i, next_j])
+
+            while True:
+                i, j = search_stack.pop(0)
+                found = False
+
+                for i_off, j_off in offsets:
+                    i_nbr = i + i_off
+                    j_nbr = j + j_off
+
+                    if i_nbr == i_bound or i_nbr < 0 or j_nbr == j_bound or j_nbr < 0:
+                        continue
+
+                    try:
+                        searched[i_nbr][j_nbr]
+                        continue
+                    except:
+                        try:
+                            searched[i_nbr][j_nbr] = True
+                        except:
+                            searched[i_nbr] = {j_nbr: True}
+                        if ve[i_nbr, j_nbr]:
+                            continue
+                        if bfw[i_nbr, j_nbr]:
+                            vw[i_nbr, j_nbr] += np.sqrt(
+                                (next_i - i_nbr) ** 2 + (next_j - j_nbr) ** 2
+                            )
+                            found = True
+                            break
+                        else:
+                            search_stack.append([i_nbr, j_nbr])
+
+                if found:
+                    break
+
+        return np.where(vw > 0, bfw / vw, 0)
+
+    valleys = from_raster(twi_src) >= twi_threshold
+    valley_edges = valleys & binary_dilation(~valleys, np.ones((1, 3, 3), dtype=bool))
+
+    bf_width = from_raster(bankfull_width_src)
+    valley_width = da.zeros_like(bf_width)
+
+    (_, i, j), bfw, ve, vw = da.compute(
+        da.where(valley_edges), bf_width, valley_edges, valley_width
+    )
+
+    vci = da.from_array(calc_vci(List(np.array([i, j]).T.tolist()), bfw, ve, vw))
+    vci = da.ma.masked_where(vci == 0, vci)
+
+    to_raster(vci, bankfull_width_src, valley_confinement_dst)
 
 
 def topographic_wetness(
