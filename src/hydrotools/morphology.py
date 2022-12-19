@@ -6,9 +6,9 @@ from multiprocessing.dummy import Pool
 import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
-from dask_image.ndmorph import binary_dilation
-from numba import njit, types
-from numba.typed import List, Dict
+from dask_image.ndmorph import binary_erosion
+from numba import njit
+from numba.typed import List
 import numpy as np
 
 from hydrotools.raster import (
@@ -21,6 +21,7 @@ from hydrotools.raster import (
 from hydrotools.utils import GrassRunner
 from hydrotools.watershed import extract_streams, flow_direction_accumulation
 from hydrotools.elevation import slope
+from hydrotools.interpolate import front_contains
 
 
 def sinuosity(
@@ -251,17 +252,15 @@ def bankfull_extent(
     """
     elevation = from_raster(dem)
     bf_elevation = elevation + from_raster(bankfull_depth_src) * flood_factor
-    da.ma.set_fill_value(elevation, -999)
-    da.ma.set_fill_value(bf_elevation, -999)
 
     # Load stream locations and DEM into memory
     (_, i, j), complete, bfe, bfw, str_dist, elev = da.compute(
         da.where(~da.ma.getmaskarray(bf_elevation)),
         ~da.ma.getmaskarray(bf_elevation),
-        da.ma.filled(bf_elevation),
+        da.ma.filled(bf_elevation, -999),
         from_raster(bankfull_width_src),
         da.zeros_like(elevation, dtype="float32"),
-        da.ma.filled(elevation),
+        da.ma.filled(elevation, -999),
     )
 
     raster_specs = Raster.raster_specs(dem)
@@ -271,7 +270,7 @@ def bankfull_extent(
     stack = List(np.array([i, j]).T.tolist())
     del i, j
 
-    @njit(fastmath=True, parallel=True)
+    @njit(parallel=True)
     def interpolate(
         stack,
         complete,
@@ -366,6 +365,148 @@ def bankfull_extent(
     )
 
 
+@njit
+def vci_width_transform_task(
+    regions: np.ndarray, edges: np.ndarray, bfw: np.ndarray, csx: float, csy: float
+) -> np.ndarray:
+    """Compute approximate valley confinement index using widths of connected regions
+    and returning the ratio of the maximum bankfull width to the valley width.
+
+    Args:
+        regions (np.ndarray): Array of regions (float) bounded by a value of -999.
+        edges (np.ndarray): Array of edges (bool) of regions.
+        bfw (np.ndarray): Array of bankfull width values, with -999 outside of streams.
+        csx (float): Cell size in the x-direction.
+        csy (float): Cell size in they y-direction.
+
+    Returns:
+        np.ndarray: Array of region widths bounded by -999.
+    """
+    i_bound, j_bound = regions.shape
+
+    width = regions.copy()
+    modals = regions.copy()
+
+    stack = [
+        [stack_i, stack_j]
+        for stack_i in range(i_bound)
+        for stack_j in range(j_bound)
+        if edges[stack_i, stack_j]
+    ]
+
+    offsets = [
+        [-1, -1],
+        [-1, 0],
+        [-1, 1],
+        [0, -1],
+        [0, 1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+    ]
+
+    while len(stack) > 0:
+        next_i, next_j = stack.pop(0)
+
+        search_stack = List()
+        searched = {np.int64(next_i): {np.int64(next_j): True}}
+        edge_stack = List([[next_i, next_j]])
+        region_stack = List()
+        i, j = next_i, next_j
+
+        current_distance = (csx + csy) / 2.0
+
+        while True:
+            distances = List()
+            terminate = False
+            for i_off, j_off in offsets:
+                i_nbr = np.int64(i + i_off)
+                j_nbr = np.int64(j + j_off)
+
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or regions[i_nbr, j_nbr] == -999
+                ):
+                    continue
+
+                if i_nbr in searched and j_nbr in searched[i_nbr]:
+                    continue
+                else:
+                    dist = np.sqrt(
+                        (np.float64(i_nbr - next_i) * csy) ** 2
+                        + (np.float64(j_nbr - next_j) * csx) ** 2
+                    )
+
+                    try:
+                        searched[i_nbr][j_nbr] = True
+                    except:
+                        searched[i_nbr] = {j_nbr: True}
+
+                    if edges[i_nbr, j_nbr]:
+                        distances.append(dist)
+                        if len(region_stack) > 0:
+                            # Check if the edge opposes the existing center of mass
+                            r_com_i, r_com_j = 0.0, 0.0
+                            for _i, _j in region_stack:
+                                r_com_i += np.float64(_i)
+                                r_com_j += np.float64(_j)
+                            denom = np.float64(len(region_stack))
+                            r_com_i /= denom
+                            r_com_j /= denom
+
+                            e_com_i, e_com_j = 0.0, 0.0
+                            for _i, _j in edge_stack:
+                                e_com_i += np.float64(_i)
+                                e_com_j += np.float64(_j)
+                            denom = np.float64(len(edge_stack))
+                            e_com_i /= denom
+                            e_com_j /= denom
+
+                            if not front_contains(
+                                e_com_j, e_com_i, r_com_j, r_com_i, j_nbr, i_nbr
+                            ):
+                                terminate = True
+                        edge_stack.append([i_nbr, j_nbr])
+                    else:
+                        region_stack.append([i_nbr, j_nbr])
+                        if len(search_stack) == 0 or dist >= search_stack[-1][0]:
+                            search_stack.append([dist, i_nbr, j_nbr])
+                        elif dist <= search_stack[0][0]:
+                            search_stack.insert(0, [dist, i_nbr, j_nbr])
+                        else:
+                            idx = -1
+                            while dist <= search_stack[idx][0]:
+                                idx -= 1
+                            search_stack.insert(idx + 1, [dist, i_nbr, j_nbr])
+
+            if len(distances) > 0:
+                current_distance = sum(distances) / len(distances)
+
+            if terminate:
+                break
+
+            try:
+                _, i, j = search_stack.pop(0)
+            except:
+                break
+
+        bfw_value = 0
+        for assign_i, j_dict in searched.items():
+            for assign_j, _ in j_dict.items():
+                width[assign_i, assign_j] += current_distance
+                modals[assign_i, assign_j] += 1
+                if (
+                    bfw[assign_i, assign_j] != -999
+                    and bfw[assign_i, assign_j] > bfw_value
+                ):
+                    bfw_value = bfw[assign_i, assign_j]
+
+    return np.where(modals > 0, bfw_value / (width / modals), -999)
+
+
 def valley_confinement(
     bankfull_width_src: str,
     twi_src: str,
@@ -385,83 +526,27 @@ def valley_confinement(
         twi_threshold (float): The maximum topographic wetness used to constrain the
         valley bottom. Defaults to 3500.
     """
+    raster_specs = Raster.raster_specs(bankfull_width_src)
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
 
-    @njit(fastmath=True)
-    def calc_vci(
-        stack,
-        bfw,
-        ve,
-        vw,
-    ):
-        i_bound, j_bound = bfw.shape[1:]
+    valleys = da.ma.filled(from_raster(twi_src) >= twi_threshold, False).astype(bool)
+    valley_eroded = binary_erosion(valleys, np.ones((1, 3, 3), dtype=bool)).astype(bool)
+    valley_edges = valleys & ~valley_eroded
 
-        offsets = [
-            [-1, -1],
-            [-1, 0],
-            [-1, 1],
-            [0, -1],
-            [0, 1],
-            [1, -1],
-            [1, 0],
-            [1, 1],
-        ]
-
-        while len(stack) > 0:
-            next_i, next_j = stack.pop()
-            searched = {next_i: {next_j: True}}
-            search_stack = List([[next_i, next_j]])
-
-            while True:
-                i, j = search_stack.pop(0)
-                found = False
-
-                for i_off, j_off in offsets:
-                    i_nbr = i + i_off
-                    j_nbr = j + j_off
-
-                    if i_nbr == i_bound or i_nbr < 0 or j_nbr == j_bound or j_nbr < 0:
-                        continue
-
-                    try:
-                        searched[i_nbr][j_nbr]
-                        continue
-                    except:
-                        try:
-                            searched[i_nbr][j_nbr] = True
-                        except:
-                            searched[i_nbr] = {j_nbr: True}
-                        if ve[0, i_nbr, j_nbr]:
-                            continue
-                        if bfw[0, i_nbr, j_nbr] == 0:
-                            vw[0, i_nbr, j_nbr] += np.sqrt(
-                                (next_i - i_nbr) ** 2 + (next_j - j_nbr) ** 2
-                            )
-                            found = True
-                            break
-                        else:
-                            search_stack.append([i_nbr, j_nbr])
-
-                if found:
-                    break
-
-        return np.where(vw > 0, bfw / vw, 0)
-
-    valleys = from_raster(twi_src) >= twi_threshold
-    valley_edges = valleys & binary_dilation(~valleys, np.ones((1, 3, 3), dtype=bool))
-
-    bf_width = from_raster(bankfull_width_src)
-    da.ma.set_fill_value(bf_width, 0)
-    valley_width = da.zeros_like(bf_width)
-
-    (_, i, j), bfw, ve, vw = da.compute(
-        da.where(valley_edges), da.ma.filled(bf_width), valley_edges, valley_width
+    regions, edges, bfw = da.compute(
+        da.squeeze(da.where(valleys, 0, -999)).astype(np.float64),
+        da.squeeze(valley_edges),
+        da.squeeze(da.ma.filled(from_raster(bankfull_width_src), -999)).astype(
+            np.float64
+        ),
     )
 
-    stack = List(np.array([i, j]).T.tolist())
-    del i, j
+    vci = da.from_array(
+        vci_width_transform_task(regions, edges, bfw, csx, csy)[np.newaxis, :]
+    )
+    del regions, edges, bfw
 
-    vci = da.from_array(calc_vci(stack, bfw, ve, vw))
-    vci = da.ma.masked_where(vci == 0, vci)
+    vci = da.ma.masked_where(vci == -999, vci)
 
     to_raster(vci, bankfull_width_src, valley_confinement_dst)
 
@@ -479,12 +564,18 @@ def topographic_wetness(
         (generated using `watershed.flow_direction_accumulation`)
         slope_src (str): Topographic slope in Degrees.
         topographic_wetness_dst (str): Output TWI grid
-        cutoff (Union[float, None]): Return the index up to a defined threshold. Defaults to None.
+        cutoff (Union[float, None]): Return the index up to a defined threshold.
+        Defaults to None.
     """
+    raster_specs = Raster.raster_specs(slope_src)
+    avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
+
     streams = ~da.ma.getmaskarray(from_raster(streams))
 
-    # Generate cost surface (normalized slope)
-    cost = da.clip(from_raster(slope_src), 0.0, 90.0) / 90.0
+    # Generate cost surface (normalized slope, adjusted for cell size)
+    cost = (
+        da.clip(from_raster(slope_src).astype(np.float64), 0.0, 90.0) / 90.0
+    ) * avg_cs
     # Make cost 0 where simulated streams exist
     cost = raster_where(~streams, cost, 0)
 
@@ -523,7 +614,7 @@ def riparian_connectivity(
     annual_precip: str,
     connectivity_dst: str,
     min_ws_area: float = 1e6,
-    **kwargs
+    **kwargs,
 ):
     """Calculate regions of riparian connectivity surrounding streams
 

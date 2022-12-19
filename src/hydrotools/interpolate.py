@@ -4,7 +4,9 @@ from typing import Union
 
 import numpy as np
 import dask.array as da
-from numba import jit
+from dask_image.ndmorph import binary_erosion
+from numba import njit
+from numba.typed import List
 from sklearn.neighbors import KNeighborsRegressor, BallTree
 
 from hydrotools.raster import Raster, from_raster, to_raster
@@ -46,7 +48,7 @@ def raster_filter(
         q: Percentile or quantile to use if `method` is percentile or quantile
     """
 
-    @jit(nopython=True, nogil=True)
+    @njit(nogil=True)
     def apply_filter(a, kernel, nodata, i_start, j_start, i_end, j_end, method, q):
         output = np.full(a.shape, nodata, np.float32)
 
@@ -156,6 +158,320 @@ def distance_transform(raster_source: str, distance_dst: str):
         gr.save_raster("output", distance_dst)
 
 
+@njit
+def front_contains(
+    x1: float, y1: float, x2: float, y2: float, tx: float, ty: float
+) -> bool:
+    """Determine if point (tx, ty) is within the front normal to the vector
+    (x1, y1) -> (x2, y2).
+
+    Args:
+        x1 (float): Point 1 x-coordinate.
+        y1 (float): Point 1 y-coordinate.
+        x2 (float): Point 2 x-coordinate.
+        y2 (float): Point 2 y-coordinate.
+        tx (float): Test Point x-coordinate.
+        ty (float): Test Point y-coordinate.
+
+    Returns:
+        bool: True if the Test Point is within the front, False if outside.
+    """
+    if x1 == x2:
+        return (y2 - y1) >= 0 and ty <= y2 or (y2 - y1) <= 0 and ty >= y2
+    if y1 == y2:
+        return (x2 - x1) >= 0 and tx <= x2 or (x2 - x1) <= 0 and tx >= x2
+
+    inner_angle = np.arctan((x2 - x1) / (y2 - y1))
+    slope_angle = np.sign(inner_angle) * np.pi * 90 / 180 - inner_angle
+    fty = y2 + np.cos(slope_angle)
+    ftx = x2 - np.sin(slope_angle)
+
+    sign = (tx - x2) * (fty - y2) - (ty - y2) * (ftx - x2)
+
+    return x2 < x1 and sign >= 0 or x2 > x1 and sign <= 0
+
+
+@njit
+def width_transform_task(
+    regions: np.ndarray, edges: np.ndarray, csx: float, csy: float
+) -> np.ndarray:
+    """Compute the approximate widths of regions by searching for bounded edges
+
+    Args:
+        regions (np.ndarray): Array of regions (float) bounded by a value of -999.
+        edges (np.ndarray): Array of edges (bool) of regions.
+        csx (float): Cell size in the x-direction.
+        csy (float): Cell size in they y-direction.
+
+    Returns:
+        np.ndarray: Array of region widths bounded by -999.
+    """
+    i_bound, j_bound = regions.shape
+
+    width = regions.copy()
+    modals = regions.copy()
+
+    stack = [
+        [stack_i, stack_j]
+        for stack_i in range(i_bound)
+        for stack_j in range(j_bound)
+        if edges[stack_i, stack_j]
+    ]
+
+    offsets = [
+        [-1, -1],
+        [-1, 0],
+        [-1, 1],
+        [0, -1],
+        [0, 1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+    ]
+
+    while len(stack) > 0:
+        next_i, next_j = stack.pop(0)
+
+        search_stack = List()
+        searched = {np.int64(next_i): {np.int64(next_j): True}}
+        edge_stack = List([[next_i, next_j]])
+        region_stack = List()
+        i, j = next_i, next_j
+
+        current_distance = (csx + csy) / 2.0
+
+        while True:
+            distances = List()
+            terminate = False
+            for i_off, j_off in offsets:
+                i_nbr = np.int64(i + i_off)
+                j_nbr = np.int64(j + j_off)
+
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or regions[i_nbr, j_nbr] == -999
+                ):
+                    continue
+
+                if i_nbr in searched and j_nbr in searched[i_nbr]:
+                    continue
+                else:
+                    dist = np.sqrt(
+                        (np.float64(i_nbr - next_i) * csy) ** 2
+                        + (np.float64(j_nbr - next_j) * csx) ** 2
+                    )
+
+                    try:
+                        searched[i_nbr][j_nbr] = True
+                    except:
+                        searched[i_nbr] = {j_nbr: True}
+
+                    if edges[i_nbr, j_nbr]:
+                        distances.append(dist)
+                        if len(region_stack) > 0:
+                            # Check if the edge opposes the existing center of mass
+                            r_com_i, r_com_j = 0.0, 0.0
+                            for _i, _j in region_stack:
+                                r_com_i += np.float64(_i)
+                                r_com_j += np.float64(_j)
+                            denom = np.float64(len(region_stack))
+                            r_com_i /= denom
+                            r_com_j /= denom
+
+                            e_com_i, e_com_j = 0.0, 0.0
+                            for _i, _j in edge_stack:
+                                e_com_i += np.float64(_i)
+                                e_com_j += np.float64(_j)
+                            denom = np.float64(len(edge_stack))
+                            e_com_i /= denom
+                            e_com_j /= denom
+
+                            if not front_contains(
+                                e_com_j, e_com_i, r_com_j, r_com_i, j_nbr, i_nbr
+                            ):
+                                terminate = True
+                        edge_stack.append([i_nbr, j_nbr])
+                    else:
+                        region_stack.append([i_nbr, j_nbr])
+                        if len(search_stack) == 0 or dist >= search_stack[-1][0]:
+                            search_stack.append([dist, i_nbr, j_nbr])
+                        elif dist <= search_stack[0][0]:
+                            search_stack.insert(0, [dist, i_nbr, j_nbr])
+                        else:
+                            idx = -1
+                            while dist <= search_stack[idx][0]:
+                                idx -= 1
+                            search_stack.insert(idx + 1, [dist, i_nbr, j_nbr])
+
+            if len(distances) > 0:
+                current_distance = sum(distances) / len(distances)
+
+            if terminate:
+                break
+
+            try:
+                _, i, j = search_stack.pop(0)
+            except:
+                break
+
+        for assign_i, j_dict in searched.items():
+            for assign_j, _ in j_dict.items():
+                width[assign_i, assign_j] += current_distance
+                modals[assign_i, assign_j] += 1
+
+    return np.where(modals > 0, width / modals, -999)
+
+
+def width_transform(src: str, dst: str):
+    """Approximate the width of regions constrained by no data.
+
+    Args:
+        src (str): Source raster with regions. Regions are constrained by the raster
+        no data value.
+        dst (str): Destination raster with continuous values of approximate width
+        within regions.
+    """
+    raster_specs = Raster.raster_specs(src)
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
+
+    regions = ~da.ma.getmaskarray(from_raster(src))
+    region_eroded = binary_erosion(regions, np.ones((1, 3, 3), dtype=bool)).astype(bool)
+    edges = regions & ~region_eroded
+
+    region_array, edges_array = da.compute(
+        da.squeeze(da.where(regions, 0, -999).astype("float32")),
+        da.squeeze(edges),
+    )
+
+    width = da.from_array(
+        width_transform_task(region_array, edges_array, csx, csy)[np.newaxis, :]
+    )
+    del region_array, edges_array
+
+    to_raster(width, src, dst)
+
+
+@njit
+def expand_interpolate_task(
+    data: np.ndarray, regions: np.ndarray, csx: float, csy: float
+):
+    """Interpolator for `expand_interpolate`. Extends data outwards into regions.
+    Adds to data in place.
+
+    Args:
+        data (np.ndarray): Data with values for interpolation, bounded by NaNs.
+        regions (np.ndarray): Regions to constrain interpolation.
+        csx (float): Cell size in the x-direction.
+        csy (float): Cell size in the y-direction.
+    """
+    i_bound, j_bound = data.shape
+
+    stack = List()
+    for stack_i in range(i_bound):
+        for stack_j in range(j_bound):
+            if not np.isnan(data[stack_i, stack_j]):
+                stack.append([stack_i, stack_j])
+
+    offsets = [
+        [-1, -1],
+        [-1, 0],
+        [-1, 1],
+        [0, -1],
+        [0, 1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+    ]
+
+    stack_2 = List()
+    while len(stack) > 0:
+        while len(stack) > 0:
+            i, j = stack.pop()
+            for i_off, j_off in offsets:
+                i_nbr = i + i_off
+                j_nbr = j + j_off
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or not np.isnan(data[i_nbr, j_nbr])
+                    or not regions[i_nbr, j_nbr]
+                ):
+                    continue
+
+                stack_2.append([i_nbr, j_nbr])
+                data[i_nbr, j_nbr] = np.inf
+
+        values = List()
+        while len(stack_2) > 0:
+            i, j = stack_2.pop()
+
+            interp_accum = 0
+            total_distance = 0
+            for i_off, j_off in offsets:
+                i_nbr = np.int64(i + i_off)
+                j_nbr = np.int64(j + j_off)
+
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or np.isnan(data[i_nbr, j_nbr])
+                    or np.isinf(data[i_nbr, j_nbr])
+                    or not regions[i_nbr, j_nbr]
+                ):
+                    continue
+
+                inverse_dist = 1 / np.sqrt(
+                    (np.float64(i - i_nbr) * csy) ** 2.0
+                    + (np.float64(j - j_nbr) * csx) ** 2.0
+                )
+
+                interp_accum += data[i_nbr, j_nbr] * inverse_dist
+                total_distance += inverse_dist
+
+            if total_distance > 0:
+                values.append([i, j, interp_accum / total_distance])
+                stack.append([i, j])
+
+        # Assign interpolated values and continue
+        for i, j, value in values:
+            data[np.int64(i), np.int64(j)] = value
+
+
+def expand_interpolate(src: str, dst: str, regions: str = None):
+    """Expand regions with valid data progressively outwards into regions with no data.
+
+    Args:
+        src (str): Source raster with values to expand.
+        dst (str): Destination raster with interpolated values.
+        regions (str, optional): Raster to constrain interpolation extent. Regions are
+        defined by areas with data (constrained by no data). Defaults to None.
+    """
+    raster_specs = Raster.raster_specs(src)
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
+
+    data, regions = da.compute(
+        da.squeeze(da.ma.filled(from_raster(src), np.nan)),
+        da.squeeze(~da.ma.getmaskarray(from_raster(regions)))
+        if regions is not None
+        else da.ones(raster_specs["shape"][1:], dtype=bool),
+    )
+
+    expand_interpolate_task(data, regions, csx, csy)
+    output_data = da.from_array(data)
+    output_data = da.ma.masked_where(
+        da.isnan(output_data) | da.isinf(output_data), output_data
+    )[np.newaxis, :]
+
+    to_raster(output_data, src, dst)
+
+
 def fill_nodata(raster_source: str, destination: str, method: str = "rst"):
     """Fill regions of no data in a raster with interpolated values.
 
@@ -225,7 +541,7 @@ def fill_stats(
             mode=method,
             distance=kwargs.get("distance", 3),
             cells=kwargs.get("cells", 3),
-            flags=flags
+            flags=flags,
         )
 
         gr.save_raster("output", destination)
@@ -434,7 +750,7 @@ def bidw_task(obs, obs_z, pred, n_neighbours):
     return pred_z
 
 
-@jit(nopython=True, nogil=True)
+@njit(nogil=True)
 def full_idw(args):
     """Complete outer product idw
 
