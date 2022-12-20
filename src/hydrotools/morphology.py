@@ -13,6 +13,7 @@ import numpy as np
 
 from hydrotools.raster import (
     Raster,
+    TempRasterFile,
     TempRasterFiles,
     raster_where,
     from_raster,
@@ -117,6 +118,31 @@ def sinuosity(
                         "properties": OrderedDict([("sinuosity", point[2])]),
                     }
                 )
+
+
+def stream_slope(
+    dem: str, streams: str, slope_dst: str, units: str = "degress", scale: float = 1
+):
+    """Calculate slope along extracted streams.
+
+    Args:
+        dem (str): Digital Elevation model raster
+        streams (str): Streams raster source generated using `watershed.extract_streams`
+        slope_dst (str): Destination slope raster dataset.
+        units (str, optional): Units for the output. Defaults to "degrees".
+        scale (float, optional): Z-factor to scale the output. Defaults to 1.
+    """
+    with TempRasterFile() as elev_dst:
+        to_raster(
+            da.ma.masked_where(
+                da.ma.getmaskarray(from_raster(streams)), from_raster(dem)
+            ),
+            dem,
+            elev_dst,
+            overviews=False,
+        )
+
+        slope(elev_dst, slope_dst, units, scale, overviews=False)
 
 
 def bankfull_width(
@@ -496,15 +522,20 @@ def vci_width_transform_task(
         bfw_value = 0
         for assign_i, j_dict in searched.items():
             for assign_j, _ in j_dict.items():
-                width[assign_i, assign_j] += current_distance
-                modals[assign_i, assign_j] += 1
                 if (
                     bfw[assign_i, assign_j] != -999
                     and bfw[assign_i, assign_j] > bfw_value
                 ):
                     bfw_value = bfw[assign_i, assign_j]
 
-    return np.where(modals > 0, bfw_value / (width / modals), -999)
+        if current_distance > 0:
+            vci = bfw_value / current_distance
+            for assign_i, j_dict in searched.items():
+                for assign_j, _ in j_dict.items():
+                    width[assign_i, assign_j] += vci
+                    modals[assign_i, assign_j] += 1
+
+    return np.where(modals > 0, width / modals, -999)
 
 
 def valley_confinement(

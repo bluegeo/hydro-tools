@@ -457,13 +457,13 @@ def to_raster(data: da.Array, template: str, destination: str, overviews: bool =
     """
     # The nodata value should be inferred from the data type and filled
     dtype = data.dtype.name
-    
+
     if dtype == "bool":
         dtype = "uint8"
         data = da.ma.masked_where(~data, data.astype("uint8"))
 
     nodata = infer_nodata(data)
-    
+
     da.ma.set_fill_value(data, nodata)
 
     output_raster = Raster.empty_like(destination, template, dtype=dtype, nodata=nodata)
@@ -524,13 +524,13 @@ class TempRasterFile:
 
 
 class TempRasterFiles:
-    def __init__(self, num):
+    def __init__(self, num: int):
         self.paths = [
             os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
             for _ in range(num)
         ]
 
-    def __enter__(self):
+    def __enter__(self) -> list:
         return self.paths
 
     def __exit__(self, exc_type, exc_val, exc_tb):

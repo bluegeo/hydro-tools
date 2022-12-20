@@ -50,6 +50,27 @@ def raster_filter(
 
     @njit(nogil=True)
     def apply_filter(a, kernel, nodata, i_start, j_start, i_end, j_end, method, q):
+        if method == "sum":
+            stats_func = np.nansum
+        elif method == "min":
+            stats_func = np.nanmin
+        elif method == "max":
+            stats_func = np.nanmax
+        elif method == "diff":
+            stats_func = lambda x: np.nanmax(x) - np.nanmin(x)
+        elif method == "mean":
+            stats_func = np.nanmean
+        elif method == "median":
+            stats_func = np.nanmedian
+        elif method == "std":
+            stats_func = np.nanstd
+        elif method == "variance":
+            stats_func = np.nanvar
+        elif method == "percentile":
+            stats_func = lambda x: np.nanpercentile(x, q)
+        elif method == "quantile":
+            stats_func = lambda x: np.nanquantile(x, q)
+            
         output = np.full(a.shape, nodata, np.float32)
 
         for i in range(i_start, a.shape[1] - i_end):
@@ -63,26 +84,7 @@ def raster_filter(
                             if val != nodata:
                                 sample[k_i, k_j] = val
 
-                if method == "sum":
-                    output_val = np.nansum(sample)
-                elif method == "min":
-                    output_val = np.nanmin(sample)
-                elif method == "max":
-                    output_val = np.nanmax(sample)
-                elif method == "diff":
-                    output_val = np.nanmax(sample) - np.nanmin(sample)
-                elif method == "mean":
-                    output_val = np.nanmean(sample)
-                elif method == "median":
-                    output_val = np.nanmedian(sample)
-                elif method == "std":
-                    output_val = np.nanstd(sample)
-                elif method == "variance":
-                    output_val = np.nanvar(sample)
-                elif method == "percentile":
-                    output_val = np.nanpercentile(sample, q)
-                elif method == "quantile":
-                    output_val = np.nanquantile(sample, q)
+                output_val = stats_func(sample)
 
                 output[0, i, j] = nodata if np.isnan(output_val) else output_val
 
