@@ -49,49 +49,52 @@ def raster_filter(
     """
 
     @njit(nogil=True)
-    def apply_filter(a, kernel, nodata, i_start, j_start, i_end, j_end, method, q):
-        if method == "sum":
-            stats_func = np.nansum
-        elif method == "min":
-            stats_func = np.nanmin
-        elif method == "max":
-            stats_func = np.nanmax
-        elif method == "diff":
-            stats_func = lambda x: np.nanmax(x) - np.nanmin(x)
-        elif method == "mean":
-            stats_func = np.nanmean
-        elif method == "median":
-            stats_func = np.nanmedian
-        elif method == "std":
-            stats_func = np.nanstd
-        elif method == "variance":
-            stats_func = np.nanvar
-        elif method == "percentile":
-            stats_func = lambda x: np.nanpercentile(x, q)
-        elif method == "quantile":
-            stats_func = lambda x: np.nanquantile(x, q)
-            
-        output = np.full(a.shape, nodata, np.float32)
+    def apply_filter(a, kernel, i_start, j_start, i_end, j_end, method, q):
+        output = np.full(a.shape, np.nan, np.float32)
 
         for i in range(i_start, a.shape[1] - i_end):
             for j in range(j_start, a.shape[2] - j_end):
 
-                sample = np.full(kernel.shape, np.nan, np.float32)
+                if np.isnan(a[0, i, j]):
+                    continue
+
+                sample = np.full(kernel.shape, np.nan, np.float64)
                 for k_i in range(kernel.shape[0]):
                     for k_j in range(kernel.shape[1]):
                         if kernel[k_i, k_j]:
-                            val = a[0, i + k_i - i_start, j + k_j - j_start]
-                            if val != nodata:
-                                sample[k_i, k_j] = val
+                            sample[k_i, k_j] = a[
+                                0, i + k_i - i_start, j + k_j - j_start
+                            ]
 
-                output_val = stats_func(sample)
+                if np.all(np.isnan(sample)):
+                    continue
 
-                output[0, i, j] = nodata if np.isnan(output_val) else output_val
+                if method == "sum":
+                    output_val = np.nansum(sample)
+                elif method == "min":
+                    output_val = np.nanmin(sample)
+                elif method == "max":
+                    output_val = np.nanmax(sample)
+                elif method == "diff":
+                    output_val = np.nanmax(sample) - np.nanmin(sample)
+                elif method == "mean":
+                    output_val = np.nanmean(sample)
+                elif method == "median":
+                    output_val = np.nanmedian(sample)
+                elif method == "std":
+                    output_val = np.nanstd(sample)
+                elif method == "variance":
+                    output_val = np.nanvar(sample)
+                elif method == "percentile":
+                    output_val = np.nanpercentile(sample, q)
+                elif method == "quantile":
+                    output_val = np.nanquantile(sample, q)
+
+                output[0, i, j] = output_val
 
         return output
 
-    nodata = Raster(raster_source).nodata
-    src = from_raster(raster_source)
+    src = da.ma.filled(from_raster(raster_source).astype(np.float64), np.nan)
 
     if isinstance(kernel, tuple):
         if len(kernel) != 2:
@@ -123,10 +126,9 @@ def raster_filter(
         apply_filter,
         src,
         depth=depth,
-        boundary=nodata,
+        boundary=np.nan,
         dtype=np.float32,
         kernel=kernel,
-        nodata=nodata,
         i_start=i_start,
         j_start=j_start,
         i_end=i_end,
@@ -136,7 +138,7 @@ def raster_filter(
     )
 
     to_raster(
-        da.ma.masked_where(filter_result == nodata, filter_result),
+        da.ma.masked_where(da.isnan(filter_result), filter_result),
         raster_source,
         filter_dst,
     )
@@ -794,3 +796,41 @@ def full_idw(args):
             output[pred_row] = np.sum(obs_z * weights / weights_sum)
 
     return output
+
+
+def normalize(
+    src: str,
+    dst: str,
+    in_range: tuple = ("min", "max"),
+    out_range: tuple = (0, 1),
+    invert: bool = False,
+):
+    """Normalize a raster to scale the range of values to a provided range.
+
+    Args:
+        src (str): Source Raster dataset.
+        dst (str): Output Rater dataset.
+        in_range (tuple, optional): Input range of values to use for normalization.
+        Values may be floating point numbers or the key words `"min"` and `"max"`.
+        Defaults to ("min", "max").
+        out_range (tuple, optional): Range of values for the output. Defaults to (0, 1).
+        invert (bool): Return the inverse of the normalized raster. Defaults to False.
+    """
+    in_rast = from_raster(src)
+
+    in_min = in_rast.min() if in_range[0] == "min" else float(in_range[0])
+    in_max = in_rast.max() if in_range[1] == "max" else float(in_range[1])
+
+    out_min = float(out_range[0])
+    out_max = float(out_range[1])
+
+    norm = (da.clip(in_rast.astype(np.float32), in_min, in_max) - in_min) / (
+        in_max - in_min
+    )
+
+    if invert:
+        norm = 1. - norm
+
+    out_rast = norm * (out_max - out_min) + out_min
+
+    to_raster(out_rast, src, dst)

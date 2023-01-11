@@ -1,7 +1,9 @@
+import os
 from typing import Union
 from collections import OrderedDict
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
+from tempfile import TemporaryDirectory
 
 import fiona
 from shapely.geometry import LineString, Point
@@ -10,6 +12,7 @@ from dask_image.ndmorph import binary_erosion
 from numba import njit
 from numba.typed import List
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from hydrotools.raster import (
     Raster,
@@ -19,10 +22,15 @@ from hydrotools.raster import (
     from_raster,
     to_raster,
 )
-from hydrotools.utils import GrassRunner
+from hydrotools.utils import GrassRunner, kernel_from_distance, compare_projections
 from hydrotools.watershed import extract_streams, flow_direction_accumulation
 from hydrotools.elevation import slope
-from hydrotools.interpolate import front_contains
+from hydrotools.interpolate import (
+    front_contains,
+    raster_filter,
+    expand_interpolate,
+    normalize,
+)
 
 
 def sinuosity(
@@ -640,12 +648,111 @@ def topographic_wetness(
         to_raster(cs_inverted, slope_src, topographic_wetness_dst)
 
 
+class RiparianConnectivity:
+    def __init__(self, dem: str):
+        """Define a study area and begin a Riparian Connectivity Analysis"""
+        self.dem = dem
+
+        # Specifications
+        self.__dict__.update(Raster.raster_specs(dem))
+
+        # Create a directory
+        self.tmp_dir = TemporaryDirectory()
+
+        # Components of the analysis
+        (
+            self.flow_directon,
+            self.flow_accumulation,
+            self.streams,
+            self.slope,
+            self.twi,
+            self.stream_slope,
+            self.bankfull_width,
+            self.stream_density,
+        ) = None
+
+    def raster_path(self, name: str) -> str:
+        """Generate a raster path using the current temporary directory.
+
+        Args:
+            name (str): Name of the raster dataset.
+
+        Returns:
+            str: A valid raster path.
+        """
+        return os.path.join(self.tmp_dir, f"{name}.tif")
+
+    def verify_source(self, src: str):
+        """Ensure a raster aligns with the current study area.
+
+        Args:
+            src (str): Source Raster dataset.
+        """
+        src_specs = Raster(src)
+        if not all(
+            [
+                np.isclose(src_specs.csx, self.csx),
+                np.isclose(src_specs.csy, self.csy),
+                np.isclose(src_specs.top, self.top),
+                np.isclose(src_specs.bottom, self.bottom),
+                np.isclose(src_specs.left, self.left),
+                np.isclose(src_specs.right, self.right),
+                src_specs.shape == self.shape,
+                compare_projections(src_specs.wkt, self.wkt),
+            ]
+        ):
+            raise ValueError(f"Input raster {src} does not align with the study area.")
+
+    def extract_streams(self, min_ws_area: float = 1e6, min_stream_length: float = 0):
+        """Create a streams attribute.
+
+        Args:
+            min_ws_area: Minimum contributing area (m2) used to classify streams.
+            Defaults to 1e6 (1 km squared).
+            min_stream_lenth: Minimum length of stream segments. Defaults to 0.
+        """
+        fd = self.raster_path("flow_direction")
+        fa = self.raster_path("flow_accumulation")
+        streams = self.raster_path("streams")
+
+        with TempRasterFile() as fd1:
+            flow_direction_accumulation(
+                self.dem,
+                fd1,
+                fa,
+                False,
+                False,
+            )
+
+        extract_streams(
+            self.dem,
+            fa,
+            streams,
+            fd,
+            min_ws_area,
+            min_stream_length,
+        )
+
+        self.flow_directon = fd
+        self.flow_accumulation = fa
+        self.streams = streams
+
+    # @classmethod
+    # def load_from_data(cls):
+    # TODO: Load from all required parameters
+
+
 def riparian_connectivity(
     dem: str,
     annual_precip: str,
     connectivity_dst: str,
     min_ws_area: float = 1e6,
-    **kwargs,
+    min_stream_length: float = 0,
+    stream_density_sample_distance: float = 500,
+    twi_cutoff: float = 830,
+    bankfull_cutoff: float = 10,
+    stream_slope_cutoff: float = 15,
+    stream_density_cutoff: float = 2e5,
 ):
     """Calculate regions of riparian connectivity surrounding streams
 
@@ -653,23 +760,46 @@ def riparian_connectivity(
         dem (str): Input Digital Elevation Model raster.
         annual_precip (str): Grid of annual precipitation in mm.
         connectivity_dst (str): Output vector dataset with categorized riparian
-        connectivity zones ranging from 1 to 3.
+            connectivity zones ranging from 1 to 3.
         min_ws_area: Minimum contributing area (m2) used to classify streams. Defaults
-        to 1e6 (1 km squared).
+            to 1e6 (1 km squared).
+        min_stream_lenth: Minimum length of stream segments. Defaults to 0.
+        stream_density_sample_distance: Distance to sample stream cells for the stream
+            density transform. Defaults to 500 units.
+        twi_cutoff: Topographic Wetness Index value to use to constrain riparian areas.
+            This value will vary with respect to the raster resolution, and the
+            resulting riparian extent should be inspected and adjusted if the extent is
+            smaller or larger than anticipated. Defaults to 830.
+        bankfull_cutoff (float): Maximum bankfull value to include in sensitivity
+            calculations. Defaults to 10.
+        stream_slope_cutoff (float): Maximum stream slope value to include in
+            sensitivity calculations. Defaults to 15.
+        stream_density_cutoff (float): Maximum stream density value to include in
+            sensitivity calculations. This value should assume a cell size of 1m, be
+            adjusted with the `stream_density_sample_distance` argument, and will be
+            adjusted for the actual input raster cell size. Defaults to 2E5.
     """
     dem_rast = Raster(dem)
-    if not np.isclose(dem_rast.csx - dem_rast.csy, 0):
-        raise ValueError("Input grid must be isotropic")
 
-    with TempRasterFiles(8) as (
+    with TempRasterFiles(18) as (
         accumulation_dst,
         direction_dst1,
         direction_dst2,
         stream_dst,
+        stream_mask_dst,
         slope_dst,
         bankfull_dst,
-        cost_dst,
-        lcp_dst,
+        twi_dst,
+        twi_norm_dst,
+        stream_slope_dst,
+        stream_filter_dst,
+        stream_density_dst,
+        bankfull_interp_dst,
+        stream_slope_interp_dst,
+        stream_density_interp_dst,
+        bankfull_norm_dst,
+        stream_slope_norm_dst,
+        stream_density_norm_dst,
     ):
         # Derive streams
         flow_direction_accumulation(
@@ -686,59 +816,73 @@ def riparian_connectivity(
             stream_dst,
             direction_dst2,
             min_ws_area,
-            kwargs.get("min_length", 0),
-        )
-
-        # Create a cost surface
-        # Source regions are comprised of Bankfull Width
-        bankfull_width(
-            accumulation_dst,
-            annual_precip,
-            bankfull_dst,
-            streams=stream_dst,
-            distribute=True,
+            min_stream_length,
         )
 
         slope(dem, slope_dst, overviews=False)
 
-        cost = raster_where(
-            da.ma.getmaskarray(from_raster(bankfull_dst)),
-            da.clip(from_raster(slope_dst), 0.0, 90.0) / 90.0,
-            0,
+        # Delineate the riparian regions
+        topographic_wetness(stream_dst, slope_dst, twi_dst, cutoff=twi_cutoff)
+        normalize(twi_dst, twi_norm_dst)
+
+        # ---
+        # Compute covariate values and expand them to the riparian region
+        # ---
+        bankfull_width(stream_dst, accumulation_dst, annual_precip, bankfull_dst)
+        normalize(bankfull_dst, bankfull_norm_dst, (0, bankfull_cutoff))
+        expand_interpolate(bankfull_norm_dst, bankfull_interp_dst, twi_norm_dst)
+
+        stream_slope(dem, stream_dst, stream_slope_dst)
+        normalize(
+            stream_slope_dst,
+            stream_slope_norm_dst,
+            (0, stream_slope_cutoff),
+            invert=True,
+        )
+        expand_interpolate(stream_slope_norm_dst, stream_slope_interp_dst, twi_norm_dst)
+
+        # Channel density
+        to_raster(
+            ~da.ma.getmaskarray(from_raster(stream_dst)),
+            stream_dst,
+            stream_mask_dst,
+            overviews=False,
+        )
+        kernel = kernel_from_distance(
+            stream_density_sample_distance, dem_rast.csx, dem_rast.csy
+        )
+        raster_filter(stream_mask_dst, kernel, "sum", stream_filter_dst)
+        to_raster(
+            from_raster(stream_filter_dst) / kernel.sum(),
+            stream_filter_dst,
+            stream_density_dst,
+            False,
+        )
+        # Adjust stream_density_cutoff for cell size
+        avg_cs = (dem_rast.csx + dem_rast.csy) / 2.0
+        stream_density_cutoff /= avg_cs**2
+        normalize(
+            stream_density_dst, stream_density_norm_dst, (0, stream_density_cutoff)
+        )
+        expand_interpolate(stream_density_dst, stream_density_interp_dst, twi_norm_dst)
+
+        # Merge layers and classify into 3 zones based on distribution
+        sensitivity = (
+            from_raster(twi_norm_dst)
+            + from_raster(bankfull_interp_dst)
+            + from_raster(stream_slope_interp_dst)
+            + from_raster(stream_density_interp_dst)
+        )
+        q1_3 = da.percentile(sensitivity.ravel(), (1.0 / 3.0) * 100.0)
+        q2_3 = da.percentile(sensitivity.ravel(), (2.0 / 3.0) * 100.0)
+
+        sensitivity_classified = da.ma.masked_where(
+            da.ma.getmaskarray(from_raster(twi_norm_dst)),
+            da.digitize(sensitivity, [q1_3, q2_3]).astype(np.uint8),
         )
 
-        to_raster(cost, slope_dst, cost_dst, False)
+        import pdb
 
-        with GrassRunner(cost_dst) as gr:
-            gr.run_command(
-                "r.cost",
-                (cost_dst, "cost", "raster"),
-                (stream_dst, "streams", "raster"),
-                input="cost",
-                output="conn",
-                start_raster="streams",
-            )
-            # gr.save_raster("conn", lcp_dst)
-            gr.save_raster("conn", connectivity_dst)
+        pdb.set_trace()
 
-        # Classify connectivity region
-        # conn_threshold = kwargs.get("lcp_threshold", 1)
-        # conn_region = from_raster(lcp_dst) < conn_threshold
-
-        # Calculate other variables and interpolate to the connectivity region
-        # Channel density
-        # convolve(stream_dst, np.ones((10, 10, 1), dtype="bool"), "sum")
-
-        # Inverse of normalized channel slope
-        # to_raster(raster_where(da.ma.getmaskarray(from_raster(stream_dst)), from_raster(dem), None))
-        # slope(strem_elev_dst, stream_slope_dst, overviews=False)
-        # 1 - da.clip(from_raster(stream_slope_dst), 0.0, 90.0) / 90
-
-        # precip_cm = from_raster(precip).astype("float32") / 10
-
-        # bankfull_width = 0.196 * (contrib_area**0.280) * (precip_cm**0.355)
-
-        # Cost (already distributed)
-        # 1 - da.clip(raster_where(from_raster(connectivity_dst), 0, conn_threshold) / conn_threshold
-
-        # Classify into 3 zones based on distribution
+        to_raster(sensitivity_classified, dem, connectivity_dst)

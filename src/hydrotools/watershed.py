@@ -8,7 +8,7 @@ from typing import Union
 
 import dask.array as da
 import numpy as np
-from numba import jit
+from numba import njit
 import fiona
 from fiona.crs import from_string
 
@@ -385,7 +385,9 @@ class WatershedIndex:
         # Initialize an array for the stack
         visited = np.ma.getmaskarray(fd)
 
-        @jit(nopython=True)
+        fd = fd.filled(-1)
+
+        @njit
         def traverse(fd, streams, i, j):
             directions = [
                 None,
@@ -426,7 +428,7 @@ class WatershedIndex:
             # Traverse to the outlet
             return traverse(fd, streams, i, j)
 
-        @jit(nopython=True)
+        @njit
         def delineate(fd, streams, i, j, visited):
             directions = [[7, 6, 5], [8, 0, 4], [1, 2, 3]]
 

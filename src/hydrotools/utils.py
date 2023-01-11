@@ -7,7 +7,8 @@ from tempfile import _get_candidate_names
 import numpy as np
 import dask.array as da
 from grass_session import Session
-from pyproj import Transformer, CRS
+from pyproj import Transformer, CRS, Proj
+from scipy.ndimage import distance_transform_edt
 
 # Implicitly becomes available after importing grass_session
 from grass.script import core as grass  # noqa
@@ -220,6 +221,10 @@ def proj4_string(sr: Union[str, int]) -> str:
     return sr_data.to_proj4()
 
 
+def compare_projections(proj1, proj2):
+    return Proj(init=proj1) == Proj(init=proj2)
+
+
 def transform_points(
     points: List[Tuple[float, float]],
     in_proj: Union[int, str],
@@ -242,3 +247,25 @@ def transform_points(
     t_points = transformer.transform(points[:, 0], points[:, 1])
 
     return list(zip(*t_points))
+
+
+def kernel_from_distance(distance: float, csx: float, csy: float) -> np.ndarray:
+    """
+    Calculate a kernel mask using distance.
+
+    :param distance (float): Radius for kernel.
+    :param csx (float): Cell size in the x-direction.
+    :param csy (float): Cell size in the y-direction.
+    :return (np.ndarray): Kernel mask.
+    """
+    num_cells_x = np.ceil(round((distance * 2.0) / csx)) + 1
+    num_cells_y = np.ceil(round((distance * 2.0) / csy)) + 1
+
+    centroid = (int((num_cells_y - 1) / 2.0), int((num_cells_x - 1) / 2.0))
+
+    kernel = np.ones(shape=(int(num_cells_y), int(num_cells_x)), dtype=bool)
+    kernel[centroid] = 0
+    
+    dt = distance_transform_edt(kernel, (csy, csx))
+
+    return dt <= distance
