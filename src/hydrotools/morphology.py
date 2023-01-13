@@ -607,14 +607,14 @@ def topographic_wetness(
         Defaults to None.
     """
     raster_specs = Raster.raster_specs(slope_src)
-    avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
+    max_cost = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
 
     streams = ~da.ma.getmaskarray(from_raster(streams))
 
     # Generate cost surface (normalized slope, adjusted for cell size)
     cost = (
         da.clip(from_raster(slope_src).astype(np.float64), 0.0, 90.0) / 90.0
-    ) * avg_cs
+    ) * max_cost
     # Make cost 0 where simulated streams exist
     cost = raster_where(~streams, cost, 0)
 
@@ -637,8 +637,7 @@ def topographic_wetness(
         cs = from_raster(cost_surface)
 
         # Invert
-        cs_min = cs.min()
-        cs_inverted = (cs.max() - cs_min) - (cs - cs_min)
+        cs_inverted = (max_cost - cs_min) - (cs - cs_min)
 
         if cutoff is not None:
             cs_inverted = da.ma.masked_where(cs_inverted < float(cutoff), cs_inverted)
@@ -661,11 +660,10 @@ class RiparianConnectivity:
 
         # Components of the analysis
         (
-            self.flow_directon,
-            self.flow_accumulation,
-            self.streams,
             self.slope,
+            self.streams,
             self.twi,
+            self.region,
             self.stream_slope,
             self.bankfull_width,
             self.stream_density,
@@ -711,11 +709,9 @@ class RiparianConnectivity:
             Defaults to 1e6 (1 km squared).
             min_stream_lenth: Minimum length of stream segments. Defaults to 0.
         """
-        fd = self.raster_path("flow_direction")
-        fa = self.raster_path("flow_accumulation")
         streams = self.raster_path("streams")
 
-        with TempRasterFile() as fd1:
+        with TempRasterFiles(3) as (fd1, fd2, fa):
             flow_direction_accumulation(
                 self.dem,
                 fd1,
@@ -724,18 +720,64 @@ class RiparianConnectivity:
                 False,
             )
 
-        extract_streams(
-            self.dem,
-            fa,
-            streams,
-            fd,
-            min_ws_area,
-            min_stream_length,
-        )
+            extract_streams(
+                self.dem,
+                fa,
+                streams,
+                fd2,
+                min_ws_area,
+                min_stream_length,
+            )
 
-        self.flow_directon = fd
-        self.flow_accumulation = fa
         self.streams = streams
+
+    def calc_twi(self):
+        """Create a Topographic Wetness Attribute, which is also used to constrain the
+        riparian extent.
+        """
+        if self.streams is None:
+            raise AttributeError(
+                "Streams must be delineated first using "
+                "`RiparianConnectivity.extract_streams`."
+            )
+        if self.slope is None:
+            slope_dst = self.raster_path("slope")
+            slope(self.dem, slope_dst, overviews=False)
+            self.slope = slope_dst
+
+        twi_dst = self.raster_path("twi")
+        topographic_wetness(self.streams, self.slope, twi_dst)
+        self.twi = twi_dst
+
+    def define_region(self, twi_cutoff: float = 830):
+        """Constrain the Topographic Wetness Index (TWI) to a threshold that is used
+        to define the extent of the riparian.
+
+        This method may be called iteratively after calculating the TWI, defining the
+        region using a threshold, and inspecting the result (the path to which can be
+        accessed using the `region` attribute) to determine whether the extent
+        accurately represents the extent of riparian regions.
+
+        Args:
+            twi_cutoff (float): Topographic wetness cutoff value. Defaults to 830.
+        """
+        if self.twi is None:
+            raise AttributeError(
+                "The Topographic Wetness Index must be calculated "
+                "first using `RiparianConnectivity.calc_twi`."
+            )
+
+        twi = from_raster(self.twi)
+        twi = da.ma.masked_where(twi < float(twi_cutoff), twi)
+
+        twi_max = twi.max()
+        twi_norm = (twi - twi_cutoff) / (twi_max - twi_cutoff)
+
+        region_dst = self.raster_path("region")
+        to_raster(twi_norm, self.twi, region_dst)
+
+        self.region = region_dst
+
 
     # @classmethod
     # def load_from_data(cls):
@@ -880,9 +922,5 @@ def riparian_connectivity(
             da.ma.getmaskarray(from_raster(twi_norm_dst)),
             da.digitize(sensitivity, [q1_3, q2_3]).astype(np.uint8),
         )
-
-        import pdb
-
-        pdb.set_trace()
 
         to_raster(sensitivity_classified, dem, connectivity_dst)
