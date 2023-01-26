@@ -94,7 +94,7 @@ def raster_filter(
 
         return output
 
-    src = da.ma.filled(from_raster(raster_source).astype(np.float64), np.nan)
+    src = da.ma.filled(from_raster(raster_source).astype(np.float32), np.nan)
 
     if isinstance(kernel, tuple):
         if len(kernel) != 2:

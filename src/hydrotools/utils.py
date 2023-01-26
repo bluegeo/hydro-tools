@@ -222,7 +222,7 @@ def proj4_string(sr: Union[str, int]) -> str:
 
 
 def compare_projections(proj1, proj2):
-    return Proj(init=proj1) == Proj(init=proj2)
+    return CRS.from_user_input(proj1) == CRS.from_user_input(proj2)
 
 
 def transform_points(

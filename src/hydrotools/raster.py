@@ -2,7 +2,7 @@ import os
 from typing import Union
 from contextlib import contextmanager
 from subprocess import run
-from tempfile import gettempdir, _get_candidate_names
+from tempfile import _get_candidate_names
 
 import numpy as np
 import dask.array as da
