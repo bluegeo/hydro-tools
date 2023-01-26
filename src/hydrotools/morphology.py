@@ -1,21 +1,38 @@
+import os
 from typing import Union
 from collections import OrderedDict
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
+from tempfile import TemporaryDirectory
 
 import fiona
 from shapely.geometry import LineString, Point
 import dask.array as da
+from dask_image.ndmorph import binary_erosion
+from numba import njit
+from numba.typed import List
 import numpy as np
 
+from hydrotools.config import CHUNKS
 from hydrotools.raster import (
     Raster,
     TempRasterFile,
+    TempRasterFiles,
     raster_where,
     from_raster,
     to_raster,
+    vectorize,
 )
-from hydrotools.utils import GrassRunner
+from hydrotools.utils import GrassRunner, kernel_from_distance, compare_projections
+from hydrotools.watershed import extract_streams, flow_direction_accumulation
+from hydrotools.elevation import slope
+from hydrotools.interpolate import (
+    PointInterpolator,
+    front_contains,
+    raster_filter,
+    expand_interpolate,
+    normalize,
+)
 
 
 def sinuosity(
@@ -94,7 +111,11 @@ def sinuosity(
         }
 
         with fiona.open(
-            sinuosity_vector, "w", driver="GPKG", crs=vect.crs, schema=output_schema,
+            sinuosity_vector,
+            "w",
+            driver="GPKG",
+            crs=vect.crs,
+            schema=output_schema,
         ) as out_vect:
 
             for point in points:
@@ -109,99 +130,500 @@ def sinuosity(
                 )
 
 
-def bankfull_width(
-    accumulation: str, precip: str, bankfull: str, min_area: float = 1e6
+def stream_slope(
+    dem: str, streams: str, slope_dst: str, units: str = "degress", scale: float = 1
 ):
-    """Estimate theoretical bankfull width using:
+    """Calculate slope along extracted streams.
 
-    bankfull_depth = 0.196 * (contrib_area[km2] ** 0.280) * (precip[cm] ** 0.355)
+    Args:
+        dem (str): Digital Elevation model raster
+        streams (str): Streams raster source generated using `watershed.extract_streams`
+        slope_dst (str): Destination slope raster dataset.
+        units (str, optional): Units for the output. Defaults to "degrees".
+        scale (float, optional): Z-factor to scale the output. Defaults to 1.
+    """
+    with TempRasterFile() as elev_dst:
+        to_raster(
+            da.ma.masked_where(
+                da.ma.getmaskarray(from_raster(streams)), from_raster(dem)
+            ),
+            dem,
+            elev_dst,
+            overviews=False,
+        )
 
-    Method from:
+        slope(elev_dst, slope_dst, units, scale, overviews=False)
 
-    Hall, J. E., D. M. Holzer, and T. J. Beechie. 2007. Predicting river floodplain and lateral channel migration
-        for salmon habitat conservation. Journal of the American Water Resources Association 43:786–797
+
+def bankfull_width(
+    streams: str,
+    accumulation: str,
+    precip: str,
+    bankfull: str,
+    bw_coeff: float = 0.196,
+    a_exp: float = 0.280,
+    p_exp: float = 0.355,
+):
+    """Estimate bankfull width with empirically-derived constants using:
+
+    bankfull_width = bw_coeff * (contrib_area[km2] ** a_exp) * (precip[cm/yr] ** p_exp)
+
+    Method and defaults from:
+
+    Hall, J. E., D. M. Holzer, and T. J. Beechie. 2007. Predicting river floodplain and
+        lateral channel migration for salmon habitat conservation. Journal of the
+        American Water Resources Association 43:786-797.
 
     Note, ensure the spatial reference of the rasters is a projected system in metres.
 
-    For the best results, the average annual precipitation should be summarized for
-    every position on the streams using the result of a `WatershedIndex` mean grid.
+    An example workflow that starts with a DEM and uses streams with a minumum
+    contributing area could look like this:
+
+    ```python
+    with TempRasterFile() as tmp_flow_direction:
+        # Compute flow accumulation. The resulting flow direction is not needed here
+        flow_direction_accumulation(
+            dem_path,
+            tmp_flow_direction,
+            accumulation_dst,
+            False,  # Multiple flow-direction
+            False,  # Allow negatives
+        )
+
+        # Compute streams with a minimum length of 0 while saving flow direction
+        extract_streams(
+            dem_path, accumulation_dst, stream_dst, flow_direction_dst, 1e6, 0
+        )
+
+        bankfull_width(
+            stream_dst,
+            accumulation_dst,
+            avg_annual_precip,
+            bankfull_dst,
+        )
+    ```
 
     Args:
-        accumulation (str): Flow accumulation grid
+        streams: Grid with stream locations
+        (generated using `watershed.extract_streams`),
+        accumulation (str): Flow accumulation dataset
         (generated using `watershed.flow_direction_accumulation`)
         precip (str): Mean annual precipitation grid in mm
         bankfull (str): Destination raster for bankfull grid
-        min_area (float, optional): Minimum contributing area for streams in m.
-        Defaults to 1E6.
+        streams (Union[str, None], optional): Input streams raster. Defaults to None.
+        bw_coeff (float): Bankfull width coefficient. Defaults to 0.196.
+        a_exp (float): Area expenential scale. Defaults to 0.280.
+        p_exp (float): Precip expenential scale. Defaults to 0.355.
     """
+    # Contributing area in km**2
     ca_specs = Raster(accumulation)
     fa = from_raster(accumulation)
-    contrib_area = fa.astype("float32") * (ca_specs.csx * ca_specs.csy / 1e6)
-    contrib_area = da.ma.masked_where(contrib_area < min_area / 1e6, contrib_area)
+    contrib_area = da.ma.masked_where(
+        da.ma.getmaskarray(from_raster(streams)),
+        da.abs(fa.astype("float32")) * ((ca_specs.csx * ca_specs.csy) / 1e6),
+    )
 
+    # Convert precipitation to cm
     precip_cm = from_raster(precip).astype("float32") / 10
 
-    bankfull_width = 0.196 * (contrib_area ** 0.280) * (precip_cm ** 0.355)
+    bankfull_width = bw_coeff * (contrib_area**a_exp) * (precip_cm**p_exp)
 
     to_raster(
         da.ma.masked_where(
             da.isinf(bankfull_width) | da.isnan(bankfull_width), bankfull_width
         ),
-        precip,
+        accumulation,
         bankfull,
     )
 
 
-def bankfull_mask(dem: str, bankfull_width: str):
-    """Generate a mask around streams guided by a distance derived from bankfull width,
-     which is calculated using `morphology.bankfull`.
+def bankfull_depth(
+    bankfull_width_src: str,
+    bankfull_depth_dst: str,
+    b_d_coeff: float = 0.145,
+    b_w_exp: float = 0.607,
+):
+    """Generate a bankfull depth dataset. Method and defaults from:
+
+    Hall, J. E., D. M. Holzer, and T. J. Beechie. 2007. Predicting river floodplain and
+        lateral channel migration for salmon habitat conservation. Journal of the
+        American Water Resources Association 43:786-797.
 
     Args:
-        dem (str): [description]
-        bankfull_width (str): [description]
+        bankfull_width_src (str): Bankfull width along streams derived from
+        `morphology.bankfull_width`.
+        bankfull_depth_dst (str): Output bankfull depth or bankfull mask dataset.
+        b_d_coeff (float, optional): Bankfull depth coefficient. Defaults to 0.145.
+        b_w_exp (float, optional): Bankfull width exponent. Defaults to 0.607.
     """
-    # Create distance transform to streams
+    bankfull_depth = b_d_coeff * (from_raster(bankfull_width_src) ** b_w_exp)
 
-    # Interpolate nodata for bankfull width
+    to_raster(
+        bankfull_depth,
+        bankfull_width_src,
+        bankfull_depth_dst,
+    )
 
-    # Mask areas where distance exceeds interpolated bankfull
 
-    # return mask
-    pass
+def bankfull_extent(
+    bankfull_width_src: str,
+    bankfull_depth_src: str,
+    dem: str,
+    bankfull_extent_dst: str,
+    flood_factor: float = 1,
+):
+    """Interpolate a bankfull extent surrounding streams using the bankfull elevation.
+
+    **Note**: This method is not memory-safe.
+
+    Args:
+        bankfull_width_src (str): Bankfull Depth calculated using
+        `morphology.bankfull_width`.
+        bankfull_depth_src (str): Bankfull Depth calculated using
+        `morphology.bankfull_depth`.
+        dem (str): DEM Grid used to originally derive Bankfull Depth.
+        bankfull_extent_dst (str): Output raster with the bankfull extent mask.
+        flood_factor (float, optional): A scaling factor to modify the bankfull depth.
+        Defaults to 1.
+    """
+    elevation = from_raster(dem)
+    bf_elevation = elevation + from_raster(bankfull_depth_src) * flood_factor
+
+    # Load stream locations and DEM into memory
+    (_, i, j), complete, bfe, bfw, str_dist, elev = da.compute(
+        da.where(~da.ma.getmaskarray(bf_elevation)),
+        ~da.ma.getmaskarray(bf_elevation),
+        da.ma.filled(bf_elevation, -999),
+        from_raster(bankfull_width_src),
+        da.zeros_like(elevation, dtype="float32"),
+        da.ma.filled(elevation, -999),
+    )
+
+    raster_specs = Raster.raster_specs(dem)
+    shape = raster_specs["shape"][1], raster_specs["shape"][2]
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
+
+    stack = List(np.array([i, j]).T.tolist())
+    del i, j
+
+    @njit(parallel=True)
+    def interpolate(
+        stack,
+        complete,
+        bfe,
+        bfw,
+        str_dist,
+        elev,
+        i_bound,
+        j_bound,
+        i_sampling,
+        j_sampling,
+    ):
+        offsets = [
+            [-1, -1],
+            [-1, 0],
+            [-1, 1],
+            [0, -1],
+            [0, 1],
+            [1, -1],
+            [1, 0],
+            [1, 1],
+        ]
+
+        stack_2 = List()
+        while len(stack) > 0:
+            while len(stack) > 0:
+                i, j = stack.pop()
+                for i_off, j_off in offsets:
+                    i_nbr = i + i_off
+                    j_nbr = j + j_off
+                    if i_nbr == i_bound or i_nbr < 0 or j_nbr == j_bound or j_nbr < 0:
+                        continue
+
+                    if (
+                        elev[0, i_nbr, j_nbr] != -999
+                        and bfe[0, i_nbr, j_nbr] == -999
+                        and not complete[0, i_nbr, j_nbr]
+                    ):
+                        stack_2.append([i_nbr, j_nbr])
+                        complete[0, i_nbr, j_nbr] = True
+
+            while len(stack_2) > 0:
+                i, j = stack_2.pop()
+                bfe_accum = 0
+                bfw_accum = 0
+                dist_accum = 0
+                modal = 0.0
+                distance = 0
+                inverse_distance = 0
+                for i_off, j_off in offsets:
+                    i_nbr = i + i_off
+                    j_nbr = j + j_off
+
+                    if i_nbr == i_bound or i_nbr < 0 or j_nbr == j_bound or j_nbr < 0:
+                        continue
+
+                    dist = np.sqrt(
+                        (i - i_nbr * i_sampling) ** 2.0
+                        + (j - j_nbr * j_sampling) ** 2.0
+                    )
+                    inverse_dist = 1 / dist
+
+                    if bfe[0, i_nbr, j_nbr] != -999:
+                        bfe_accum += bfe[0, i_nbr, j_nbr] * inverse_dist
+                        bfw_accum += bfw[0, i_nbr, j_nbr] * inverse_dist
+                        dist_accum += str_dist[0, i_nbr, j_nbr] * inverse_dist
+                        inverse_distance += inverse_dist
+
+                        distance += dist
+                        modal += 1
+
+                bfe_accum /= inverse_distance
+                bfw_accum /= inverse_distance
+                dist_accum /= inverse_distance
+
+                avg_width = distance / modal
+                dist_accum += avg_width
+                limit = elev[0, i, j]
+
+                if bfe_accum >= limit and dist_accum <= bfw_accum:
+                    stack.append([i, j])
+                    bfe[0, i, j] = bfe_accum
+                    bfw[0, i, j] = bfw_accum
+                    str_dist[0, i, j] = dist_accum
+
+    interpolate(stack, complete, bfe, bfw, str_dist, elev, shape[0], shape[1], csy, csx)
+
+    to_raster(
+        da.from_array(bfe != -999),
+        bankfull_depth_src,
+        bankfull_extent_dst,
+    )
+
+
+@njit
+def vci_width_transform_task(
+    regions: np.ndarray, edges: np.ndarray, bfw: np.ndarray, csx: float, csy: float
+) -> np.ndarray:
+    """Compute approximate valley confinement index using widths of connected regions
+    and returning the ratio of the maximum bankfull width to the valley width.
+
+    Args:
+        regions (np.ndarray): Array of regions (float) bounded by a value of -999.
+        edges (np.ndarray): Array of edges (bool) of regions.
+        bfw (np.ndarray): Array of bankfull width values, with -999 outside of streams.
+        csx (float): Cell size in the x-direction.
+        csy (float): Cell size in they y-direction.
+
+    Returns:
+        np.ndarray: Array of region widths bounded by -999.
+    """
+    i_bound, j_bound = regions.shape
+
+    width = regions.copy()
+    modals = regions.copy()
+
+    stack = [
+        [stack_i, stack_j]
+        for stack_i in range(i_bound)
+        for stack_j in range(j_bound)
+        if edges[stack_i, stack_j]
+    ]
+
+    offsets = [
+        [-1, -1],
+        [-1, 0],
+        [-1, 1],
+        [0, -1],
+        [0, 1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+    ]
+
+    while len(stack) > 0:
+        next_i, next_j = stack.pop(0)
+
+        search_stack = List()
+        searched = {np.int64(next_i): {np.int64(next_j): True}}
+        edge_stack = List([[next_i, next_j]])
+        region_stack = List()
+        i, j = next_i, next_j
+
+        current_distance = (csx + csy) / 2.0
+
+        while True:
+            distances = List()
+            terminate = False
+            for i_off, j_off in offsets:
+                i_nbr = np.int64(i + i_off)
+                j_nbr = np.int64(j + j_off)
+
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or regions[i_nbr, j_nbr] == -999
+                ):
+                    continue
+
+                if i_nbr in searched and j_nbr in searched[i_nbr]:
+                    continue
+                else:
+                    dist = np.sqrt(
+                        (np.float64(i_nbr - next_i) * csy) ** 2
+                        + (np.float64(j_nbr - next_j) * csx) ** 2
+                    )
+
+                    try:
+                        searched[i_nbr][j_nbr] = True
+                    except:
+                        searched[i_nbr] = {j_nbr: True}
+
+                    if edges[i_nbr, j_nbr]:
+                        distances.append(dist)
+                        if len(region_stack) > 0:
+                            # Check if the edge opposes the existing center of mass
+                            r_com_i, r_com_j = 0.0, 0.0
+                            for _i, _j in region_stack:
+                                r_com_i += np.float64(_i)
+                                r_com_j += np.float64(_j)
+                            denom = np.float64(len(region_stack))
+                            r_com_i /= denom
+                            r_com_j /= denom
+
+                            e_com_i, e_com_j = 0.0, 0.0
+                            for _i, _j in edge_stack:
+                                e_com_i += np.float64(_i)
+                                e_com_j += np.float64(_j)
+                            denom = np.float64(len(edge_stack))
+                            e_com_i /= denom
+                            e_com_j /= denom
+
+                            if not front_contains(
+                                e_com_j, e_com_i, r_com_j, r_com_i, j_nbr, i_nbr
+                            ):
+                                terminate = True
+                        edge_stack.append([i_nbr, j_nbr])
+                    else:
+                        region_stack.append([i_nbr, j_nbr])
+                        if len(search_stack) == 0 or dist >= search_stack[-1][0]:
+                            search_stack.append([dist, i_nbr, j_nbr])
+                        elif dist <= search_stack[0][0]:
+                            search_stack.insert(0, [dist, i_nbr, j_nbr])
+                        else:
+                            idx = -1
+                            while dist <= search_stack[idx][0]:
+                                idx -= 1
+                            search_stack.insert(idx + 1, [dist, i_nbr, j_nbr])
+
+            if len(distances) > 0:
+                current_distance = sum(distances) / len(distances)
+
+            if terminate:
+                break
+
+            try:
+                _, i, j = search_stack.pop(0)
+            except:
+                break
+
+        bfw_value = 0
+        for assign_i, j_dict in searched.items():
+            for assign_j, _ in j_dict.items():
+                if (
+                    bfw[assign_i, assign_j] != -999
+                    and bfw[assign_i, assign_j] > bfw_value
+                ):
+                    bfw_value = bfw[assign_i, assign_j]
+
+        if current_distance > 0:
+            vci = bfw_value / current_distance
+            for assign_i, j_dict in searched.items():
+                for assign_j, _ in j_dict.items():
+                    width[assign_i, assign_j] += vci
+                    modals[assign_i, assign_j] += 1
+
+    return np.where(modals > 0, width / modals, -999)
+
+
+def valley_confinement(
+    bankfull_width_src: str,
+    twi_src: str,
+    valley_confinement_dst: str,
+    twi_threshold: float = 3500,
+):
+    """Calculate a valley confinement index - the ratio of valley width to estimated
+    bankfull width.
+
+    Args:
+        bankfull_width_src (str): Bankfull width data source calculated using
+        `morphology.bankfull_width`.
+        twi_src (str): Topographic Wetness Index data source calculated using
+        `morphology.topographic_wetness`.
+        valley_confinement_dst (str): Output raster with valley confinement index
+        values.
+        twi_threshold (float): The maximum topographic wetness used to constrain the
+        valley bottom. Defaults to 3500.
+    """
+    raster_specs = Raster.raster_specs(bankfull_width_src)
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
+
+    valleys = da.ma.filled(from_raster(twi_src) >= twi_threshold, False).astype(bool)
+    valley_eroded = binary_erosion(valleys, np.ones((1, 3, 3), dtype=bool)).astype(bool)
+    valley_edges = valleys & ~valley_eroded
+
+    regions, edges, bfw = da.compute(
+        da.squeeze(da.where(valleys, 0, -999)).astype(np.float64),
+        da.squeeze(valley_edges),
+        da.squeeze(da.ma.filled(from_raster(bankfull_width_src), -999)).astype(
+            np.float64
+        ),
+    )
+
+    vci = da.from_array(
+        vci_width_transform_task(regions, edges, bfw, csx, csy)[np.newaxis, :]
+    )
+    del regions, edges, bfw
+
+    vci = da.ma.masked_where(vci == -999, vci)
+
+    to_raster(vci, bankfull_width_src, valley_confinement_dst)
 
 
 def topographic_wetness(
-    accumulation: str,
-    slope: str,
-    destination: str,
-    min_area: float = 1e6,
-    cutoff: Union[float, None] = None,
+    streams: str,
+    slope_src: str,
+    topographic_wetness_dst: str,
+    max_cost: float = 750.0,
 ):
     """Calculate a topographic wetness index
 
     Args:
-        accumulation (str): Flow accumulation grid
+        streams (str): Grid with stream locations
         (generated using `watershed.flow_direction_accumulation`)
-        slope (str): Topographic slope in Degrees.
-        destination (str): Output TWI grid
-        min_area (float, optional): Minimum contributing area for simulated streams.
-        Defaults to 1e6.
-        cutoff (Union[float, None]): Return the index up to a defined threshold. Defaults to None.
+        slope_src (str): Topographic slope in Degrees.
+        topographic_wetness_dst (str): Output TWI grid
+        max_cost (float): Maximum cost used to scale and invert the TWI values.
+        Defaults to 750.
     """
-    ca_specs = Raster(accumulation)
-    fa = from_raster(accumulation)
+    raster_specs = Raster.raster_specs(slope_src)
+    avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
 
-    streams = da.ma.masked_where(fa < min_area / (ca_specs.csx * ca_specs.csy), fa)
+    streams = ~da.ma.getmaskarray(from_raster(streams))
 
-    # Generate cost surface (normalized slope)
-    cost = da.clip(from_raster(slope), 0.0, 90.0) / 90.0
+    # Generate cost surface (normalized slope, adjusted for cell size)
+    cost = (
+        da.clip(from_raster(slope_src).astype(np.float64), 0.0, 90.0) / 90.0
+    ) * avg_cs
     # Make cost 0 where simulated streams exist
-    cost = raster_where(da.ma.getmaskarray(streams), cost, 0)
+    cost = raster_where(~streams, cost, 0)
 
     # Generate least cost surface
-    with TempRasterFile() as streams_path, TempRasterFile() as cost_path, TempRasterFile() as cost_surface:
-        to_raster(cost, slope, cost_path, False)
-        to_raster(streams, slope, streams_path, False)
+    with TempRasterFiles(3) as (streams_path, cost_path, cost_surface):
+        to_raster(cost, slope_src, cost_path, False)
+        to_raster(streams, slope_src, streams_path, False)
 
         with GrassRunner(cost_path) as gr:
             gr.run_command(
@@ -211,18 +633,391 @@ def topographic_wetness(
                 input="cost",
                 output="cost_path",
                 start_raster="streams",
+                memory=2048,
+                flags="k",
             )
             gr.save_raster("cost_path", cost_surface)
 
-        cs = from_raster(cost_surface)
+        cs = from_raster(cost_surface).astype("float32")
 
         # Invert
-        cs_min = cs.min()
-        cs_inverted = (cs.max() - cs_min) - (cs - cs_min)
+        cs_inverted = max_cost - da.ma.masked_where(cs > max_cost, cs)
 
-        if cutoff is not None:
-            cs_inverted = da.ma.masked_where(cs_inverted < float(cutoff), cs_inverted)
+        to_raster(cs_inverted, slope_src, topographic_wetness_dst)
 
-        cs_inverted = cs_inverted.astype("float32")
 
-        to_raster(cs_inverted, slope, destination)
+class RiparianConnectivity:
+    def __init__(self, dem: str):
+        """Define a study area and begin a Riparian Connectivity Analysis"""
+        self.dem = dem
+
+        # Specifications
+        self.__dict__.update(Raster.raster_specs(dem))
+
+        # Create a directory
+        self.tmp_dir = TemporaryDirectory()
+
+        # Components of the analysis
+        (
+            self.slope,
+            self.flow_accumulation,
+            self.streams,
+            self.twi,
+            self.region,
+            self.bankfull_width,
+            self.stream_slope,
+            self.stream_density,
+        ) = (None for _ in range(8))
+
+    def raster_path(self, name: str) -> str:
+        """Generate a raster path using the current temporary directory.
+
+        Args:
+            name (str): Name of the raster dataset.
+
+        Returns:
+            str: A valid raster path.
+        """
+        return os.path.join(self.tmp_dir.name, f"{name}.tif")
+
+    def verify_source(self, src: str):
+        """Ensure a raster aligns with the current study area.
+
+        Args:
+            src (str): Source Raster dataset.
+        """
+        src_specs = Raster(src)
+        if not all(
+            [
+                np.isclose(src_specs.csx, self.csx),
+                np.isclose(src_specs.csy, self.csy),
+                np.isclose(src_specs.top, self.top),
+                np.isclose(src_specs.bottom, self.bottom),
+                np.isclose(src_specs.left, self.left),
+                np.isclose(src_specs.right, self.right),
+                src_specs.shape == self.shape,
+                compare_projections(src_specs.wkt, self.wkt),
+            ]
+        ):
+            raise ValueError(f"Input raster {src} does not align with the study area.")
+
+    # TODO: copy tmp_dir to a specified dir
+    # def save(self, dst_dir: str):
+    #     """_summary_
+
+    #     Args:
+    #         dst_dir (str): _description_
+    #     """
+
+    # @classmethod
+    # def load_from_data(cls):
+    # TODO: Load from all required parameters
+
+    def extract_streams(
+        self,
+        min_ws_area: float = 1e6,
+        min_stream_length: float = 0,
+        memory: Union[int, None] = None,
+    ):
+        """Create a streams attribute.
+
+        Args:
+            min_ws_area (float, optional): Minimum contributing area (m2) used to
+            classify streams. Defaults to 1e6 (1 km squared).
+            min_stream_lenth (float, optional): Minimum length of stream segments.
+            Defaults to 0.
+            memory (Union[int, None], optional): Memory size to pass to GRASS for memory
+            management of `r.watershed` operations. Defaults to None.
+        """
+        streams = self.raster_path("streams")
+        fa = self.raster_path("flow_accumulation")
+
+        with TempRasterFiles(2) as (fd1, fd2):
+            flow_direction_accumulation(
+                self.dem,
+                fd1,
+                fa,
+                False,
+                False,
+                memory=memory
+            )
+
+            extract_streams(
+                self.dem,
+                fa,
+                streams,
+                fd2,
+                min_ws_area,
+                min_stream_length,
+            )
+
+        self.streams = streams
+        self.flow_accumulation = fa
+
+    def calc_twi(self):
+        """Calculate a Topographic Wetness Attribute, which is also used to constrain the
+        riparian extent.
+        """
+        if self.streams is None:
+            raise AttributeError(
+                "Streams must be delineated first using "
+                "`RiparianConnectivity.extract_streams`."
+            )
+        if self.slope is None:
+            slope_dst = self.raster_path("slope")
+            slope(self.dem, slope_dst, overviews=False)
+            self.slope = slope_dst
+
+        twi_dst = self.raster_path("twi")
+        topographic_wetness(self.streams, self.slope, twi_dst)
+        self.twi = twi_dst
+
+    def define_region(self, twi_cutoff: float = 745.0):
+        """Constrain the Topographic Wetness Index (TWI) to a threshold that is used
+        to define the extent of the riparian.
+
+        This method may be called iteratively after calculating the TWI, defining the
+        region using a threshold, and inspecting the result (the path to which can be
+        accessed using the `region` attribute) to determine whether the extent
+        accurately represents the extent of riparian regions.
+
+        Args:
+            twi_cutoff (float): Topographic wetness cutoff value. Defaults to 830.
+        """
+        if self.twi is None:
+            raise AttributeError(
+                "The Topographic Wetness Index must be calculated "
+                "first using `RiparianConnectivity.calc_twi`."
+            )
+
+        twi = from_raster(self.twi)
+        twi = da.ma.masked_where(twi < float(twi_cutoff), twi)
+
+        twi_max = twi.max()
+        twi_norm = (twi - twi_cutoff) / (twi_max - twi_cutoff)
+
+        region_dst = self.raster_path("region")
+        to_raster(twi_norm, self.twi, region_dst)
+
+        self.region = region_dst
+
+    def interpolate_into_region(self, src, dst):
+        pred_locations_dask = da.where(~da.ma.getmaskarray(from_raster(self.region)))
+        obs_dask = from_raster(src)
+        out_shape = obs_dask.shape
+        obs_locations_dask = da.where(~da.ma.getmaskarray(obs_dask))
+        obs_dask = da.ma.getdata(obs_dask)[~da.ma.getmaskarray(obs_dask)]
+
+        obs_locations, obs, pred_locations = da.compute(
+            obs_locations_dask, obs_dask, pred_locations_dask
+        )
+
+        pred_z = PointInterpolator(
+            np.vstack(obs_locations).T[:, 1:],
+            obs,
+            np.vstack(pred_locations).T[:, 1:],
+        ).idw(int(round(200 / ((self.csx + self.csy) / 2.0))))
+
+        nodata = np.finfo("float32").min
+        output = da.full(out_shape[1] * out_shape[2], nodata, "float32")
+        output[np.ravel_multi_index(pred_locations, out_shape)] = pred_z
+        output[np.ravel_multi_index(obs_locations, out_shape)] = obs
+
+        output = output.reshape(out_shape).rechunk(CHUNKS)
+        output = da.ma.masked_where(output == nodata, output)
+
+        to_raster(output, src, dst)
+
+    def calc_bankfull_width(self, annual_precip_src: str, cutoff: float = 10.0):
+        """Calculate a Bankfull Width attribute, which is normalized and  expanded to
+        the riparian region.
+
+        Args:
+            annual_precip_src (str): Mean annual precipitation grid in mm.
+            cutoff (float, optional): A maximum Bankfull Width threshold to use for the
+                normalized value. Defaults to 10.0m.
+        """
+        if self.streams is None or self.flow_accumulation is None:
+            raise AttributeError(
+                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
+                " prior to calculating Bankfull Width."
+            )
+        if self.region is None:
+            raise AttributeError(
+                "Riparian regions must be delineated using "
+                "`RiparianConnectivity.define_region` prior to calculating Bankfull "
+                "Width."
+            )
+
+        self.verify_source(annual_precip_src)
+
+        bankfull_width_dst = self.raster_path("bankfull_width")
+        with TempRasterFiles(2) as (bankfull_dst, bankfull_norm_dst):
+            bankfull_width(
+                self.streams, self.flow_accumulation, annual_precip_src, bankfull_dst
+            )
+            normalize(bankfull_dst, bankfull_norm_dst, (0, cutoff))
+            self.interpolate_into_region(bankfull_norm_dst, bankfull_width_dst)
+
+        self.bankfull_width = bankfull_width_dst
+
+    def calc_stream_slope(self, cutoff: float = 15.0):
+        """Calculate and add a Stream Slope attribute.
+
+        Args:
+            cutoff (float, optional): A maximum Stream Slope threshold to use for the
+                normalized value. Defaults to 15.0 degrees.
+        """
+        if self.streams is None:
+            raise AttributeError(
+                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
+                " prior to calculating Stream Slope."
+            )
+        if self.region is None:
+            raise AttributeError(
+                "Riparian regions must be delineated using "
+                "`RiparianConnectivity.define_region` prior to calculating Stream "
+                "Slope."
+            )
+
+        stream_slope_dst = self.raster_path("stream_slope")
+
+        with TempRasterFiles(2) as (strslo_dst, strslo_norm_dst):
+            stream_slope(self.dem, self.streams, strslo_dst)
+            normalize(
+                strslo_dst,
+                strslo_norm_dst,
+                (0, cutoff),
+                invert=True,
+            )
+            self.interpolate_into_region(strslo_norm_dst, stream_slope_dst)
+
+        self.stream_slope = stream_slope_dst
+
+    def calc_stream_density(self, sample_distance: float = 500, cutoff: float = 2e5):
+        """Calculate and add a Stream Density attribute.
+
+        Args:
+            sample_distance (float, optional): Distance to sample stream cells for the
+                stream density transform. Defaults to 500m.
+            cutoff (float, optional): A maximum Stream Slope threshold to use for the
+                normalized value. This value should assume a cell size of 1m, be
+                adjusted with the `sample_distance` argument, and be adjusted for
+                the actual input raster cell size. Defaults to 2e5 cells per the
+                `radius` parameter.
+        """
+        if self.streams is None:
+            raise AttributeError(
+                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
+                " prior to calculating Stream Density."
+            )
+        if self.region is None:
+            raise AttributeError(
+                "Riparian regions must be delineated using "
+                "`RiparianConnectivity.define_region` prior to calculating Stream "
+                "Density."
+            )
+        # Would check for slope, but it will be implicitly included if
+        # RiparianConnectivity.define_region has been called.
+
+        stream_density_dst = self.raster_path("stream_density")
+        with TempRasterFiles(4) as (
+            stream_mask_dst,
+            stream_filter_dst,
+            strdens_dst,
+            strdens_norm_dst,
+        ):
+            to_raster(
+                ~da.ma.getmaskarray(from_raster(self.streams)),
+                self.streams,
+                stream_mask_dst,
+                overviews=False,
+            )
+            kernel = kernel_from_distance(sample_distance, self.csx, self.csy)
+            raster_filter(stream_mask_dst, kernel, "sum", stream_filter_dst)
+
+            stream_density = from_raster(stream_filter_dst) / kernel.sum()
+
+            to_raster(
+                stream_density.astype(np.float32),
+                stream_filter_dst,
+                strdens_dst,
+                False,
+            )
+
+            # Adjust stream_density_cutoff for cell size
+            avg_cs = (self.csx + self.csy) / 2.0
+            cutoff /= avg_cs**2
+            normalize(strdens_dst, strdens_norm_dst, (0, cutoff))
+
+            self.interpolate_into_region(strdens_norm_dst, stream_density_dst)
+
+        self.stream_density = stream_density_dst
+
+    def calc_connectivity(
+        self,
+        connectivity_dst: str,
+        attributes: list = ["twi", "bankfull_width", "stream_slope", "stream_density"],
+        quantize: bool = True,
+        percentiles: list = [(1.0 / 3.0) * 100.0, (2.0 / 3.0) * 100.0],
+        vector: bool = True,
+    ):
+        """Calculate a riparian connectivity dataset.
+
+        Args:
+            connectivity_dst (str): Output path for Riparian Connectivity. This will be
+                a raster if `vector` is `False`.
+            attributes (list, optional): Attributes to include in the riparian
+                connectivity calculation. Defaults to
+                ["bankfull_width", "stream_slope", "stream_density"].
+            quantize (bool, optional): Split the result into zones of sensitivity using.
+                percentiles. Defaults to True.
+            percentiles (list, optional): Percentiles to use to define zones of
+                connectivity. Defaults to [(1.0 / 3.0) * 100.0, (2.0 / 3.0) * 100.0].
+            vector (bool, optional): Save the output as a vector file.
+        """
+        if len(attributes) == 0:
+            raise ValueError("At least one attribute must be included")
+
+        if quantize and (
+            len(percentiles) == 0
+            or any([q2 < q1 for q1, q2 in zip(percentiles[0:-1], percentiles[1:])])
+            or any([q > 100 for q in percentiles])
+        ):
+            raise ValueError(
+                "Percentiles must have at least one value, be monotonically increasing, "
+                "and not exceed 100."
+            )
+
+        if vector and not quantize:
+            raise ValueError("A vector should only be specified if `quantize` is used.")
+
+        prepared_attrs = []
+        for attr in attributes:
+            if attr == "twi":
+                attr = "region"
+
+            attr_value = getattr(self, attr)
+            if attr_value is None:
+                raise AttributeError(f"The attribute '{attr}' has not been calculated.")
+            prepared_attrs.append(attr_value)
+
+        sensitivity = from_raster(prepared_attrs[0])
+        for attr in prepared_attrs[1:]:
+            sensitivity += from_raster(attr)
+
+        if quantize:
+            percentile_sample = sensitivity[~da.ma.getmaskarray(sensitivity)]
+            qs = [da.percentile(percentile_sample, q)[0] for q in percentiles]
+
+            sensitivity = da.ma.masked_where(
+                da.ma.getmaskarray(from_raster(self.region)),
+                da.digitize(sensitivity, qs).astype(np.uint8),
+            )
+
+        if vector:
+            with TempRasterFile() as tmp_rast:
+                to_raster(sensitivity, self.dem, tmp_rast)
+                vectorize(tmp_rast, connectivity_dst, True)
+        else:
+            to_raster(sensitivity, self.dem, connectivity_dst)

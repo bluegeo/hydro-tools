@@ -1,30 +1,554 @@
 from multiprocessing.dummy import Pool as DummyPool
 from multiprocessing import cpu_count
+from typing import Union
 
 import numpy as np
-from numba import jit
+import dask.array as da
+from dask_image.ndmorph import binary_erosion
+from numba import njit
+from numba.typed import List
 from sklearn.neighbors import KNeighborsRegressor, BallTree
 
+from hydrotools.raster import Raster, from_raster, to_raster
 from hydrotools.utils import GrassRunner
 
 
-def fill_nodata(raster_source: str, destination: str, method: str = "idw"):
-    """Interpolate regions with no data in a raster
+def raster_filter(
+    raster_source: str,
+    kernel: Union[np.ndarray, tuple],
+    method: str,
+    filter_dst: str,
+    **kwargs,
+):
+    """Filter a raster using a defined kernel and method
 
     Args:
-        raster_source (str): [description]
-        destination (str): Destination raster dataset
-        method (str, optional): [description]. Defaults to "linear".
+        raster_source (str): Input raster
+        kernel (Union[np.ndarray, tuple]): Kernel to create the moving window sample.
+        The kernal may be a 2-length tuple to define the size of a rectangular window
+        or a boolean numpy array that defines the locations of the sample for the
+        window.
+        method (str): Method used to apply the filter. Choose one of:
+            [
+                "sum",
+                "min",
+                "max",
+                "diff",
+                "mean",
+                "median",
+                "std",
+                "variance",
+                "percentile",
+                "quantile"
+            ]
+            When choosing percentil or quantile, the `q` kwarg should be specified.
+        filter_dst (str): Path to the output filtered raster
+
+    Kwargs:
+        q: Percentile or quantile to use if `method` is percentile or quantile
     """
-    if method == "idw":
-        with GrassRunner(raster_source) as gr:
-            gr.run_command(
-                "r.fill.stats",
-                (raster_source, "input", "raster"),
-                input="input",
-                output="output",
+
+    @njit(nogil=True)
+    def apply_filter(a, kernel, i_start, j_start, i_end, j_end, method, q):
+        output = np.full(a.shape, np.nan, np.float32)
+
+        for i in range(i_start, a.shape[1] - i_end):
+            for j in range(j_start, a.shape[2] - j_end):
+
+                if np.isnan(a[0, i, j]):
+                    continue
+
+                sample = np.full(kernel.shape, np.nan, np.float64)
+                for k_i in range(kernel.shape[0]):
+                    for k_j in range(kernel.shape[1]):
+                        if kernel[k_i, k_j]:
+                            sample[k_i, k_j] = a[
+                                0, i + k_i - i_start, j + k_j - j_start
+                            ]
+
+                if np.all(np.isnan(sample)):
+                    continue
+
+                if method == "sum":
+                    output_val = np.nansum(sample)
+                elif method == "min":
+                    output_val = np.nanmin(sample)
+                elif method == "max":
+                    output_val = np.nanmax(sample)
+                elif method == "diff":
+                    output_val = np.nanmax(sample) - np.nanmin(sample)
+                elif method == "mean":
+                    output_val = np.nanmean(sample)
+                elif method == "median":
+                    output_val = np.nanmedian(sample)
+                elif method == "std":
+                    output_val = np.nanstd(sample)
+                elif method == "variance":
+                    output_val = np.nanvar(sample)
+                elif method == "percentile":
+                    output_val = np.nanpercentile(sample, q)
+                elif method == "quantile":
+                    output_val = np.nanquantile(sample, q)
+
+                output[0, i, j] = output_val
+
+        return output
+
+    src = da.ma.filled(from_raster(raster_source).astype(np.float32), np.nan)
+
+    if isinstance(kernel, tuple):
+        if len(kernel) != 2:
+            raise IndexError(
+                f"Input kernel {kernel} does not have values for two dimensions"
             )
-            gr.save_raster("output", destination)
+
+        kernel = np.ones(kernel, bool)
+    else:
+        if kernel.ndim != 2:
+            raise IndexError(
+                f"Input kernel of shape {kernel.shape} does not have two dimensions"
+            )
+
+        kernel = np.array(kernel, dtype=bool)
+
+    i_start = int(np.ceil((kernel.shape[0] - 1) / 2.0))
+    i_end = kernel.shape[0] - 1 - i_start
+    j_start = int(np.ceil(kernel.shape[1] - 1) / 2.0)
+    j_end = kernel.shape[1] - 1 - j_start
+
+    depth = {
+        0: 0,
+        1: i_start,
+        2: j_start,
+    }
+
+    filter_result = da.map_overlap(
+        apply_filter,
+        src,
+        depth=depth,
+        boundary=np.nan,
+        dtype=np.float32,
+        kernel=kernel,
+        i_start=i_start,
+        j_start=j_start,
+        i_end=i_end,
+        j_end=j_end,
+        method=method,
+        q=kwargs.get("q", 25),
+    )
+
+    to_raster(
+        da.ma.masked_where(da.isnan(filter_result), filter_result),
+        raster_source,
+        filter_dst,
+    )
+
+
+def distance_transform(raster_source: str, distance_dst: str):
+    """Calculate a distance transform where cells with values of nodata are given
+    values of distance to the nearest cell with valid data.
+
+    Args:
+        raster_source (str): Raster used to provide locations of valid data.
+        distance_dst (str): Output distance transform raster.
+    """
+    with GrassRunner(raster_source) as gr:
+        gr.run_command(
+            "r.grow.distance",
+            (raster_source, "input", "raster"),
+            input="input",
+            distance="output",
+        )
+        gr.save_raster("output", distance_dst)
+
+
+@njit
+def front_contains(
+    x1: float, y1: float, x2: float, y2: float, tx: float, ty: float
+) -> bool:
+    """Determine if point (tx, ty) is within the front normal to the vector
+    (x1, y1) -> (x2, y2).
+
+    Args:
+        x1 (float): Point 1 x-coordinate.
+        y1 (float): Point 1 y-coordinate.
+        x2 (float): Point 2 x-coordinate.
+        y2 (float): Point 2 y-coordinate.
+        tx (float): Test Point x-coordinate.
+        ty (float): Test Point y-coordinate.
+
+    Returns:
+        bool: True if the Test Point is within the front, False if outside.
+    """
+    if x1 == x2:
+        return (y2 - y1) >= 0 and ty <= y2 or (y2 - y1) <= 0 and ty >= y2
+    if y1 == y2:
+        return (x2 - x1) >= 0 and tx <= x2 or (x2 - x1) <= 0 and tx >= x2
+
+    inner_angle = np.arctan((x2 - x1) / (y2 - y1))
+    slope_angle = np.sign(inner_angle) * np.pi * 90 / 180 - inner_angle
+    fty = y2 + np.cos(slope_angle)
+    ftx = x2 - np.sin(slope_angle)
+
+    sign = (tx - x2) * (fty - y2) - (ty - y2) * (ftx - x2)
+
+    return x2 < x1 and sign >= 0 or x2 > x1 and sign <= 0
+
+
+@njit
+def width_transform_task(
+    regions: np.ndarray, edges: np.ndarray, csx: float, csy: float
+) -> np.ndarray:
+    """Compute the approximate widths of regions by searching for bounded edges
+
+    Args:
+        regions (np.ndarray): Array of regions (float) bounded by a value of -999.
+        edges (np.ndarray): Array of edges (bool) of regions.
+        csx (float): Cell size in the x-direction.
+        csy (float): Cell size in they y-direction.
+
+    Returns:
+        np.ndarray: Array of region widths bounded by -999.
+    """
+    i_bound, j_bound = regions.shape
+
+    width = regions.copy()
+    modals = regions.copy()
+
+    stack = [
+        [stack_i, stack_j]
+        for stack_i in range(i_bound)
+        for stack_j in range(j_bound)
+        if edges[stack_i, stack_j]
+    ]
+
+    offsets = [
+        [-1, -1],
+        [-1, 0],
+        [-1, 1],
+        [0, -1],
+        [0, 1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+    ]
+
+    while len(stack) > 0:
+        next_i, next_j = stack.pop(0)
+
+        search_stack = List()
+        searched = {np.int64(next_i): {np.int64(next_j): True}}
+        edge_stack = List([[next_i, next_j]])
+        region_stack = List()
+        i, j = next_i, next_j
+
+        current_distance = (csx + csy) / 2.0
+
+        while True:
+            distances = List()
+            terminate = False
+            for i_off, j_off in offsets:
+                i_nbr = np.int64(i + i_off)
+                j_nbr = np.int64(j + j_off)
+
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or regions[i_nbr, j_nbr] == -999
+                ):
+                    continue
+
+                if i_nbr in searched and j_nbr in searched[i_nbr]:
+                    continue
+                else:
+                    dist = np.sqrt(
+                        (np.float64(i_nbr - next_i) * csy) ** 2
+                        + (np.float64(j_nbr - next_j) * csx) ** 2
+                    )
+
+                    try:
+                        searched[i_nbr][j_nbr] = True
+                    except:
+                        searched[i_nbr] = {j_nbr: True}
+
+                    if edges[i_nbr, j_nbr]:
+                        distances.append(dist)
+                        if len(region_stack) > 0:
+                            # Check if the edge opposes the existing center of mass
+                            r_com_i, r_com_j = 0.0, 0.0
+                            for _i, _j in region_stack:
+                                r_com_i += np.float64(_i)
+                                r_com_j += np.float64(_j)
+                            denom = np.float64(len(region_stack))
+                            r_com_i /= denom
+                            r_com_j /= denom
+
+                            e_com_i, e_com_j = 0.0, 0.0
+                            for _i, _j in edge_stack:
+                                e_com_i += np.float64(_i)
+                                e_com_j += np.float64(_j)
+                            denom = np.float64(len(edge_stack))
+                            e_com_i /= denom
+                            e_com_j /= denom
+
+                            if not front_contains(
+                                e_com_j, e_com_i, r_com_j, r_com_i, j_nbr, i_nbr
+                            ):
+                                terminate = True
+                        edge_stack.append([i_nbr, j_nbr])
+                    else:
+                        region_stack.append([i_nbr, j_nbr])
+                        if len(search_stack) == 0 or dist >= search_stack[-1][0]:
+                            search_stack.append([dist, i_nbr, j_nbr])
+                        elif dist <= search_stack[0][0]:
+                            search_stack.insert(0, [dist, i_nbr, j_nbr])
+                        else:
+                            idx = -1
+                            while dist <= search_stack[idx][0]:
+                                idx -= 1
+                            search_stack.insert(idx + 1, [dist, i_nbr, j_nbr])
+
+            if len(distances) > 0:
+                current_distance = sum(distances) / len(distances)
+
+            if terminate:
+                break
+
+            try:
+                _, i, j = search_stack.pop(0)
+            except:
+                break
+
+        for assign_i, j_dict in searched.items():
+            for assign_j, _ in j_dict.items():
+                width[assign_i, assign_j] += current_distance
+                modals[assign_i, assign_j] += 1
+
+    return np.where(modals > 0, width / modals, -999)
+
+
+def width_transform(src: str, dst: str):
+    """Approximate the width of regions constrained by no data.
+
+    Args:
+        src (str): Source raster with regions. Regions are constrained by the raster
+        no data value.
+        dst (str): Destination raster with continuous values of approximate width
+        within regions.
+    """
+    raster_specs = Raster.raster_specs(src)
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
+
+    regions = ~da.ma.getmaskarray(from_raster(src))
+    region_eroded = binary_erosion(regions, np.ones((1, 3, 3), dtype=bool)).astype(bool)
+    edges = regions & ~region_eroded
+
+    region_array, edges_array = da.compute(
+        da.squeeze(da.where(regions, 0, -999).astype("float32")),
+        da.squeeze(edges),
+    )
+
+    width = da.from_array(
+        width_transform_task(region_array, edges_array, csx, csy)[np.newaxis, :]
+    )
+    del region_array, edges_array
+
+    to_raster(width, src, dst)
+
+
+@njit
+def expand_interpolate_task(
+    data: np.ndarray, regions: np.ndarray, csx: float, csy: float
+):
+    """Interpolator for `expand_interpolate`. Extends data outwards into regions.
+    Adds to data in place.
+
+    Args:
+        data (np.ndarray): Data with values for interpolation, bounded by NaNs.
+        regions (np.ndarray): Regions to constrain interpolation.
+        csx (float): Cell size in the x-direction.
+        csy (float): Cell size in the y-direction.
+    """
+    i_bound, j_bound = data.shape
+
+    stack = List()
+    for stack_i in range(i_bound):
+        for stack_j in range(j_bound):
+            if not np.isnan(data[stack_i, stack_j]):
+                stack.append([stack_i, stack_j])
+
+    offsets = [
+        [-1, -1],
+        [-1, 0],
+        [-1, 1],
+        [0, -1],
+        [0, 1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+    ]
+
+    stack_2 = List()
+    while len(stack) > 0:
+        while len(stack) > 0:
+            i, j = stack.pop()
+            for i_off, j_off in offsets:
+                i_nbr = i + i_off
+                j_nbr = j + j_off
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or not np.isnan(data[i_nbr, j_nbr])
+                    or not regions[i_nbr, j_nbr]
+                ):
+                    continue
+
+                stack_2.append([i_nbr, j_nbr])
+                data[i_nbr, j_nbr] = np.inf
+
+        values = List()
+        while len(stack_2) > 0:
+            i, j = stack_2.pop()
+
+            interp_accum = 0
+            total_distance = 0
+            for i_off, j_off in offsets:
+                i_nbr = np.int64(i + i_off)
+                j_nbr = np.int64(j + j_off)
+
+                if (
+                    i_nbr == i_bound
+                    or i_nbr < 0
+                    or j_nbr == j_bound
+                    or j_nbr < 0
+                    or np.isnan(data[i_nbr, j_nbr])
+                    or np.isinf(data[i_nbr, j_nbr])
+                    or not regions[i_nbr, j_nbr]
+                ):
+                    continue
+
+                inverse_dist = 1 / np.sqrt(
+                    (np.float64(i - i_nbr) * csy) ** 2.0
+                    + (np.float64(j - j_nbr) * csx) ** 2.0
+                )
+
+                interp_accum += data[i_nbr, j_nbr] * inverse_dist
+                total_distance += inverse_dist
+
+            if total_distance > 0:
+                values.append([i, j, interp_accum / total_distance])
+                stack.append([i, j])
+
+        # Assign interpolated values and continue
+        for i, j, value in values:
+            data[np.int64(i), np.int64(j)] = value
+
+
+def expand_interpolate(src: str, dst: str, regions: str = None):
+    """Expand regions with valid data progressively outwards into regions with no data.
+
+    Args:
+        src (str): Source raster with values to expand.
+        dst (str): Destination raster with interpolated values.
+        regions (str, optional): Raster to constrain interpolation extent. Regions are
+        defined by areas with data (constrained by no data). Defaults to None.
+    """
+    raster_specs = Raster.raster_specs(src)
+    csx, csy = raster_specs["csx"], raster_specs["csy"]
+
+    data, regions = da.compute(
+        da.squeeze(da.ma.filled(from_raster(src), np.nan)),
+        da.squeeze(~da.ma.getmaskarray(from_raster(regions)))
+        if regions is not None
+        else da.ones(raster_specs["shape"][1:], dtype=bool),
+    )
+
+    expand_interpolate_task(data, regions, csx, csy)
+    output_data = da.from_array(data)
+    output_data = da.ma.masked_where(
+        da.isnan(output_data) | da.isinf(output_data), output_data
+    )[np.newaxis, :]
+
+    to_raster(output_data, src, dst)
+
+
+def fill_nodata(raster_source: str, destination: str, method: str = "rst"):
+    """Fill regions of no data in a raster with interpolated values.
+
+    Args:
+        raster_source (str): Input raster to be interpolated.
+        destination (str): Output raster with interpolated values replacing no data.
+        method (str, optional): Select one of:
+            ["bilinear", "bicubic", "rst"]
+        Defaults to "rst".
+    """
+    if method.lower() not in ["bilinear", "bicubic", "rst"]:
+        raise ValueError(
+            f"Method {method} not recognized as a valid interpolation method"
+        )
+
+    with GrassRunner(raster_source) as gr:
+        gr.run_command(
+            "r.fillnulls",
+            (raster_source, "input", "raster"),
+            input="input",
+            output="output",
+            method=method.lower(),
+        )
+        gr.save_raster("output", destination)
+
+
+def fill_stats(
+    raster_source: str,
+    destination: str,
+    method: str = "wmean",
+    **kwargs,
+):
+    """Interpolate small regions with no data in a raster.
+
+    See https://grass.osgeo.org/grass82/manuals/r.fill.stats.html
+
+    Args:
+        raster_source (str): Input raster dataset to interpolate
+        destination (str): Destination raster dataset
+        method (str, optional): Interpolation method. Choose one of:
+        [
+             "wmean", "mean", "median", mode"
+        ]
+        Defaults to "linear".
+
+    Kwargs:
+        distance (int): Number of cells to fill surrounding regions with data.
+        Defaults to 3.
+        use_map_units (bool): Interpret the distance as map units and not cells.
+        Defaults to False.
+        cells (int): Minimum number of cells to use for interpolation sample.
+        Defaults to 3.
+        smooth (bool): Smooth the grid while interpolating. Defaults to True.
+    """
+    flags = "s"
+    if not kwargs.get("smooth", True):
+        flags += "k"
+    if kwargs.get("use_map_units", False):
+        flags += "m"
+
+    with GrassRunner(raster_source) as gr:
+        gr.run_command(
+            "r.fill.stats",
+            (raster_source, "input", "raster"),
+            input="input",
+            output="output",
+            mode=method,
+            distance=kwargs.get("distance", 3),
+            cells=kwargs.get("cells", 3),
+            flags=flags,
+        )
+
+        gr.save_raster("output", destination)
 
 
 def cubic_spline(
@@ -129,7 +653,7 @@ class PointInterpolator:
         n_neighbours = min(n_neighbours, self.obs_z.size)
 
         def idw_callable(distance):
-            return 1 / (distance ** 2)
+            return 1 / (distance**2)
 
         knn = KNeighborsRegressor(n_neighbors=n_neighbours, weights=idw_callable).fit(
             self.obs, self.obs_z
@@ -230,7 +754,7 @@ def bidw_task(obs, obs_z, pred, n_neighbours):
     return pred_z
 
 
-@jit(nopython=True, nogil=True)
+@njit(nogil=True)
 def full_idw(args):
     """Complete outer product idw
 
@@ -261,7 +785,7 @@ def full_idw(args):
                 coincident = obs_z[obs_row]
                 break
             else:
-                weight = 1 / distance ** 2
+                weight = 1 / distance**2
 
             weights[obs_row] = weight
             weights_sum += weight
@@ -272,3 +796,41 @@ def full_idw(args):
             output[pred_row] = np.sum(obs_z * weights / weights_sum)
 
     return output
+
+
+def normalize(
+    src: str,
+    dst: str,
+    in_range: tuple = ("min", "max"),
+    out_range: tuple = (0, 1),
+    invert: bool = False,
+):
+    """Normalize a raster to scale the range of values to a provided range.
+
+    Args:
+        src (str): Source Raster dataset.
+        dst (str): Output Rater dataset.
+        in_range (tuple, optional): Input range of values to use for normalization.
+        Values may be floating point numbers or the key words `"min"` and `"max"`.
+        Defaults to ("min", "max").
+        out_range (tuple, optional): Range of values for the output. Defaults to (0, 1).
+        invert (bool): Return the inverse of the normalized raster. Defaults to False.
+    """
+    in_rast = from_raster(src)
+
+    in_min = in_rast.min() if in_range[0] == "min" else float(in_range[0])
+    in_max = in_rast.max() if in_range[1] == "max" else float(in_range[1])
+
+    out_min = float(out_range[0])
+    out_max = float(out_range[1])
+
+    norm = (da.clip(in_rast.astype(np.float32), in_min, in_max) - in_min) / (
+        in_max - in_min
+    )
+
+    if invert:
+        norm = 1. - norm
+
+    out_rast = norm * (out_max - out_min) + out_min
+
+    to_raster(out_rast, src, dst)

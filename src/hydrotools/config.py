@@ -7,8 +7,6 @@ CHUNKS = (1, 4096, 4096)
 
 TMP_DIR = gettempdir()
 
-GRASS_LOCATION: str = "hydro-tools-grass"
-
 GRASS_TMP: str = gettempdir()
 
 GRASS_FLAGS: dict = {"quiet": True}
@@ -16,6 +14,8 @@ GRASS_FLAGS: dict = {"quiet": True}
 GDAL_DEFAULT_ARGS = [
     "-of",
     "GTiff",
+    "-co",
+    "COPY_SRC_OVERVIEWS=YES",
     "-co",
     "TILED=YES",
     "-co",

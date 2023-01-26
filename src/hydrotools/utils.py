@@ -1,20 +1,20 @@
 import os
 import shutil
-from tempfile import gettempdir
 from typing import List, Tuple, Union
 import warnings
-from subprocess import run
+from tempfile import _get_candidate_names
 
 import numpy as np
 import dask.array as da
 from grass_session import Session
-from pyproj import Transformer, CRS
+from pyproj import Transformer, CRS, Proj
+from scipy.ndimage import distance_transform_edt
 
 # Implicitly becomes available after importing grass_session
 from grass.script import core as grass  # noqa
 from grass.pygrass.modules.shortcuts import raster as graster  # noqa
 
-from hydrotools.config import GRASS_TMP, GRASS_LOCATION, GRASS_FLAGS, GDAL_DEFAULT_ARGS
+from hydrotools.config import GRASS_TMP, GRASS_FLAGS
 
 
 warnings.filterwarnings("ignore")
@@ -35,17 +35,21 @@ class GrassRunner(Session):
             dataset (str): GRASS mapset initialization data.
         """
         self.dataset = dataset
+        self.grass_location = f"hydro-tools-grass-{next(_get_candidate_names())}"
 
     def __enter__(self):
         super().__init__(
-            gisdb=GRASS_TMP, location=GRASS_LOCATION, create_opts=self.dataset
+            gisdb=GRASS_TMP, location=self.grass_location, create_opts=self.dataset
         )
         super().__enter__()
         return self
 
     def __exit__(self, exception_type, exception, traceback):
         super().__exit__(exception_type, exception, traceback)
-        shutil.rmtree(os.path.join(GRASS_TMP, GRASS_LOCATION))
+        try:
+            shutil.rmtree(os.path.join(GRASS_TMP, self.grass_location))
+        except:
+            print("Warning: unable to remove grass env")
 
     def run_command(self, cmd: str, *args, **kwargs):
         """Run a grass command
@@ -64,7 +68,7 @@ class GrassRunner(Session):
         for dataset, key, _type in args:
             ds_kwargs = {"input": dataset, "output": key}
             ds_kwargs.update(GRASS_FLAGS)
-            
+
             if _type.lower() == "vector":
                 grass.run_command("v.in.ogr", **ds_kwargs)
             elif _type.lower() == "raster":
@@ -99,6 +103,7 @@ class GrassRunner(Session):
                 "COMPRESS=LZW",
                 "BIGTIFF=YES",
             ],
+            flags="c",
             **kwargs,
         )
 
@@ -216,6 +221,10 @@ def proj4_string(sr: Union[str, int]) -> str:
     return sr_data.to_proj4()
 
 
+def compare_projections(proj1, proj2):
+    return CRS.from_user_input(proj1) == CRS.from_user_input(proj2)
+
+
 def transform_points(
     points: List[Tuple[float, float]],
     in_proj: Union[int, str],
@@ -238,3 +247,25 @@ def transform_points(
     t_points = transformer.transform(points[:, 0], points[:, 1])
 
     return list(zip(*t_points))
+
+
+def kernel_from_distance(distance: float, csx: float, csy: float) -> np.ndarray:
+    """
+    Calculate a kernel mask using distance.
+
+    :param distance (float): Radius for kernel.
+    :param csx (float): Cell size in the x-direction.
+    :param csy (float): Cell size in the y-direction.
+    :return (np.ndarray): Kernel mask.
+    """
+    num_cells_x = np.ceil(round((distance * 2.0) / csx)) + 1
+    num_cells_y = np.ceil(round((distance * 2.0) / csy)) + 1
+
+    centroid = (int((num_cells_y - 1) / 2.0), int((num_cells_x - 1) / 2.0))
+
+    kernel = np.ones(shape=(int(num_cells_y), int(num_cells_x)), dtype=bool)
+    kernel[centroid] = 0
+    
+    dt = distance_transform_edt(kernel, (csy, csx))
+
+    return dt <= distance

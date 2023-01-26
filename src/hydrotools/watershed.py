@@ -8,7 +8,7 @@ from typing import Union
 
 import dask.array as da
 import numpy as np
-from numba import jit
+from numba import njit
 import fiona
 from fiona.crs import from_string
 
@@ -41,7 +41,7 @@ def flow_direction_accumulation(
     accumulation_grid: str,
     single: bool = True,
     positive_only: bool = True,
-    mem_manage: bool = False,
+    memory: Union[int, None] = 4096,
 ):
     """Generate Flow Direction and Flow Accumulation grids using GRASS r.watershed
 
@@ -52,14 +52,15 @@ def flow_direction_accumulation(
         single (bool, optional): Output Single Flow Direction. Defaults to True.
         positive_only (bool, optional): Only include positive flow direction values.
         Defaults to True.
-        mem_manage (bool, optional): Manage memory during execution. Defaults to False.
+        memory (Union[int, None], optional): Manage memory during execution by assigning
+        a maximum block size. Defaults to 4096 MB.
     """
     flags = ""
     if positive_only:
         flags += "a"
     if single:
         flags += "s"
-    if mem_manage:
+    if memory is not None:
         flags += "m"
 
     with GrassRunner(dem) as gr:
@@ -70,6 +71,7 @@ def flow_direction_accumulation(
             drainage="fd",
             accumulation="fa",
             flags=flags,
+            memory=memory if memory is not None else 300,  # r.watershed default
         )
         gr.save_raster("fd", direction_grid)
         gr.save_raster("fa", accumulation_grid)
@@ -86,16 +88,25 @@ def area_to_cells(src: str, area: float):
     return int(np.ceil(area / (r.csx * r.csy)))
 
 
-def auto_basin(dem: str, min_area: float, basin_dataset: str):
+def auto_basin(
+    dem: str, min_area: float, basin_dataset: str, memory: Union[int, None] = 4096
+):
     """Automatically generate basins throughout a dataset that are larger than a minimum area
 
     Args:
-        dem (str): Digital Elevation Model raster
-        min_area (float): Minimum basin area to constrain size
-        basin_dataset (str): Output raster data containing labeled basins
+        dem (str): Digital Elevation Model raster.
+        min_area (float): Minimum basin area to constrain size.
+        basin_dataset (str): Output raster data containing labeled basins.
+        memory (Union[int, None], optional): Manage memory during execution by assigning
+        a maximum block size. Defaults to 4096 MB.
     """
     # Min Area needs to be converted to cells
     min_area_cells = area_to_cells(dem, min_area)
+
+    flags = "s"
+
+    if memory is not None:
+        flags += "m"
 
     with GrassRunner(dem) as gr:
         gr.run_command(
@@ -104,7 +115,8 @@ def auto_basin(dem: str, min_area: float, basin_dataset: str):
             elevation="dem",
             threshold=min_area_cells,
             basin="b",
-            flags="s",
+            flags=flags,
+            memory=memory if memory is not None else 300,  # r.watershed default
         )
         gr.save_raster("b", basin_dataset)
 
@@ -155,7 +167,7 @@ def stream_order(
     order_dst: str,
     use_accum: bool = False,
     zero_bg: bool = False,
-    mem_manage: bool = False,
+    memory: Union[int, None] = 4096
 ):
     """Calculate stream order using the following data:
 
@@ -178,7 +190,8 @@ def stream_order(
         created.
         use_accum (bool): Use flow accumulation to trace Horton and Hack orders.
         zero_bg (bool): Use a background value of 0 instead of nodata
-        mem_manage (bool): Manage memory while computing stream order.
+        memory (Union[int, None], optional): Manage memory during execution by assigning
+        a maximum block size. Defaults to 4096 MB.
     """
     if order_dst.lower().endswith(".tif"):
         kwargs = {"strahler": "stream_o"}
@@ -188,7 +201,7 @@ def stream_order(
     flags = ""
     if zero_bg:
         flags += "z"
-    if mem_manage:
+    if memory is not None:
         flags += "m"
     if use_accum:
         flags += "a"
@@ -204,6 +217,7 @@ def stream_order(
             stream_rast="streams",
             direction="direction",
             accumulation="accum",
+            memory=memory if memory is not None else 300,  # r.stream.order default
             flags=flags,
             **kwargs,
         )
@@ -379,7 +393,9 @@ class WatershedIndex:
         # Initialize an array for the stack
         visited = np.ma.getmaskarray(fd)
 
-        @jit(nopython=True)
+        fd = fd.filled(-1)
+
+        @njit
         def traverse(fd, streams, i, j):
             directions = [
                 None,
@@ -420,7 +436,7 @@ class WatershedIndex:
             # Traverse to the outlet
             return traverse(fd, streams, i, j)
 
-        @jit(nopython=True)
+        @njit
         def delineate(fd, streams, i, j, visited):
             directions = [[7, 6, 5], [8, 0, 4], [1, 2, 3]]
 
