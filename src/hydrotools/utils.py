@@ -7,7 +7,7 @@ from tempfile import _get_candidate_names
 import numpy as np
 import dask.array as da
 from grass_session import Session
-from pyproj import Transformer, CRS, Proj
+from pyproj import Transformer, CRS
 from scipy.ndimage import distance_transform_edt
 
 # Implicitly becomes available after importing grass_session
@@ -242,7 +242,7 @@ def transform_points(
     """
     transformer = Transformer.from_crs(in_proj, out_proj, always_xy=True)
 
-    points = np.array(points)
+    points = np.asarray(points)
 
     t_points = transformer.transform(points[:, 0], points[:, 1])
 

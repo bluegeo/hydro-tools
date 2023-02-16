@@ -1018,6 +1018,6 @@ class RiparianConnectivity:
         if vector:
             with TempRasterFile() as tmp_rast:
                 to_raster(sensitivity, self.dem, tmp_rast)
-                vectorize(tmp_rast, connectivity_dst, True)
+                vectorize(tmp_rast, connectivity_dst, smooth_corners=True)
         else:
             to_raster(sensitivity, self.dem, connectivity_dst)

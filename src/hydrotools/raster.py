@@ -1,5 +1,6 @@
 import os
-from typing import Union
+from shutil import rmtree
+from typing import Union, Tuple
 from contextlib import contextmanager
 from subprocess import run
 from tempfile import _get_candidate_names
@@ -9,6 +10,7 @@ import dask.array as da
 from dask.diagnostics import ProgressBar
 import rasterio
 from rasterio.windows import Window
+from pyproj import Transformer
 
 from hydrotools.utils import infer_nodata
 from hydrotools.utils import GrassRunner
@@ -111,23 +113,223 @@ def warp_like(
     )
 
 
-def vectorize(raster_source, destination, smooth_corners=False):
-    if smooth_corners:
-        # GRASS implementation
-        with GrassRunner(raster_source) as gr:
-            gr.run_command(
-                "r.to.vect",
-                (raster_source, "rast", "raster"),
-                input="rast",
-                output="vect",
-                type="area",
-                flags="s",
-            )
-            gr.save_vector("vect", destination)
+class TXTFactory:
+    """
+    Enable writing of raster cell data as points to a text file or tiles using
+    `dask.array.store`.
+    """
+
+    def __init__(
+        self,
+        shape: Tuple[int],
+        band: int,
+        top: float,
+        left: float,
+        csx: float,
+        csy: float,
+        out_txt: str,
+        in_proj: Union[str, int],
+        tiles: bool = False,
+    ):
+        if len(shape) != 3:
+            raise ValueError("Expected 3 dimensions")
+
+        if not os.path.isdir(os.path.dirname(out_txt)):
+            raise ValueError(f"Unrecognized path: {os.path.dirname(out_txt)}")
+
+        self.out_txt = out_txt
+        if self.out_txt.lower().endswith(".csv"):
+            # Write headings
+            with open(self.out_txt, "a") as f:
+                f.write("longitude,latitude,value\n")
+        elif tiles:
+            self.tile_temp_dir = os.path.join(TMP_DIR, next(_get_candidate_names()))
+            os.mkdir(self.tile_temp_dir)
+
+        self.tiles = tiles
+        self.shape = shape
+        self.band = band - 1
+        self.top = float(top)
+        self.left = float(left)
+        self.csx = float(csx)
+        self.csy = float(csy)
+
+        self.transformer = Transformer.from_crs(in_proj, 4326, always_xy=True)
+
+        # For dask
+        self.ndim = 3
+        self.dtype = np.float32
+
+    def __setitem__(self, s: Union[slice, int, tuple, None], a: np.ndarray):
+        """Place array data in the output text file (csv or ndjson)
+
+        Args:
+            s (Union[slice, int, tuple, None]): Slicing parameter
+            a (np.ndarray): numpy array
+        """
+        _, col_off, row_off, _, _ = Raster.parse_slice(s, self.shape)
+
+        a = a[self.band, ...]
+
+        i, j = np.where(~np.ma.getmaskarray(a))
+        if i.size > 0:
+            y = self.top - (row_off * self.csy) - (i * self.csy) - self.csy * 0.5
+            x = self.left + (col_off * self.csx) + (j * self.csx) + self.csx * 0.5
+
+            x, y = self.transformer.transform(x, y)
+
+            data = np.char.mod("%f", np.vstack([x, y, a[i, j].data]).T)
+
+            if self.out_txt.lower().endswith(".csv") or self.tiles:
+                out_data = "\n".join([",".join(row) for row in data])
+            else:
+                json_format = '{{"type": "Feature", "properties": {{"value": {2}}}, "geometry": {{ "type": "Point", "coordinates": [{0}, {1}]}}}}'
+                out_data = "\n".join([json_format.format(*row) for row in data])
+
+            if self.tiles:
+                out_dst_dir = os.path.join(TMP_DIR, next(_get_candidate_names()))
+                os.mkdir(out_dst_dir)
+                out_dst = os.path.join(
+                    out_dst_dir, f"{os.path.basename(self.out_txt)}.csv"
+                )
+                # Write headings
+                with open(out_dst, "a") as f:
+                    f.write("x,y,value\n")
+            else:
+                out_dst = self.out_txt
+
+            with open(out_dst, "a") as f:
+                f.write(out_data + "\n")
+
+            if self.tiles:
+                next_tile_dir = os.path.join(
+                    self.tile_temp_dir, next(_get_candidate_names())
+                )
+
+                cmd = [
+                    "tippecanoe",
+                    "-zg",
+                    "-P",
+                    "-ai",
+                    "-e",
+                    next_tile_dir,
+                    "--drop-densest-as-needed",
+                    "--extend-zooms-if-still-dropping",
+                    out_dst,
+                ]
+                run(cmd, check=True)
+
+                os.remove(out_dst)
+
+    def consolidate_tiles(self):
+        tiles = " ".join(
+            [
+                os.path.join(self.tile_temp_dir, f)
+                for f in os.listdir(self.tile_temp_dir)
+                if os.path.isdir(os.path.join(self.tile_temp_dir, f))
+            ]
+        )
+
+        cmd = ["tile-join", "-e", self.out_txt, tiles]
+        run(cmd, check=True)
+
+
+def vectorize(
+    raster_source: str,
+    destination: str,
+    geometry: str = "polygon",
+    smooth_corners: bool = False,
+    band: int = 1,
+):
+    """Create a vector dataset
+
+    Args:
+        raster_source (str): Raster path.
+        destination (str): Destionation vector dataset.
+        geometry (str, optional): Geometry type for output vector. Choose from:
+            [
+                "polygon",
+                "point"
+            ]
+            Defaults to "polygon".
+        smooth_corners (bool, optional): Round the corners of raster cells.
+            Defaults to False.
+        band (int): Raster band used for assignment of values. Defaults to Band 1.
+    """
+    if geometry == "polygon":
+        if smooth_corners:
+            # GRASS implementation
+            with GrassRunner(raster_source) as gr:
+                gr.run_command(
+                    "r.to.vect",
+                    (raster_source, "rast", "raster"),
+                    input="rast",
+                    output="vect",
+                    type="area",
+                    flags="s",
+                )
+                gr.save_vector("vect", destination)
+
+        else:
+            cmd = ["gdal_polygonize.py", "-8", raster_source, destination]
+            run(cmd, check=True)
+    elif geometry == "point":
+        extensions = [".csv", ".geojsond.json"]
+
+        if not any([destination.lower().endswith(ext) for ext in extensions]):
+            raise ValueError("Only .geojsond.json and .csv files supported")
+
+        r_specs = Raster.raster_specs(raster_source)
+        a = from_raster(raster_source)
+
+        dst = TXTFactory(
+            r_specs["shape"],
+            band,
+            r_specs["top"],
+            r_specs["left"],
+            r_specs["csx"],
+            r_specs["csy"],
+            destination,
+            r_specs["wkt"],
+        )
+
+        da.store([a], [dst])
 
     else:
-        cmd = ["gdal_polygonize.py", "-8", raster_source, destination]
-        run(cmd, check=True)
+        raise NotImplementedError(f"Geometry of type '{geometry}' not implemented")
+
+
+def to_vector_tiles(raster_source: str, tile_dst: str, band: int = 1):
+    """Generate vector tiles of points with raster pixel values
+
+    **Note, the tippecanoe library must be installed**
+
+    Args:
+        raster_source (str): A raster dataset.
+        tile_dst (str): A directory (must not exist already) for output tiles.
+        band (int, optional): Raster band value to add to the vector tiles as a "value"
+        attribute. Defaults to 1.
+    """
+    r_specs = Raster.raster_specs(raster_source)
+
+    dst = TXTFactory(
+        r_specs["shape"],
+        band,
+        r_specs["top"],
+        r_specs["left"],
+        r_specs["csx"],
+        r_specs["csy"],
+        tile_dst,
+        r_specs["wkt"],
+        True,
+    )
+
+    da.store([from_raster(raster_source)], [dst])
+
+    dst.consolidate_tiles()
+
+    # Explicitly clean up
+    rmtree(dst.tile_temp_dir)
 
 
 class Raster:
@@ -283,7 +485,7 @@ class Raster:
             return np.array([]).reshape((0, 0))
 
         # Collect a compatible slice
-        bands, col_off, row_off, width, height = self.parse_slice(s)
+        bands, col_off, row_off, width, height = self.slice_params(s)
 
         # Allocate output
         out_array = np.empty((len(bands), height, width), self.dtype)
@@ -302,18 +504,20 @@ class Raster:
             s (Union[slice, int, tuple, None]): Slicing parameter
             a (np.ndarray): numpy array
         """
-        bands, col_off, row_off, width, height = self.parse_slice(s)
+        bands, col_off, row_off, width, height = self.slice_params(s)
 
         with self.ds("r+") as ds:
             window = Window(col_off, row_off, width, height)
             for i, band in enumerate(bands):
                 ds.write(a[i, ...], indexes=int(band + 1), window=window)
 
-    def parse_slice(self, s: Union[slice, int, tuple, None]) -> tuple:
-        """Prepare a slice argument
+    @staticmethod
+    def parse_slice(s: Union[slice, int, tuple, None], shape: Tuple[int]) -> tuple:
+        """Parse a variable-format slice into predictable raster-based parameters
 
         Args:
             s (Union[slice, int, tuple, None]): Slice parameter
+            shape: (Tuple[int]): Shape of the raster being sliced. Must be 3 dims.
 
         Returns:
             (tuple): bands, col_off, row_off, width, height
@@ -381,26 +585,37 @@ class Raster:
         s += [None] * (3 - len(s))
 
         # Collect bands as a list of ints
-        bands = get_slice_item(s[0], self.band_count, True)
+        bands = get_slice_item(s[0], shape[0], True)
 
         # Collect remaining two dimensions
-        row_off, height = get_slice_item(s[1], self.shape[1])
-        col_off, width = get_slice_item(s[2], self.shape[2])
+        row_off, height = get_slice_item(s[1], shape[1])
+        col_off, width = get_slice_item(s[2], shape[2])
 
-        if max(bands) > self.band_count:
+        if max(bands) > shape[0]:
             raise IndexError(
-                f"Band index {max(bands)} out of bounds with band count {self.band_count}"
+                f"Band index {max(bands)} out of bounds with band count {shape[0]}"
             )
-        if row_off > self.shape[1] - 1:
+        if row_off > shape[1] - 1:
             raise IndexError(
-                f"Index {row_off} out of bounds for axis 0 with shape {self.shape[1]}"
+                f"Index {row_off} out of bounds for axis 0 with shape {shape[1]}"
             )
-        if col_off > self.shape[2] - 1:
+        if col_off > shape[2] - 1:
             raise IndexError(
-                f"Index {col_off} out of bounds for axis 1 with shape {self.shape[2]}"
+                f"Index {col_off} out of bounds for axis 1 with shape {shape[2]}"
             )
 
         return bands, col_off, row_off, width, height
+
+    def slice_params(self, s: Union[slice, int, tuple, None]) -> tuple:
+        """Prepare a slice argument
+
+        Args:
+            s (Union[slice, int, tuple, None]): Slice parameter
+
+        Returns:
+            (tuple): bands, col_off, row_off, width, height
+        """
+        return self.parse_slice(s, self.shape)
 
     @contextmanager
     def ds(self, mode="r") -> rasterio.DatasetReader:
