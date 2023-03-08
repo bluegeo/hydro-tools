@@ -13,17 +13,7 @@ GRASS_FLAGS: dict = {"quiet": True}
 
 GDAL_DEFAULT_ARGS = [
     "-of",
-    "GTiff",
-    "-co",
-    "COPY_SRC_OVERVIEWS=YES",
-    "-co",
-    "TILED=YES",
-    "-co",
-    "COMPRESS=LZW",
-    "-co",
-    "BLOCKXSIZE=512",
-    "-co",
-    "BLOCKYSIZE=512",
+    "COG",
     "-co",
     "BIGTIFF=YES",
     "-q",

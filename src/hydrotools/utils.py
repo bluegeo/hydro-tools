@@ -265,7 +265,7 @@ def kernel_from_distance(distance: float, csx: float, csy: float) -> np.ndarray:
 
     kernel = np.ones(shape=(int(num_cells_y), int(num_cells_x)), dtype=bool)
     kernel[centroid] = 0
-    
+
     dt = distance_transform_edt(kernel, (csy, csx))
 
     return dt <= distance

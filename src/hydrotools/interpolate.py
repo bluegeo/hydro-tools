@@ -54,7 +54,6 @@ def raster_filter(
 
         for i in range(i_start, a.shape[1] - i_end):
             for j in range(j_start, a.shape[2] - j_end):
-
                 if np.isnan(a[0, i, j]):
                     continue
 
@@ -829,7 +828,7 @@ def normalize(
     )
 
     if invert:
-        norm = 1. - norm
+        norm = 1.0 - norm
 
     out_rast = norm * (out_max - out_min) + out_min
 

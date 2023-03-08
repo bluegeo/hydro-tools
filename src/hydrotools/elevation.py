@@ -1,5 +1,5 @@
 from subprocess import run
-from typing import Union, overload
+from typing import Union
 
 import numpy as np
 import dask.array as da
@@ -22,7 +22,6 @@ def slope(
     destination: str,
     units: str = "degrees",
     scale: float = 1,
-    overviews: bool = True,
 ):
     """Calculate topographic slope.
     See [gdaldem](https://gdal.org/programs/gdaldem.html#slope).
@@ -30,9 +29,9 @@ def slope(
     Args:
         dem (str): Digital Elevation model raster
         destination (str): Output slope raster destination
-        units (str, optional): Units for the output. Defaults to "degrees".
+        units (str, optional): Units for the output - choose one of
+        [`"degrees"`, `"percent"`]. Defaults to "degrees".
         scale (float, optional): Z-factor to scale the output. Defaults to 1.
-        overviews (bool, optional): Build overviews for the output. Defaults to True.
     """
     gdal_args = [
         arg
@@ -55,22 +54,16 @@ def slope(
 
     run(cmd, check=True)
 
-    if overviews:
-        cmd = ["gdaladdo", destination]
-        run(cmd, check=True)
-
 
 def aspect(
     dem: str,
     destination: str,
-    overviews: bool = True,
 ):
     """Calculate aspect. See [gdaldem](https://gdal.org/programs/gdaldem.html#aspect).
 
     Args:
         dem (str): Digital Elevation model raster
         destination (str): Output aspect raster destination
-        overviews (bool, optional): Build overviews for the output. Defaults to True.
     """
     gdal_args = [
         arg
@@ -88,15 +81,10 @@ def aspect(
 
     run(cmd, check=True)
 
-    if overviews:
-        cmd = ["gdaladdo", destination]
-        run(cmd, check=True)
-
 
 def terrain_ruggedness_index(
     dem: str,
     destination: str,
-    overviews: bool = True,
 ):
     """Calculate Terrain Ruggedness Index (TRI).
     See [gdaldem](https://gdal.org/programs/gdaldem.html#tri).
@@ -104,7 +92,6 @@ def terrain_ruggedness_index(
     Args:
         dem (str): Digital Elevation model raster
         destination (str): Output TRI raster destination
-        overviews (bool, optional): Build overviews for the output. Defaults to True.
     """
     gdal_args = [
         arg
@@ -121,10 +108,6 @@ def terrain_ruggedness_index(
     ] + gdal_args
 
     run(cmd, check=True)
-
-    if overviews:
-        cmd = ["gdaladdo", destination]
-        run(cmd, check=True)
 
 
 def z_align(
@@ -206,14 +189,13 @@ def z_align(
         delta_dst,
     ):
         if resample_interpolation is not None:
-            to_raster(delta, source, obs_tmp, overviews=False)
+            to_raster(delta, source, obs_tmp, as_cog=False)
             warp_like(
                 obs_tmp,
                 obs_dst,
                 source,
                 csx=resample_interpolation,
                 csy=resample_interpolation,
-                overviews=False,
             )
 
             # Fill area must be masked to reflect nodata, and changed from bool
@@ -221,7 +203,7 @@ def z_align(
                 da.ma.masked_where(~fill_area, fill_area).astype("uint8"),
                 source,
                 pred_tmp,
-                overviews=False,
+                as_cog=False,
             )
             warp_like(
                 pred_tmp,
@@ -229,7 +211,6 @@ def z_align(
                 source,
                 csx=resample_interpolation,
                 csy=resample_interpolation,
-                overviews=False,
             )
 
             delta_a = interp(
@@ -238,7 +219,7 @@ def z_align(
                 kwargs.get("n_neighbours", 1000),
             )
 
-            to_raster(delta_a, obs_dst, delta_interp, overviews=False)
+            to_raster(delta_a, obs_dst, delta_interp, as_cog=False)
 
             # Expand to ensure no gaps result from resampling
             with GrassRunner(delta_interp) as gr:
@@ -252,7 +233,7 @@ def z_align(
                 )
                 gr.save_raster("e", delta_tmp)
 
-            warp_like(delta_tmp, delta_dst, source, overviews=False)
+            warp_like(delta_tmp, delta_dst, source)
 
             delta = from_raster(delta_dst)
 
@@ -322,4 +303,4 @@ def las_to_dtm(
         gs.run_command("v.surf.rst", input="only_terrain", elevation="terrain")
 
         # save output
-        gs.save_raster("terrain", destination, overviews=True)
+        gs.save_raster("terrain", destination)
