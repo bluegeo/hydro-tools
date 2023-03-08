@@ -117,7 +117,6 @@ def sinuosity(
             crs=vect.crs,
             schema=output_schema,
         ) as out_vect:
-
             for point in points:
                 out_vect.write(
                     {
@@ -149,10 +148,10 @@ def stream_slope(
             ),
             dem,
             elev_dst,
-            overviews=False,
+            as_cog=False,
         )
 
-        slope(elev_dst, slope_dst, units, scale, overviews=False)
+        slope(elev_dst, slope_dst, units, scale)
 
 
 def bankfull_width(
@@ -622,8 +621,8 @@ def topographic_wetness(
 
     # Generate least cost surface
     with TempRasterFiles(3) as (streams_path, cost_path, cost_surface):
-        to_raster(cost, slope_src, cost_path, False)
-        to_raster(streams, slope_src, streams_path, False)
+        to_raster(cost, slope_src, cost_path, as_cog=False)
+        to_raster(streams, slope_src, streams_path, as_cog=False)
 
         with GrassRunner(cost_path) as gr:
             gr.run_command(
@@ -733,14 +732,7 @@ class RiparianConnectivity:
         fa = self.raster_path("flow_accumulation")
 
         with TempRasterFiles(2) as (fd1, fd2):
-            flow_direction_accumulation(
-                self.dem,
-                fd1,
-                fa,
-                False,
-                False,
-                memory=memory
-            )
+            flow_direction_accumulation(self.dem, fd1, fa, False, False, memory=memory)
 
             extract_streams(
                 self.dem,
@@ -765,7 +757,7 @@ class RiparianConnectivity:
             )
         if self.slope is None:
             slope_dst = self.raster_path("slope")
-            slope(self.dem, slope_dst, overviews=False)
+            slope(self.dem, slope_dst)
             self.slope = slope_dst
 
         twi_dst = self.raster_path("twi")
@@ -931,7 +923,7 @@ class RiparianConnectivity:
                 ~da.ma.getmaskarray(from_raster(self.streams)),
                 self.streams,
                 stream_mask_dst,
-                overviews=False,
+                as_cog=False,
             )
             kernel = kernel_from_distance(sample_distance, self.csx, self.csy)
             raster_filter(stream_mask_dst, kernel, "sum", stream_filter_dst)
@@ -942,7 +934,7 @@ class RiparianConnectivity:
                 stream_density.astype(np.float32),
                 stream_filter_dst,
                 strdens_dst,
-                False,
+                as_cog=False,
             )
 
             # Adjust stream_density_cutoff for cell size
@@ -1017,7 +1009,7 @@ class RiparianConnectivity:
 
         if vector:
             with TempRasterFile() as tmp_rast:
-                to_raster(sensitivity, self.dem, tmp_rast)
+                to_raster(sensitivity, self.dem, tmp_rast, as_cog=False)
                 vectorize(tmp_rast, connectivity_dst, smooth_corners=True)
         else:
             to_raster(sensitivity, self.dem, connectivity_dst)

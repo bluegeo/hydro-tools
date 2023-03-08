@@ -26,7 +26,6 @@ def warp(
     t_srs: Union[None, str, int] = None,
     dtype: str = "Float32",
     resample_method: str = "cubicspline",
-    overviews: bool = False,
 ):
     """Warp a source or sources into a destination using a resolution and extent
 
@@ -39,7 +38,6 @@ def warp(
         t_srs (Union[str, int]): Target spatial reference. Defaults to None.
         dtype (str, optional): Target data type. Defaults to "Float32".
         resample_method (str, optional): Resample method. Defaults to "cubicspline".
-        overviews (bool, optional): Add overviews to destination. Defaults to False.
     """
     # Ensure source is a list
     if not isinstance(source, (tuple, list)):
@@ -70,17 +68,12 @@ def warp(
 
     run(cmd, check=True)
 
-    if overviews:
-        cmd = ["gdaladdo", destination]
-        run(cmd, check=True)
-
 
 def warp_like(
     source: Union[str, list, tuple],
     destination: str,
     template: str,
     resample_method: str = "cubicspline",
-    overviews: bool = False,
     **kwargs,
 ):
     """Warp a raster into a destination using a template raster
@@ -109,7 +102,6 @@ def warp_like(
         rs.wkt,
         kwargs.get("dtype", rs.dtype),
         resample_method,
-        overviews,
     )
 
 
@@ -391,7 +383,10 @@ class Raster:
         dtype: str,
         nodata: Union[int, float, bool, None] = None,
     ):
-        """Create an empty raster
+        """Create an empty raster.
+
+        Note, since this is open for writing a GeoTiff is
+        created, and will not include overviews.
 
         Args:
             top (float): Top coordinate
@@ -661,14 +656,15 @@ def from_raster(src: Union[Raster, str], chunks: tuple = CHUNKS) -> da.Array:
     return a
 
 
-def to_raster(data: da.Array, template: str, destination: str, overviews: bool = True):
+def to_raster(data: da.Array, template: str, destination: str, as_cog: bool = True):
     """Compute a dask array and store it in a destination raster dataset
 
     Args:
         data (da.Array): Array of data to compute and store in the output raster
         template (str): Raster to use for specifications
-        destination (str): Output raster path
-        overviews (bool): Build overviews. Defaults to True.
+        destination (str): Output raster path.
+        as_cog (bool): The output raster will be a valid COG. Otherwise, it will be a
+        compressed GeoTiff without overviews.
     """
     # The nodata value should be inferred from the data type and filled
     dtype = data.dtype.name
@@ -681,14 +677,20 @@ def to_raster(data: da.Array, template: str, destination: str, overviews: bool =
 
     da.ma.set_fill_value(data, nodata)
 
-    output_raster = Raster.empty_like(destination, template, dtype=dtype, nodata=nodata)
-
     with ProgressBar():
-        da.store([da.ma.filled(data)], [output_raster])
+        if as_cog:
+            with TempRasterFile() as tmp_dst:
+                da.store(
+                    [da.ma.filled(data)],
+                    [Raster.empty_like(tmp_dst, template, dtype=dtype, nodata=nodata)],
+                )
 
-    if overviews:
-        cmd = ["gdaladdo", destination]
-        run(cmd, check=True)
+                run(["gdal_translate", "-of", "COG", tmp_dst, destination], check=True)
+        else:
+            da.store(
+                [da.ma.filled(data)],
+                [Raster.empty_like(destination, template, dtype=dtype, nodata=nodata)],
+            )
 
 
 def raster_where(

@@ -167,7 +167,7 @@ def stream_order(
     order_dst: str,
     use_accum: bool = False,
     zero_bg: bool = False,
-    memory: Union[int, None] = 4096
+    memory: Union[int, None] = 4096,
 ):
     """Calculate stream order using the following data:
 
