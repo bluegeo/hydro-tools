@@ -26,6 +26,7 @@ def warp(
     t_srs: Union[None, str, int] = None,
     dtype: str = "Float32",
     resample_method: str = "cubicspline",
+    additional_args: list = [],
 ):
     """Warp a source or sources into a destination using a resolution and extent
 
@@ -38,6 +39,7 @@ def warp(
         t_srs (Union[str, int]): Target spatial reference. Defaults to None.
         dtype (str, optional): Target data type. Defaults to "Float32".
         resample_method (str, optional): Resample method. Defaults to "cubicspline".
+        additional_args (list, optional): Any additional gdalwarp arguments.
     """
     # Ensure source is a list
     if not isinstance(source, (tuple, list)):
@@ -62,6 +64,7 @@ def warp(
             "Byte" if dtype == "uint8" else dtype,
         ]
         + GDAL_DEFAULT_ARGS
+        + additional_args
         + source
         + [destination]
     )
@@ -102,6 +105,7 @@ def warp_like(
         rs.wkt,
         kwargs.get("dtype", rs.dtype),
         resample_method,
+        additional_args=kwargs.get("additional_args", []),
     )
 
 
@@ -135,8 +139,7 @@ class TXTFactory:
             with open(self.out_txt, "a") as f:
                 f.write("longitude,latitude,value\n")
         elif tiles:
-            self.tile_temp_dir = os.path.join(
-                TMP_DIR, next(_get_candidate_names()))
+            self.tile_temp_dir = os.path.join(TMP_DIR, next(_get_candidate_names()))
             os.mkdir(self.tile_temp_dir)
 
         self.tiles = tiles
@@ -166,10 +169,8 @@ class TXTFactory:
 
         i, j = np.where(~np.ma.getmaskarray(a))
         if i.size > 0:
-            y = self.top - (row_off * self.csy) - \
-                (i * self.csy) - self.csy * 0.5
-            x = self.left + (col_off * self.csx) + \
-                (j * self.csx) + self.csx * 0.5
+            y = self.top - (row_off * self.csy) - (i * self.csy) - self.csy * 0.5
+            x = self.left + (col_off * self.csx) + (j * self.csx) + self.csx * 0.5
 
             x, y = self.transformer.transform(x, y)
 
@@ -179,12 +180,10 @@ class TXTFactory:
                 out_data = "\n".join([",".join(row) for row in data])
             else:
                 json_format = '{{"type": "Feature", "properties": {{"value": {2}}}, "geometry": {{ "type": "Point", "coordinates": [{0}, {1}]}}}}'
-                out_data = "\n".join([json_format.format(*row)
-                                     for row in data])
+                out_data = "\n".join([json_format.format(*row) for row in data])
 
             if self.tiles:
-                out_dst_dir = os.path.join(
-                    TMP_DIR, next(_get_candidate_names()))
+                out_dst_dir = os.path.join(TMP_DIR, next(_get_candidate_names()))
                 os.mkdir(out_dst_dir)
                 out_dst = os.path.join(
                     out_dst_dir, f"{os.path.basename(self.out_txt)}.csv"
@@ -293,8 +292,7 @@ def vectorize(
         da.store([a], [dst])
 
     else:
-        raise NotImplementedError(
-            f"Geometry of type '{geometry}' not implemented")
+        raise NotImplementedError(f"Geometry of type '{geometry}' not implemented")
 
 
 def to_vector_tiles(raster_source: str, tile_dst: str, band: int = 1):
@@ -587,8 +585,7 @@ class Raster:
             s = [s]
 
         if len(s) > 3:
-            raise IndexError(
-                "Rasters must be indexed in a maximum of 3 dimensions")
+            raise IndexError("Rasters must be indexed in a maximum of 3 dimensions")
 
         # Ensure s includes 3 dimensions
         s = list(s)
@@ -702,17 +699,30 @@ def to_raster(data: da.Array, template: str, destination: str, as_cog: bool = Tr
             with TempRasterFile() as tmp_dst:
                 da.store(
                     [da.ma.filled(data)],
-                    [Raster.empty_like(
-                        tmp_dst, template, dtype=dtype, nodata=nodata, shape=data.shape)],
+                    [
+                        Raster.empty_like(
+                            tmp_dst,
+                            template,
+                            dtype=dtype,
+                            nodata=nodata,
+                            shape=data.shape,
+                        )
+                    ],
                 )
 
-                run(["gdal_translate", "-of", "COG",
-                    tmp_dst, destination], check=True)
+                run(["gdal_translate", "-of", "COG", tmp_dst, destination], check=True)
         else:
             da.store(
                 [da.ma.filled(data)],
-                [Raster.empty_like(
-                    destination, template, dtype=dtype, nodata=nodata, shape=data.shape)],
+                [
+                    Raster.empty_like(
+                        destination,
+                        template,
+                        dtype=dtype,
+                        nodata=nodata,
+                        shape=data.shape,
+                    )
+                ],
             )
 
 
@@ -753,8 +763,7 @@ def raster_where(
 
 class TempRasterFile:
     def __init__(self):
-        self.path = os.path.join(TMP_DIR, next(
-            _get_candidate_names()) + ".tif")
+        self.path = os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
 
     def __enter__(self):
         return self.path
@@ -803,11 +812,9 @@ def reset_corrupt_blocks(src: str, dst: str):
                         a = src_ds.read(band, window=window)
                     except:
                         unreadable_blocks += 1
-                        a = np.full((window.height, window.width),
-                                    nodata, dtype)
+                        a = np.full((window.height, window.width), nodata, dtype)
 
                     dst_ds.write(a, indexes=band, window=window)
 
     if unreadable_blocks > 0:
-        print(
-            f"Filled {unreadable_blocks} of {total_blocks} blocks with no data")
+        print(f"Filled {unreadable_blocks} of {total_blocks} blocks with no data")
