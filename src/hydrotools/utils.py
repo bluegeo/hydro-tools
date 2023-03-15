@@ -94,13 +94,9 @@ class GrassRunner(Session):
 
         graster.out_gdal(
             dataset,
-            format="GTiff",
+            format="COG",
             output=out_path,
             createopt=[
-                "TILED=YES",
-                "BLOCKXSIZE=512",
-                "BLOCKYSIZE=512",
-                "COMPRESS=LZW",
                 "BIGTIFF=YES",
             ],
             flags="c",

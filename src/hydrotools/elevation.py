@@ -82,6 +82,29 @@ def aspect(
     run(cmd, check=True)
 
 
+def solar_radiation(dem: str, day: int, step: float, rad_dst: str):
+    """Calculate a solar radiation grid for a given day.
+
+    Args:
+        dem (str): Digital Elevation Model.
+        day (int): Day (1-365).
+        step (float): Time step in decimal hours when computing all-day radiation sums.
+        rad_dst (str): Output irradiance/irradiation raster in W/m**2.
+    """
+    if day < 1 or day > 365:
+        raise ValueError("Invalid day for 1 <= day <= 365")
+    with GrassRunner(dem) as gr:
+        gr.run_command(
+            "r.sun",
+            (dem, "dem", "raster"),
+            elevation="dem",
+            day=int(day),
+            step=float(step),
+            glob_rad="rad",
+        )
+        gr.save_raster("rad", rad_dst)
+
+
 def terrain_ruggedness_index(
     dem: str,
     destination: str,
