@@ -128,6 +128,7 @@ def extract_streams(
     direction_dst: str,
     min_area: float = 1e6,
     min_length: float = 0,
+    memory: Union[int, None] = 4096,
 ):
     """Extract simulated streams
 
@@ -139,6 +140,8 @@ def extract_streams(
         direction_dst (str): Output flow direction raster path
         min_area (float, optional): Minimum watershed area for streams. Defaults to 1e6.
         min_length (float, optional): Minimum stream length. Defaults to 0.
+        memory (Union[int, None], optional): Manage memory during execution by assigning
+        a maximum block size. Defaults to 4096 MB.
     """
     # Min Area needs to be converted to cells
     min_area_cells = area_to_cells(dem, min_area)
@@ -154,6 +157,7 @@ def extract_streams(
             threshold=min_area_cells,
             stream_raster="streams",
             direction="direction",
+            memory=memory,
         )
         gr.save_raster("streams", stream_dst)
         gr.save_raster("direction", direction_dst)

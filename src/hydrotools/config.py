@@ -11,13 +11,26 @@ GRASS_TMP: str = gettempdir()
 
 GRASS_FLAGS: dict = {"quiet": True}
 
-GDAL_DEFAULT_ARGS = [
+GDALWARP_ARGS = [
+    "-of",
+    "GTiff",
+    "-co",
+    "COMPRESS=LZW",
+    "-co",
+    "TILED=YES",
+    "-co",
+    "BLOCKXSIZE=512",
+    "-co",
+    "BLOCKYSIZE=512",
+    "-co",
+    "BIGTIFF=YES",
+    "-q",
+]
+
+COG_ARGS = [
     "-of",
     "COG",
     "-co",
     "BIGTIFF=YES",
     "-q",
-    "-multi",
-    "-wo",
-    "NUM_THREADS=ALL_CPUS",
 ]

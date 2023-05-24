@@ -5,15 +5,14 @@ import numpy as np
 import dask.array as da
 from scipy.ndimage import binary_erosion
 
-from hydrotools.utils import GrassRunner
+from hydrotools.utils import GrassRunner, TempRasterFiles
 from hydrotools.raster import (
-    TempRasterFiles,
     from_raster,
     raster_where,
     to_raster,
     warp_like,
 )
-from hydrotools.config import CHUNKS, GDAL_DEFAULT_ARGS
+from hydrotools.config import CHUNKS, COG_ARGS
 from hydrotools.interpolate import PointInterpolator
 
 
@@ -33,12 +32,6 @@ def slope(
         [`"degrees"`, `"percent"`]. Defaults to "degrees".
         scale (float, optional): Z-factor to scale the output. Defaults to 1.
     """
-    gdal_args = [
-        arg
-        for arg in GDAL_DEFAULT_ARGS
-        if arg not in ["-multi", "-wo", "NUM_THREADS=ALL_CPUS"]
-    ]
-
     cmd = [
         "gdaldem",
         "slope",
@@ -47,7 +40,7 @@ def slope(
         str(scale),
         dem,
         destination,
-    ] + gdal_args
+    ] + COG_ARGS
 
     if units.lower() == "percent":
         cmd += ["-p"]
@@ -65,19 +58,13 @@ def aspect(
         dem (str): Digital Elevation model raster
         destination (str): Output aspect raster destination
     """
-    gdal_args = [
-        arg
-        for arg in GDAL_DEFAULT_ARGS
-        if arg not in ["-multi", "-wo", "NUM_THREADS=ALL_CPUS"]
-    ]
-
     cmd = [
         "gdaldem",
         "aspect",
         "-compute_edges",
         dem,
         destination,
-    ] + gdal_args
+    ] + COG_ARGS
 
     run(cmd, check=True)
 
@@ -116,19 +103,13 @@ def terrain_ruggedness_index(
         dem (str): Digital Elevation model raster
         destination (str): Output TRI raster destination
     """
-    gdal_args = [
-        arg
-        for arg in GDAL_DEFAULT_ARGS
-        if arg not in ["-multi", "-wo", "NUM_THREADS=ALL_CPUS"]
-    ]
-
     cmd = [
         "gdaldem",
         "TRI",
         "-compute_edges",
         dem,
         destination,
-    ] + gdal_args
+    ] + COG_ARGS
 
     run(cmd, check=True)
 

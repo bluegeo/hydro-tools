@@ -3,6 +3,7 @@ import shutil
 from typing import List, Tuple, Union
 import warnings
 from tempfile import _get_candidate_names
+from subprocess import run
 
 import numpy as np
 import dask.array as da
@@ -14,10 +15,50 @@ from scipy.ndimage import distance_transform_edt
 from grass.script import core as grass  # noqa
 from grass.pygrass.modules.shortcuts import raster as graster  # noqa
 
-from hydrotools.config import GRASS_TMP, GRASS_FLAGS
+from hydrotools.config import TMP_DIR, GRASS_TMP, GRASS_FLAGS, COG_ARGS
 
 
 warnings.filterwarnings("ignore")
+
+
+class TempRasterFile:
+    def __init__(self):
+        self.path = os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
+
+    def __enter__(self):
+        return self.path
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if os.path.isfile(self.path):
+            os.remove(self.path)
+
+
+class TempRasterFiles:
+    def __init__(self, num: int):
+        self.paths = [
+            os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
+            for _ in range(num)
+        ]
+
+    def __enter__(self) -> list:
+        return self.paths
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for path in self.paths:
+            if os.path.isfile(path):
+                os.remove(path)
+
+
+def translate_to_cog(src: str, dst: str):
+    run(
+        ["gdal_translate"]
+        + COG_ARGS
+        + [
+            src,
+            dst,
+        ],
+        check=True,
+    )
 
 
 class GrassRunner(Session):
@@ -81,7 +122,7 @@ class GrassRunner(Session):
         grass.run_command(cmd, **kwargs)
 
     def save_raster(self, dataset: str, out_path: str, **kwargs):
-        """Save a dataset in the GRASS env to a COG
+        """Save a dataset in the GRASS env to a GeoTiff
 
         Args:
             dataset (str): GRASS dataset name
@@ -90,18 +131,42 @@ class GrassRunner(Session):
         if not out_path.lower().endswith(".tif"):
             out_path += ".tif"
 
-        kwargs.update(GRASS_FLAGS)
+        as_cog = kwargs.pop("as_cog", True)
 
-        graster.out_gdal(
-            dataset,
-            format="COG",
-            output=out_path,
-            createopt=[
-                "BIGTIFF=YES",
-            ],
-            flags="c",
-            **kwargs,
+        kwargs.update(GRASS_FLAGS)
+        kwargs.update(
+            {
+                "format": "GTiff",
+                "createopt": [
+                    "BIGTIFF=YES",
+                    "TILED=YES",
+                    "COMPRESS=LZW",
+                    "BLOCKXSIZE=512",
+                    "BLOCKYSiZE=512",
+                ],
+                "flags": "c",
+            }
         )
+
+        if as_cog:
+            with TempRasterFile() as tmp_dst:
+                graster.out_gdal(
+                    dataset,
+                    output=tmp_dst,
+                    **kwargs,
+                )
+
+                run(["gdal_edit.py", "-stats", tmp_dst], check=True)
+
+                translate_to_cog(tmp_dst, out_path)
+        else:
+            graster.out_gdal(
+                dataset,
+                output=out_path,
+                **kwargs,
+            )
+
+            run(["gdal_edit.py", "-stats", out_path], check=True)
 
     def save_vector(self, dataset: str, out_path: str, layer: str = None):
         """Save a dataset to a geopackage

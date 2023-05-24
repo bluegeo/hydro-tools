@@ -16,17 +16,22 @@ import numpy as np
 from hydrotools.config import CHUNKS
 from hydrotools.raster import (
     Raster,
-    TempRasterFile,
-    TempRasterFiles,
     raster_where,
     from_raster,
     to_raster,
     vectorize,
 )
-from hydrotools.utils import GrassRunner, kernel_from_distance, compare_projections
+from hydrotools.utils import (
+    GrassRunner,
+    TempRasterFile,
+    TempRasterFiles,
+    kernel_from_distance,
+    compare_projections,
+)
 from hydrotools.watershed import extract_streams, flow_direction_accumulation
 from hydrotools.elevation import slope
 from hydrotools.interpolate import (
+    raster_filter,
     PointInterpolator,
     front_contains,
     raster_filter,
@@ -130,7 +135,12 @@ def sinuosity(
 
 
 def stream_slope(
-    dem: str, streams: str, slope_dst: str, units: str = "degress", scale: float = 1
+    dem: str,
+    streams: str,
+    slope_dst: str,
+    units: str = "degress",
+    scale: float = 1,
+    focal_mean_dist: Union[None, float] = None,
 ):
     """Calculate slope along extracted streams.
 
@@ -140,6 +150,9 @@ def stream_slope(
         slope_dst (str): Destination slope raster dataset.
         units (str, optional): Units for the output. Defaults to "degrees".
         scale (float, optional): Z-factor to scale the output. Defaults to 1.
+        focal_mean_dist (Union[None, float]): Sampling distance for a focal mean
+        designed to smooth slope values so they are representative of segments and
+        avoid oversampling at the cell level. Defaults to None.
     """
     with TempRasterFile() as elev_dst:
         to_raster(
@@ -151,7 +164,22 @@ def stream_slope(
             as_cog=False,
         )
 
-        slope(elev_dst, slope_dst, units, scale)
+        if focal_mean_dist is not None:
+            with TempRasterFile() as slope_dst_tmp:
+                slope(elev_dst, slope_dst_tmp, units, scale)
+
+                raster_specs = Raster.raster_specs(dem)
+
+                raster_filter(
+                    slope_dst_tmp,
+                    kernel_from_distance(
+                        float(focal_mean_dist), raster_specs["csx"], raster_specs["csy"]
+                    ),
+                    "mean",
+                    slope_dst,
+                )
+        else:
+            slope(elev_dst, slope_dst, units, scale)
 
 
 def bankfull_width(
@@ -165,7 +193,8 @@ def bankfull_width(
 ):
     """Estimate bankfull width with empirically-derived constants using:
 
-    bankfull_width = bw_coeff * (contrib_area[km2] ** a_exp) * (precip[cm/yr] ** p_exp)
+    bankfull_width = bw_coeff * \
+        (contrib_area[km2] ** a_exp) * (precip[cm/yr] ** p_exp)
 
     Method and defaults from:
 
@@ -634,6 +663,7 @@ def topographic_wetness(
                 start_raster="streams",
                 memory=2048,
                 flags="k",
+                as_cog=False
             )
             gr.save_raster("cost_path", cost_surface)
 
@@ -646,6 +676,45 @@ def topographic_wetness(
 
 
 class RiparianConnectivity:
+    """Riparian analysis workflow
+
+    The general steps are:
+
+    1. Instantiate using DEM
+
+        `rc = RiparianConnectivity(dem_path)`
+
+    2. Extract streams
+
+        `rc.extract_streams()`
+
+    3. Calculate the Topographic Wetness Index
+
+        `rc.calc_twi()`
+
+    4. Define a riparian region
+
+        `rc.define_region()`
+
+        Here you should visually examing the output regions and verify they align with
+        valley bottoms. If needed, recalculate using a different twi_cutoff. Ex.
+        `rc.define_region(740)`
+
+    5. You may now calculate attributes that you wish to add. The following
+        includes all of them:
+
+        ```
+        rc.calc_bankfull_width(annual_precip_grid)
+        rc.calc_stream_slope()
+        rc.calc_stream_density()
+        ```
+
+    6. Calculate Riparian Connectivity regions using the desired attributes:
+
+        `rc.calc_connectivity(output_dataset)`
+
+    """
+
     def __init__(self, dem: str):
         """Define a study area and begin a Riparian Connectivity Analysis"""
         self.dem = dem
@@ -716,7 +785,7 @@ class RiparianConnectivity:
         self,
         min_ws_area: float = 1e6,
         min_stream_length: float = 0,
-        memory: Union[int, None] = None,
+        memory: Union[int, None] = 4096,
     ):
         """Create a streams attribute.
 
@@ -729,10 +798,16 @@ class RiparianConnectivity:
             management of `r.watershed` operations. Defaults to None.
         """
         streams = self.raster_path("streams")
-        fa = self.raster_path("flow_accumulation")
+        if self.flow_accumulation is None:
+            fa = self.raster_path("flow_accumulation")
+        else:
+            fa = self.flow_accumulation
 
         with TempRasterFiles(2) as (fd1, fd2):
-            flow_direction_accumulation(self.dem, fd1, fa, False, False, memory=memory)
+            if self.flow_accumulation is None:
+                flow_direction_accumulation(
+                    self.dem, fd1, fa, False, False, memory=memory
+                )
 
             extract_streams(
                 self.dem,
@@ -741,6 +816,7 @@ class RiparianConnectivity:
                 fd2,
                 min_ws_area,
                 min_stream_length,
+                memory=memory,
             )
 
         self.streams = streams

@@ -12,9 +12,9 @@ import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
 
-from hydrotools.utils import infer_nodata
-from hydrotools.utils import GrassRunner
-from hydrotools.config import CHUNKS, TMP_DIR, GDAL_DEFAULT_ARGS
+from hydrotools.utils import infer_nodata, translate_to_cog
+from hydrotools.utils import GrassRunner, TempRasterFile
+from hydrotools.config import CHUNKS, TMP_DIR, GDALWARP_ARGS, COG_ARGS
 
 
 def warp(
@@ -27,6 +27,7 @@ def warp(
     dtype: str = "Float32",
     resample_method: str = "cubicspline",
     additional_args: list = [],
+    as_cog: bool = True,
 ):
     """Warp a source or sources into a destination using a resolution and extent
 
@@ -40,6 +41,7 @@ def warp(
         dtype (str, optional): Target data type. Defaults to "Float32".
         resample_method (str, optional): Resample method. Defaults to "cubicspline".
         additional_args (list, optional): Any additional gdalwarp arguments.
+        as_cog (bool, optional): Output a GeoTiff in COG format. Defaults to True.
     """
     # Ensure source is a list
     if not isinstance(source, (tuple, list)):
@@ -58,18 +60,30 @@ def warp(
         + ([] if csx is None else ["-tr", str(csx), str(csy)])
         + ([] if t_srs is None else ["-t_srs", t_srs])
         + [
+            "-multi",
+            "-wo",
+            "NUM_THREADS=ALL_CPUS",
             "-r",
             resample_method,
             "-ot",
             "Byte" if dtype == "uint8" else dtype,
         ]
-        + GDAL_DEFAULT_ARGS
+        + GDALWARP_ARGS
         + additional_args
         + source
-        + [destination]
     )
 
-    run(cmd, check=True)
+    if as_cog:
+        with TempRasterFile() as tmp_dst:
+            run(cmd + [tmp_dst], check=True)
+
+            run(["gdal_edit.py", "-stats", tmp_dst], check=True)
+
+            translate_to_cog(tmp_dst, destination)
+    else:
+        run(cmd + [destination], check=True)
+
+        run(["gdal_edit.py", "-stats", destination], check=True)
 
 
 def warp_like(
@@ -437,10 +451,10 @@ class Raster:
             bigtiff=True,
         )
 
-        for band in range(shape[0]):
-            for _, window in new_dataset.block_windows(band + 1):
-                a = np.full((window.height, window.width), nodata, dtype)
-                new_dataset.write(a, indexes=band + 1, window=window)
+        # for band in range(shape[0]):
+        #     for _, window in new_dataset.block_windows(band + 1):
+        #         a = np.full((window.height, window.width), nodata, dtype)
+        #         new_dataset.write(a, indexes=band + 1, window=window)
 
         new_dataset.close()
 
@@ -694,36 +708,30 @@ def to_raster(data: da.Array, template: str, destination: str, as_cog: bool = Tr
     elif data.ndim == 2:
         data = data.reshape((1,) + data.shape)
 
+    def save_tif(data, src, dst):
+        da.store(
+            [da.ma.filled(data)],
+            [
+                Raster.empty_like(
+                    dst,
+                    src,
+                    dtype=dtype,
+                    nodata=nodata,
+                    shape=data.shape,
+                )
+            ],
+        )
+
+        run(["gdal_edit.py", "-stats", dst], check=True)
+
     with ProgressBar():
         if as_cog:
             with TempRasterFile() as tmp_dst:
-                da.store(
-                    [da.ma.filled(data)],
-                    [
-                        Raster.empty_like(
-                            tmp_dst,
-                            template,
-                            dtype=dtype,
-                            nodata=nodata,
-                            shape=data.shape,
-                        )
-                    ],
-                )
+                save_tif(data, template, tmp_dst)
+                translate_to_cog(tmp_dst, destination)
 
-                run(["gdal_translate", "-of", "COG", tmp_dst, destination], check=True)
         else:
-            da.store(
-                [da.ma.filled(data)],
-                [
-                    Raster.empty_like(
-                        destination,
-                        template,
-                        dtype=dtype,
-                        nodata=nodata,
-                        shape=data.shape,
-                    )
-                ],
-            )
+            save_tif(data, template, destination)
 
 
 def raster_where(
@@ -759,34 +767,6 @@ def raster_where(
     da.ma.set_fill_value(a, infer_nodata(a))
 
     return a
-
-
-class TempRasterFile:
-    def __init__(self):
-        self.path = os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
-
-    def __enter__(self):
-        return self.path
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if os.path.isfile(self.path):
-            os.remove(self.path)
-
-
-class TempRasterFiles:
-    def __init__(self, num: int):
-        self.paths = [
-            os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
-            for _ in range(num)
-        ]
-
-    def __enter__(self) -> list:
-        return self.paths
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        for path in self.paths:
-            if os.path.isfile(path):
-                os.remove(path)
 
 
 def reset_corrupt_blocks(src: str, dst: str):

@@ -19,6 +19,6 @@ class WSTest(unittest.TestCase):
         with TemporaryDirectory() as tmp_dir:
             auto_basin(
                 test_data.dem,
-                1E5,
+                1e5,
                 os.path.join(tmp_dir, "basins.tif"),
             )
