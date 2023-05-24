@@ -5,14 +5,19 @@ import numpy as np
 import dask.array as da
 from scipy.ndimage import binary_erosion
 
-from hydrotools.utils import GrassRunner, TempRasterFiles
+from hydrotools.utils import (
+    GrassRunner,
+    TempRasterFile,
+    TempRasterFiles,
+    translate_to_cog,
+)
 from hydrotools.raster import (
     from_raster,
     raster_where,
     to_raster,
     warp_like,
 )
-from hydrotools.config import CHUNKS, COG_ARGS
+from hydrotools.config import CHUNKS, GDALWARP_ARGS
 from hydrotools.interpolate import PointInterpolator
 
 
@@ -32,20 +37,23 @@ def slope(
         [`"degrees"`, `"percent"`]. Defaults to "degrees".
         scale (float, optional): Z-factor to scale the output. Defaults to 1.
     """
-    cmd = [
-        "gdaldem",
-        "slope",
-        "-compute_edges",
-        "-s",
-        str(scale),
-        dem,
-        destination,
-    ] + COG_ARGS
+    with TempRasterFile() as tmp_dst:
+        cmd = [
+            "gdaldem",
+            "slope",
+            "-compute_edges",
+            "-s",
+            str(scale),
+            dem,
+            tmp_dst,
+        ] + GDALWARP_ARGS
 
-    if units.lower() == "percent":
-        cmd += ["-p"]
+        if units.lower() == "percent":
+            cmd += ["-p"]
 
-    run(cmd, check=True)
+        run(cmd, check=True)
+
+        translate_to_cog(tmp_dst, destination)
 
 
 def aspect(
@@ -58,15 +66,18 @@ def aspect(
         dem (str): Digital Elevation model raster
         destination (str): Output aspect raster destination
     """
-    cmd = [
-        "gdaldem",
-        "aspect",
-        "-compute_edges",
-        dem,
-        destination,
-    ] + COG_ARGS
+    with TempRasterFile() as tmp_dst:
+        cmd = [
+            "gdaldem",
+            "aspect",
+            "-compute_edges",
+            dem,
+            tmp_dst,
+        ] + GDALWARP_ARGS
 
-    run(cmd, check=True)
+        run(cmd, check=True)
+
+        translate_to_cog(tmp_dst, destination)
 
 
 def solar_radiation(dem: str, day: int, step: float, rad_dst: str):
@@ -103,15 +114,18 @@ def terrain_ruggedness_index(
         dem (str): Digital Elevation model raster
         destination (str): Output TRI raster destination
     """
-    cmd = [
-        "gdaldem",
-        "TRI",
-        "-compute_edges",
-        dem,
-        destination,
-    ] + COG_ARGS
+    with TempRasterFile() as tmp_dst:
+        cmd = [
+            "gdaldem",
+            "TRI",
+            "-compute_edges",
+            dem,
+            tmp_dst,
+        ] + GDALWARP_ARGS
 
-    run(cmd, check=True)
+        run(cmd, check=True)
+
+        translate_to_cog(tmp_dst, destination)
 
 
 def z_align(

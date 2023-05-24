@@ -50,6 +50,8 @@ class TempRasterFiles:
 
 
 def translate_to_cog(src: str, dst: str):
+    run(["gdal_edit.py", "-stats", src], check=True)
+
     run(
         ["gdal_translate"]
         + COG_ARGS
@@ -155,8 +157,6 @@ class GrassRunner(Session):
                     output=tmp_dst,
                     **kwargs,
                 )
-
-                run(["gdal_edit.py", "-stats", tmp_dst], check=True)
 
                 translate_to_cog(tmp_dst, out_path)
         else:

@@ -77,8 +77,6 @@ def warp(
         with TempRasterFile() as tmp_dst:
             run(cmd + [tmp_dst], check=True)
 
-            run(["gdal_edit.py", "-stats", tmp_dst], check=True)
-
             translate_to_cog(tmp_dst, destination)
     else:
         run(cmd + [destination], check=True)
@@ -722,8 +720,6 @@ def to_raster(data: da.Array, template: str, destination: str, as_cog: bool = Tr
             ],
         )
 
-        run(["gdal_edit.py", "-stats", dst], check=True)
-
     with ProgressBar():
         if as_cog:
             with TempRasterFile() as tmp_dst:
@@ -732,6 +728,7 @@ def to_raster(data: da.Array, template: str, destination: str, as_cog: bool = Tr
 
         else:
             save_tif(data, template, destination)
+            run(["gdal_edit.py", "-stats", destination], check=True)
 
 
 def raster_where(

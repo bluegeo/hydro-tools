@@ -663,7 +663,7 @@ def topographic_wetness(
                 start_raster="streams",
                 memory=2048,
                 flags="k",
-                as_cog=False
+                as_cog=False,
             )
             gr.save_raster("cost_path", cost_surface)
 
