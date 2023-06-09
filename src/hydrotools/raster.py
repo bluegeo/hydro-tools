@@ -25,7 +25,7 @@ def warp(
     csy: Union[None, float] = None,
     t_srs: Union[None, str, int] = None,
     dtype: str = "Float32",
-    resample_method: str = "cubicspline",
+    resample_method: str = "cubic",
     additional_args: list = [],
     as_cog: bool = True,
 ):
@@ -39,7 +39,7 @@ def warp(
         csy (float): Cell size in the y-direction. Defaults to None.
         t_srs (Union[str, int]): Target spatial reference. Defaults to None.
         dtype (str, optional): Target data type. Defaults to "Float32".
-        resample_method (str, optional): Resample method. Defaults to "cubicspline".
+        resample_method (str, optional): Resample method. Defaults to "cubic".
         additional_args (list, optional): Any additional gdalwarp arguments.
         as_cog (bool, optional): Output a GeoTiff in COG format. Defaults to True.
     """
@@ -88,7 +88,7 @@ def warp_like(
     source: Union[str, list, tuple],
     destination: str,
     template: str,
-    resample_method: str = "cubicspline",
+    resample_method: str = "cubic",
     **kwargs,
 ):
     """Warp a raster into a destination using a template raster

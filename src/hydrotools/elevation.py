@@ -147,7 +147,7 @@ def z_align(
         the interpolation of the delta of overlapping areas. This is an expensive
         operation and can be approximated for larger datasets by
         resampling the delta to a lower resolution and returning it to the original
-        resolution using a cubic spline.
+        resolution using cubic interpolation.
     """
     # Load dasks
     source_a = from_raster(source)
