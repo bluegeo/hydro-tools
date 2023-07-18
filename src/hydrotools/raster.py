@@ -12,7 +12,7 @@ import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
 
-from hydrotools.utils import infer_nodata, translate_to_cog
+from hydrotools.utils import infer_nodata, translate_to_cog, compare_projections
 from hydrotools.utils import GrassRunner, TempRasterFile
 from hydrotools.config import CHUNKS, TMP_DIR, GDALWARP_ARGS, COG_ARGS
 
@@ -795,3 +795,101 @@ def reset_corrupt_blocks(src: str, dst: str):
 
     if unreadable_blocks > 0:
         print(f"Filled {unreadable_blocks} of {total_blocks} blocks with no data")
+
+
+def clip_raster(
+    src: str,
+    mask: str,
+    dst: str,
+    crop_to_data: bool = False,
+    resample_method: str = "bilinear",
+):
+    """Clip a source raster to the extent of another raster
+
+    Args:
+        src (string): Source raster dataset to be clipped
+        mask (string): Raster used as a mask for clipping
+        dst (string): Output (clipped) raster dataset
+        crop_to_data (boolean): Reduce the extent of the output raster to where valid
+        data exists. Defaults to False.
+        resample_method (string): GDAL-supported resampling interpolation method. Defaults to 'bilinear'.
+    """
+    src_ds = Raster(src)
+    mask_ds = Raster(mask)
+
+    # Check that projections match
+    # TODO: Transform coordinates instead of forcing a match
+    if not compare_projections(src_ds.wkt, mask_ds.wkt):
+        raise ValueError("Spatial reference of source and mask datasets must match")
+
+    if crop_to_data:
+        # Collect an extent from valid data in the mask
+        top, bottom, right, left = -np.inf, np.inf, -np.inf, np.inf
+        with mask_ds.ds as ds:
+            for band in range(1, ds.count + 1):
+                for _, window in ds.block_windows(band):
+                    a = mask_ds.read(band, window=window)
+                    i, j = np.where(a != mask_ds.nodata)
+
+                    if i.size > 0:
+                        top = max(
+                            (mask_ds.top - window.row_off * mask_ds.csy)
+                            - (i.min() * mask_ds.csy),
+                            top,
+                        )
+                        bottom = min(
+                            (
+                                (
+                                    mask_ds.top
+                                    - (window.row_off + window.height) * mask_ds.csy
+                                )
+                                - (i.max() * mask_ds.csy)
+                                - mask_ds.csy
+                            ),
+                            bottom,
+                        )
+                        left = min(
+                            (mask_ds.left + window.col_off * mask_ds.csx)
+                            + (j.min() * mask_ds.csx),
+                            left,
+                        )
+                        right = max(
+                            (
+                                (
+                                    mask_ds.left
+                                    + (window.col_off + window.width) * mask_ds.csx
+                                )
+                                + (j.max() * mask_ds.csx)
+                                + mask_ds.csx
+                            ),
+                            right,
+                        )
+
+    else:
+        top, bottom, right, left = (
+            mask_ds.top,
+            mask_ds.bottom,
+            mask_ds.right,
+            mask_ds.left,
+        )
+
+    # Translate using the new extent
+    with TempRasterFile as tmp_dst:
+        warp_like(
+            src,
+            tmp_dst,
+            mask,
+            left=left,
+            bottom=bottom,
+            right=right,
+            top=top,
+            resample_method=resample_method,
+        )
+
+        to_raster(
+            da.ma.masked_where(
+                da.ma.getmaskarray(from_raster(mask)), from_raster(tmp_dst)
+            ),
+            mask,
+            dst,
+        )
