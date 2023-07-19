@@ -870,7 +870,16 @@ def clip_raster(
     # Translate using the new extent
     with TempRasterFile() as mask_dst:
         if crop_to_data:
-            cmd = ["gdal_translate", "-projwin", left, top, right, bottom, mask, mask_dst]
+            cmd = [
+                "gdal_translate",
+                "-projwin",
+                str(left),
+                str(top),
+                str(right),
+                str(bottom),
+                mask,
+                mask_dst,
+            ]
             run(cmd, check=True)
 
         else:
