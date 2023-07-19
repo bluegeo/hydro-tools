@@ -12,9 +12,9 @@ import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
 
-from hydrotools.utils import infer_nodata, translate_to_cog, compare_projections
+from hydrotools.utils import infer_nodata, translate_to_cog
 from hydrotools.utils import GrassRunner, TempRasterFile
-from hydrotools.config import CHUNKS, TMP_DIR, GDALWARP_ARGS, COG_ARGS
+from hydrotools.config import CHUNKS, TMP_DIR, GDALWARP_ARGS
 
 
 def warp(
@@ -814,21 +814,15 @@ def clip_raster(
         data exists. Defaults to False.
         resample_method (string): GDAL-supported resampling interpolation method. Defaults to 'bilinear'.
     """
-    src_ds = Raster(src)
     mask_ds = Raster(mask)
-
-    # Check that projections match
-    # TODO: Transform coordinates instead of forcing a match
-    if not compare_projections(src_ds.wkt, mask_ds.wkt):
-        raise ValueError("Spatial reference of source and mask datasets must match")
 
     if crop_to_data:
         # Collect an extent from valid data in the mask
         top, bottom, right, left = -np.inf, np.inf, -np.inf, np.inf
-        with mask_ds.ds as ds:
+        with mask_ds.ds() as ds:
             for band in range(1, ds.count + 1):
                 for _, window in ds.block_windows(band):
-                    a = mask_ds.read(band, window=window)
+                    a = ds.read(band, window=window)
                     i, j = np.where(a != mask_ds.nodata)
 
                     if i.size > 0:
@@ -874,22 +868,26 @@ def clip_raster(
         )
 
     # Translate using the new extent
-    with TempRasterFile as tmp_dst:
-        warp_like(
-            src,
-            tmp_dst,
-            mask,
-            left=left,
-            bottom=bottom,
-            right=right,
-            top=top,
-            resample_method=resample_method,
-        )
+    with TempRasterFile() as mask_dst:
+        if crop_to_data:
+            cmd = ["gdal_translate", "-projwin", left, top, right, bottom, mask, mask_dst]
+            run(cmd, check=True)
 
-        to_raster(
-            da.ma.masked_where(
-                da.ma.getmaskarray(from_raster(mask)), from_raster(tmp_dst)
-            ),
-            mask,
-            dst,
-        )
+        else:
+            mask_dst = mask
+
+        with TempRasterFile() as tmp_dst:
+            warp_like(
+                src,
+                tmp_dst,
+                mask_dst,
+                resample_method=resample_method,
+            )
+
+            to_raster(
+                da.ma.masked_where(
+                    da.ma.getmaskarray(from_raster(mask_dst)), from_raster(tmp_dst)
+                ),
+                mask_dst,
+                dst,
+            )
