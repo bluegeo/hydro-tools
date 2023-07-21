@@ -814,6 +814,7 @@ def clip_raster(
         data exists. Defaults to False.
         resample_method (string): GDAL-supported resampling interpolation method. Defaults to 'bilinear'.
     """
+    src_ds = Raster(src)
     mask_ds = Raster(mask)
 
     if crop_to_data:
@@ -890,6 +891,7 @@ def clip_raster(
                 src,
                 tmp_dst,
                 mask_dst,
+                dtype=src_ds.dtype,
                 resample_method=resample_method,
             )
 
