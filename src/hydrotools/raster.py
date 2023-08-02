@@ -89,14 +89,18 @@ def warp_like(
     destination: str,
     template: str,
     resample_method: str = "cubic",
+    as_cog: bool = True,
     **kwargs,
 ):
     """Warp a raster into a destination using a template raster
 
     Args:
-        source (Union[str, list, tuple]): Source raster(s) to warp
-        destination (str): Output location for warped raster
-        template (str): Raster to use to define the spatial parameters for the warp
+        source (Union[str, list, tuple]): Source raster(s) to warp.
+        destination (str): Output location for warped raster.
+        template (str): Raster to use to define the spatial parameters for the warp.
+        resample_method (str): GDAL-supported resampling interpolation method. Defaults
+        to True.
+        as_cog (bool): Create a COG on output. Defaults to True.
 
     kwargs:
         Override any parameters compatible with `warp`
@@ -118,6 +122,7 @@ def warp_like(
         kwargs.get("dtype", rs.dtype),
         resample_method,
         additional_args=kwargs.get("additional_args", []),
+        as_cog=as_cog,
     )
 
 
