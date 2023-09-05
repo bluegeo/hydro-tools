@@ -33,9 +33,8 @@ from hydrotools.elevation import slope
 from hydrotools.interpolate import (
     raster_filter,
     PointInterpolator,
-    front_contains,
     raster_filter,
-    expand_interpolate,
+    width_transform,
     normalize,
 )
 
@@ -429,158 +428,11 @@ def bankfull_extent(
     )
 
 
-@njit
-def vci_width_transform_task(
-    regions: np.ndarray, edges: np.ndarray, bfw: np.ndarray, csx: float, csy: float
-) -> np.ndarray:
-    """Compute approximate valley confinement index using widths of connected regions
-    and returning the ratio of the maximum bankfull width to the valley width.
-
-    Args:
-        regions (np.ndarray): Array of regions (float) bounded by a value of -999.
-        edges (np.ndarray): Array of edges (bool) of regions.
-        bfw (np.ndarray): Array of bankfull width values, with -999 outside of streams.
-        csx (float): Cell size in the x-direction.
-        csy (float): Cell size in they y-direction.
-
-    Returns:
-        np.ndarray: Array of region widths bounded by -999.
-    """
-    i_bound, j_bound = regions.shape
-
-    width = regions.copy()
-    modals = regions.copy()
-
-    stack = [
-        [stack_i, stack_j]
-        for stack_i in range(i_bound)
-        for stack_j in range(j_bound)
-        if edges[stack_i, stack_j]
-    ]
-
-    offsets = [
-        [-1, -1],
-        [-1, 0],
-        [-1, 1],
-        [0, -1],
-        [0, 1],
-        [1, -1],
-        [1, 0],
-        [1, 1],
-    ]
-
-    while len(stack) > 0:
-        next_i, next_j = stack.pop(0)
-
-        search_stack = List()
-        searched = {np.int64(next_i): {np.int64(next_j): True}}
-        edge_stack = List([[next_i, next_j]])
-        region_stack = List()
-        i, j = next_i, next_j
-
-        current_distance = (csx + csy) / 2.0
-
-        while True:
-            distances = List()
-            terminate = False
-            for i_off, j_off in offsets:
-                i_nbr = np.int64(i + i_off)
-                j_nbr = np.int64(j + j_off)
-
-                if (
-                    i_nbr == i_bound
-                    or i_nbr < 0
-                    or j_nbr == j_bound
-                    or j_nbr < 0
-                    or regions[i_nbr, j_nbr] == -999
-                ):
-                    continue
-
-                if i_nbr in searched and j_nbr in searched[i_nbr]:
-                    continue
-                else:
-                    dist = np.sqrt(
-                        (np.float64(i_nbr - next_i) * csy) ** 2
-                        + (np.float64(j_nbr - next_j) * csx) ** 2
-                    )
-
-                    try:
-                        searched[i_nbr][j_nbr] = True
-                    except:
-                        searched[i_nbr] = {j_nbr: True}
-
-                    if edges[i_nbr, j_nbr]:
-                        distances.append(dist)
-                        if len(region_stack) > 0:
-                            # Check if the edge opposes the existing center of mass
-                            r_com_i, r_com_j = 0.0, 0.0
-                            for _i, _j in region_stack:
-                                r_com_i += np.float64(_i)
-                                r_com_j += np.float64(_j)
-                            denom = np.float64(len(region_stack))
-                            r_com_i /= denom
-                            r_com_j /= denom
-
-                            e_com_i, e_com_j = 0.0, 0.0
-                            for _i, _j in edge_stack:
-                                e_com_i += np.float64(_i)
-                                e_com_j += np.float64(_j)
-                            denom = np.float64(len(edge_stack))
-                            e_com_i /= denom
-                            e_com_j /= denom
-
-                            if not front_contains(
-                                e_com_j, e_com_i, r_com_j, r_com_i, j_nbr, i_nbr
-                            ):
-                                terminate = True
-                        edge_stack.append([i_nbr, j_nbr])
-                    else:
-                        region_stack.append([i_nbr, j_nbr])
-                        if len(search_stack) == 0 or dist >= search_stack[-1][0]:
-                            search_stack.append([dist, i_nbr, j_nbr])
-                        elif dist <= search_stack[0][0]:
-                            search_stack.insert(0, [dist, i_nbr, j_nbr])
-                        else:
-                            idx = -1
-                            while dist <= search_stack[idx][0]:
-                                idx -= 1
-                            search_stack.insert(idx + 1, [dist, i_nbr, j_nbr])
-
-            if len(distances) > 0:
-                current_distance = sum(distances) / len(distances)
-
-            if terminate:
-                break
-
-            try:
-                _, i, j = search_stack.pop(0)
-            except:
-                break
-
-        bfw_value = 0
-        for assign_i, j_dict in searched.items():
-            for assign_j, _ in j_dict.items():
-                if (
-                    bfw[assign_i, assign_j] != -999
-                    and bfw[assign_i, assign_j] > bfw_value
-                ):
-                    bfw_value = bfw[assign_i, assign_j]
-
-        if current_distance > 0:
-            vci = bfw_value / current_distance
-            for assign_i, j_dict in searched.items():
-                for assign_j, _ in j_dict.items():
-                    width[assign_i, assign_j] += vci
-                    modals[assign_i, assign_j] += 1
-
-    return np.where(modals > 0, width / modals, -999)
-
-
 def valley_confinement(
     bankfull_width_src: str,
     twi_src: str,
     valley_confinement_dst: str,
-    twi_threshold: float = 3500,
+    twi_threshold: float = 745,
 ):
     """Calculate a valley confinement index - the ratio of valley width to estimated
     bankfull width.
@@ -595,31 +447,19 @@ def valley_confinement(
         twi_threshold (float): The maximum topographic wetness used to constrain the
         valley bottom. Defaults to 3500.
     """
-    raise NotImplementedError("This method needs work")
-
-    raster_specs = Raster.raster_specs(bankfull_width_src)
-    csx, csy = raster_specs["csx"], raster_specs["csy"]
-
+    bfw = from_raster(bankfull_width_src)
     valleys = da.ma.filled(from_raster(twi_src) >= twi_threshold, False).astype(bool)
-    valley_eroded = binary_erosion(valleys, np.ones((1, 3, 3), dtype=bool)).astype(bool)
-    valley_edges = valleys & ~valley_eroded
 
-    regions, edges, bfw = da.compute(
-        da.squeeze(da.where(valleys, 0, -999)).astype(np.float64),
-        da.squeeze(valley_edges),
-        da.squeeze(da.ma.filled(from_raster(bankfull_width_src), -999)).astype(
-            np.float64
-        ),
-    )
+    with TempRasterFiles(2) as (valley_dst, valley_width_dst):
+        to_raster(valleys, bankfull_width_src, valley_dst)
 
-    vci = da.from_array(
-        vci_width_transform_task(regions, edges, bfw, csx, csy)[np.newaxis, :]
-    )
-    del regions, edges, bfw
+        width_transform(valley_dst, valley_width_dst)
 
-    vci = da.ma.masked_where(vci == -999, vci)
-
-    to_raster(vci, bankfull_width_src, valley_confinement_dst)
+        to_raster(
+            from_raster("valley_width.tif") / da.ma.masked_where(bfw <= 0, bfw),
+            bankfull_width_src,
+            valley_confinement_dst,
+        )
 
 
 def topographic_wetness(

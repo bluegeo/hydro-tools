@@ -354,7 +354,7 @@ def width_transform(src: str, dst: str):
     )
     del region_array, edges_array
 
-    to_raster(width, src, dst)
+    to_raster(da.ma.masked_where(width == -999, width), src, dst)
 
 
 @njit
