@@ -600,7 +600,13 @@ class WatershedIndex:
         """
         src = Raster(raster_source)
 
-        if any([src.shape != self.shape, src.top != self.top, src.left != self.left]):
+        if any(
+            [
+                src.shape != self.shape,
+                not np.isclose(src.top, self.top),
+                not np.isclose(src.left, self.left),
+            ]
+        ):
             raise ValueError("Input data must spatially match index domain")
 
         data = np.squeeze(from_raster(src).compute())
