@@ -18,7 +18,7 @@ from hydrotools.utils import (
     transform_points,
     proj4_string,
 )
-from hydrotools.raster import Raster, from_raster
+from hydrotools.raster import Raster, from_raster, TempRasterFile, vectorize
 
 
 def condition_dem(dem: str, dem_cnd_dst: str):
@@ -240,6 +240,35 @@ def stream_order(
             )
 
             gr.save_vector("stream_order", order_dst)
+
+
+def basin(flow_direction: str, x: float, y: float, dst: str):
+    """Delineate a watershed from coordinates using `r.water.outlet`
+
+    Args:
+        flow_direction (str): Path to a flow direction grid
+        x (float): Coordinate in the x-direction
+        y (float): Coordinate in the y-direction
+        dst (str): Output path for the watershed vector file
+    """
+    raster_type = dst.lower().endswith(".tif")
+
+    with TempRasterFile() as tmp_rast:
+        with GrassRunner(flow_direction) as gr:
+            gr.run_command(
+                "r.water.outlet",
+                (flow_direction, "fd", "raster"),
+                input="fd",
+                output="basin",
+                coordinates=(x, y),
+            )
+
+            gr.save_raster(
+                "basin", dst if raster_type else tmp_rast, as_cog=raster_type
+            )
+
+        if not raster_type:
+            vectorize(tmp_rast, dst, smooth_corners=True)
 
 
 class WatershedIndex:
