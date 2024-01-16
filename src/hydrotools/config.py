@@ -9,7 +9,7 @@ TMP_DIR = gettempdir()
 
 GRASS_TMP: str = gettempdir()
 
-GRASS_FLAGS: dict = {"quiet": True}
+GRASS_FLAGS: dict = {"quiet": False}
 
 GDALWARP_ARGS = [
     "-of",

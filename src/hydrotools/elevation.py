@@ -180,7 +180,7 @@ def z_align(
         obs_mask = ~np.ma.getmaskarray(obs)
 
         # Collect the edges of overlapping area between the source and addition
-        overlap = ~binary_erosion(obs_mask, np.ones((1, 3, 3), np.bool)) & obs_mask
+        overlap = ~binary_erosion(obs_mask, np.ones((1, 3, 3), bool)) & obs_mask
 
         pred_z = PointInterpolator(
             np.vstack(np.where(overlap)).T[:, 1:],
