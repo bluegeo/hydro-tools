@@ -11,7 +11,9 @@ import dask.array as da
 from dask_image.ndmorph import binary_erosion
 from numba import njit
 from numba.typed import List
+from scipy.interpolate import griddata
 import numpy as np
+from sklearn.neighbors import BallTree
 
 from hydrotools.config import CHUNKS
 from hydrotools.raster import (
@@ -179,6 +181,98 @@ def stream_slope(
                 )
         else:
             slope(elev_dst, slope_dst, units, scale)
+
+
+def bankfull_width_geometric(
+    streams: str,
+    slope: str,
+    bankfull_dst: str,
+    max_cost: float = 750,
+    memory: int = None,
+):
+    raster_specs = Raster.raster_specs(slope)
+    avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
+
+    stream_mask = ~da.ma.getmaskarray(from_raster(streams))
+
+    # Generate cost surface (normalized slope, adjusted for cell size)
+    cost = (da.clip(from_raster(slope).astype(np.float64), 0.0, 90.0) / 90.0) * avg_cs
+    # Make cost 0 where simulated streams exist
+    cost = raster_where(~stream_mask, cost, 0)
+
+    with TempRasterFiles(3) as (streams_path, cost_path, lcp_dst):
+        # Generate least cost surface and closest stream map
+        to_raster(cost, slope, cost_path, as_cog=False)
+        to_raster(stream_mask, slope, streams_path, as_cog=False)
+
+        with GrassRunner(cost_path) as gr:
+            gr.run_command(
+                "r.cost",
+                (cost_path, "cost", "raster"),
+                (streams_path, "streams", "raster"),
+                input="cost",
+                output="cost_path",
+                start_raster="streams",
+                max_cost=max_cost,
+                memory=memory if memory is not None else 300,
+                flags="k",
+            )
+            gr.save_raster("cost_path", lcp_dst)
+
+        # Find the edges
+        region = ~da.ma.getmaskarray(from_raster(lcp_dst))
+        eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
+        edges = region & ~eroded
+
+        # Accumulate the distance to edges along streams
+        edge_points = np.array(da.where(edges[0])).T.astype("float32")
+        edge_points[:, 0] *= raster_specs["csy"]
+        edge_points[:, 1] *= raster_specs["csx"]
+
+        stream_inds = np.array(da.where(stream_mask[0])).T
+        stream_points = stream_inds.astype("float32")
+        stream_points[:, 0] *= raster_specs["csy"]
+        stream_points[:, 1] *= raster_specs["csx"]
+
+        bt = BallTree(stream_points)
+        distances, indices = map(lambda x: x.ravel(), bt.query(edge_points, 1))
+
+        bins = np.bincount(indices, distances)
+        indices, counts = np.unique(indices, return_counts=True)
+        # Distance is the average of distance to surrounding banks * 2 to account for
+        # the entire valley width.
+        distances = (bins[indices] / counts) * 2
+
+        # Assign widths to output streams
+        locations = np.ravel_multi_index(
+            (stream_inds[indices][:, 0], stream_inds[indices][:, 1]),
+            stream_mask.shape[1:],
+        )
+
+        bfw = da.zeros(
+            stream_mask.shape, dtype="float32", chunks=stream_mask.chunks
+        ).ravel()
+        bfw[locations] = distances
+        bfw = bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks)
+        bfw = da.ma.masked_equal(bfw, 0)
+
+        # Interpolate where streams are missing values
+        points = np.array(da.where(bfw[0])).T
+        values = bfw[~da.ma.getmaskarray(bfw)].compute()
+        xi = np.array(da.where((da.ma.getmaskarray(bfw) & stream_mask)[0])).T
+
+        locations = np.ravel_multi_index(
+            (xi[:, 0], xi[:, 1]),
+            stream_mask.shape[1:],
+        )
+        bfw = bfw.ravel()
+        bfw[locations] = griddata(points, values, xi)
+
+        to_raster(
+            bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks),
+            cost_path,
+            bankfull_dst,
+        )
 
 
 def bankfull_width(
