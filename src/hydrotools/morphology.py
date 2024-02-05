@@ -187,20 +187,41 @@ def bankfull_width_geometric(
     streams: str,
     slope: str,
     bankfull_dst: str,
-    max_cost: float = 750,
+    lcp_dst: str = None,
+    max_cost: float = 13,
     memory: int = None,
 ):
+    """Calculate bankfull width as a product of the valley geometry. Slope is used as
+    cost for a Least Cost Path surface originating at streams. A threshold cost is
+    provided to constrain regions that depict potential bankfull. The resulting distance
+    across these regions is applied to stream locations as bankfull width.
+
+    Args:
+        streams (str): Stream raster derived from `watershed.extract_streams`
+        slope (str): Slope raster in degrees derived from `elevation.slope`
+        bankfull_dst (str): Output Bankfull Width raster
+        lcp_dst (str, optional): Output raster with the Least Cost Path surface.
+        Defaults to None.
+        max_cost (float, optional): Maximum cost to constrain regions of bankfull 
+        extent. Defaults to 0.13.
+        memory (int, optional): Maximum memory usage for GRASS operations.
+        Defaults to None.
+    """
     raster_specs = Raster.raster_specs(slope)
     avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
 
     stream_mask = ~da.ma.getmaskarray(from_raster(streams))
 
     # Generate cost surface (normalized slope, adjusted for cell size)
-    cost = (da.clip(from_raster(slope).astype(np.float64), 0.0, 90.0) / 90.0) * avg_cs
+    cost = (da.clip(from_raster(slope).astype(np.float64), 0.0, 90.0) / 90.0) * avg_cs * 100
     # Make cost 0 where simulated streams exist
     cost = raster_where(~stream_mask, cost, 0)
 
-    with TempRasterFiles(3) as (streams_path, cost_path, lcp_dst):
+    with TempRasterFiles(3) as (streams_path, cost_path, lcp_path):
+        # Override temporary LCP path if one is provided
+        if lcp_dst is not None:
+            lcp_path = lcp_dst
+
         # Generate least cost surface and closest stream map
         to_raster(cost, slope, cost_path, as_cog=False)
         to_raster(stream_mask, slope, streams_path, as_cog=False)
@@ -217,10 +238,10 @@ def bankfull_width_geometric(
                 memory=memory if memory is not None else 300,
                 flags="k",
             )
-            gr.save_raster("cost_path", lcp_dst)
+            gr.save_raster("cost_path", lcp_path, as_cog=lcp_dst is not None)
 
         # Find the edges
-        region = ~da.ma.getmaskarray(from_raster(lcp_dst))
+        region = ~da.ma.getmaskarray(from_raster(lcp_path))
         eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
         edges = region & ~eroded
 
