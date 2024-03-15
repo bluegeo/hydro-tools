@@ -1,6 +1,6 @@
 from multiprocessing.dummy import Pool as DummyPool
 from multiprocessing import cpu_count
-from typing import Union
+from typing import Union, Callable
 
 import numpy as np
 import dask.array as da
@@ -13,14 +13,14 @@ from hydrotools.raster import Raster, from_raster, to_raster
 from hydrotools.utils import GrassRunner
 
 
-def raster_filter(
+def custom_raster_filter(
     raster_source: str,
     kernel: Union[np.ndarray, tuple],
-    method: str,
+    func: Callable,
     filter_dst: str,
-    **kwargs,
+    *args,
 ):
-    """Filter a raster using a defined kernel and method
+    """Filter a raster using a defined kernel and custom numba.njit function
 
     Args:
         raster_source (str): Input raster
@@ -28,28 +28,15 @@ def raster_filter(
         The kernal may be a 2-length tuple to define the size of a rectangular window
         or a boolean numpy array that defines the locations of the sample for the
         window.
-        method (str): Method used to apply the filter. Choose one of:
-            [
-                "sum",
-                "min",
-                "max",
-                "diff",
-                "mean",
-                "median",
-                "std",
-                "variance",
-                "percentile",
-                "quantile"
-            ]
-            When choosing percentil or quantile, the `q` kwarg should be specified.
+        func (Callable): Custom function that reduces the kernel to a single scalar
         filter_dst (str): Path to the output filtered raster
 
-    Kwargs:
-        q: Percentile or quantile to use if `method` is percentile or quantile
+    args:
+        Any custom arguments to be added to the input `func`
     """
 
     @njit(nogil=True)
-    def apply_filter(a, kernel, i_start, j_start, i_end, j_end, method, q):
+    def apply_filter(a, kernel, i_start, j_start, i_end, j_end, custom_func, args):
         output = np.full(a.shape, np.nan, np.float32)
 
         for i in range(i_start, a.shape[1] - i_end):
@@ -68,28 +55,7 @@ def raster_filter(
                 if np.all(np.isnan(sample)):
                     continue
 
-                if method == "sum":
-                    output_val = np.nansum(sample)
-                elif method == "min":
-                    output_val = np.nanmin(sample)
-                elif method == "max":
-                    output_val = np.nanmax(sample)
-                elif method == "diff":
-                    output_val = np.nanmax(sample) - np.nanmin(sample)
-                elif method == "mean":
-                    output_val = np.nanmean(sample)
-                elif method == "median":
-                    output_val = np.nanmedian(sample)
-                elif method == "std":
-                    output_val = np.nanstd(sample)
-                elif method == "variance":
-                    output_val = np.nanvar(sample)
-                elif method == "percentile":
-                    output_val = np.nanpercentile(sample, q)
-                elif method == "quantile":
-                    output_val = np.nanquantile(sample, q)
-
-                output[0, i, j] = output_val
+                output[0, i, j] = custom_func(sample, *args)
 
         return output
 
@@ -132,8 +98,8 @@ def raster_filter(
         j_start=j_start,
         i_end=i_end,
         j_end=j_end,
-        method=method,
-        q=kwargs.get("q", 25),
+        custom_func=func,
+        args=args,
     )
 
     to_raster(
@@ -141,6 +107,103 @@ def raster_filter(
         raster_source,
         filter_dst,
     )
+
+
+def raster_filter(
+    raster_source: str,
+    kernel: Union[np.ndarray, tuple],
+    method: str,
+    filter_dst: str,
+    *args,
+):
+    """Filter a raster using a defined kernel and method
+
+    Args:
+        raster_source (str): Input raster
+        kernel (Union[np.ndarray, tuple]): Kernel to create the moving window sample.
+        The kernal may be a 2-length tuple to define the size of a rectangular window
+        or a boolean numpy array that defines the locations of the sample for the
+        window.
+        method (str): Method used to apply the filter. Choose one of:
+            [
+                "sum",
+                "min",
+                "max",
+                "diff",
+                "mean",
+                "median",
+                "std",
+                "variance",
+                "percentile",
+                "quantile"
+            ]
+            When choosing percentil or quantile, the `q` kwarg should be specified.
+        filter_dst (str): Path to the output filtered raster
+
+    args:
+        q: Percentile or quantile to use if `method` is percentile or quantile
+    """
+    if method == "sum":
+
+        @njit
+        def func(sample):
+            return np.nansum(sample)
+
+    elif method == "min":
+
+        @njit
+        def func(sample):
+            return np.nanmin(sample)
+
+    elif method == "max":
+
+        @njit
+        def func(sample):
+            return np.nanmax(sample)
+
+    elif method == "diff":
+
+        @njit
+        def func(sample):
+            return np.nanmax(sample) - np.nanmin(sample)
+
+    elif method == "mean":
+
+        @njit
+        def func(sample):
+            return np.nanmean(sample)
+
+    elif method == "median":
+
+        @njit
+        def func(sample):
+            return np.nanmedian(sample)
+
+    elif method == "std":
+
+        @njit
+        def func(sample):
+            return np.nanstd(sample)
+
+    elif method == "variance":
+
+        @njit
+        def func(sample):
+            return np.nanvar(sample)
+
+    elif method == "percentile":
+
+        @njit
+        def func(sample):
+            return np.nanpercentile(sample)
+
+    elif method == "quantile":
+
+        @njit
+        def func(sample):
+            return np.nanquantile(sample)
+
+    custom_raster_filter(raster_source, kernel, func, filter_dst, *args)
 
 
 def distance_transform(raster_source: str, distance_dst: str):
@@ -461,9 +524,11 @@ def expand_interpolate(src: str, dst: str, regions: str = None):
 
     data, regions = da.compute(
         da.squeeze(da.ma.filled(from_raster(src), np.nan)),
-        da.squeeze(~da.ma.getmaskarray(from_raster(regions)))
-        if regions is not None
-        else da.ones(raster_specs["shape"][1:], dtype=bool),
+        (
+            da.squeeze(~da.ma.getmaskarray(from_raster(regions)))
+            if regions is not None
+            else da.ones(raster_specs["shape"][1:], dtype=bool)
+        ),
     )
 
     expand_interpolate_task(data, regions, csx, csy)

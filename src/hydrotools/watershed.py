@@ -48,7 +48,7 @@ def flow_direction_accumulation(
     Args:
         dem (str): Digital Elevation Model raster
         direction_grid (str): Output flow direction raster
-        accumulation_grid (str): Output flow accumulation raster
+        accumulation_grid (str): Output flow accumulatiorn raster
         single (bool, optional): Output Single Flow Direction. Defaults to True.
         positive_only (bool, optional): Only include positive flow direction values.
         Defaults to True.
