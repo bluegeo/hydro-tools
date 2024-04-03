@@ -41,7 +41,7 @@ def flow_direction_accumulation(
     accumulation_grid: str,
     single: bool = True,
     positive_only: bool = True,
-    memory: Union[int, None] = 4096,
+    memory: Union[int, None] = None,
 ):
     """Generate Flow Direction and Flow Accumulation grids using GRASS r.watershed
 
@@ -63,6 +63,8 @@ def flow_direction_accumulation(
     if memory is not None:
         flags += "m"
 
+    kwargs = {"memory": memory} if memory is not None else {}
+
     with GrassRunner(dem) as gr:
         gr.run_command(
             "r.watershed",
@@ -71,7 +73,7 @@ def flow_direction_accumulation(
             drainage="fd",
             accumulation="fa",
             flags=flags,
-            memory=memory if memory is not None else 300,  # r.watershed default
+            **kwargs
         )
         gr.save_raster("fd", direction_grid)
         gr.save_raster("fa", accumulation_grid)
@@ -202,6 +204,9 @@ def stream_order(
     else:
         kwargs = {"stream_vect": "stream_o"}
 
+    if memory is not None:
+        kwargs["memory"] = memory
+
     flags = ""
     if zero_bg:
         flags += "z"
@@ -221,7 +226,6 @@ def stream_order(
             stream_rast="streams",
             direction="direction",
             accumulation="accum",
-            memory=memory if memory is not None else 300,  # r.stream.order default
             flags=flags,
             **kwargs,
         )
