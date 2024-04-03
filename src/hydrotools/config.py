@@ -1,3 +1,4 @@
+import os
 from tempfile import gettempdir
 
 
@@ -5,9 +6,17 @@ from tempfile import gettempdir
 # call for data. As such, use larger chunks to achieve better performance.
 CHUNKS = (1, 4096, 4096)
 
-TMP_DIR = gettempdir()
+TMP_DIR: str = (
+    os.environ["HYDROTOOLS_TMP_DIR"]
+    if os.environ.get("HYDROTOOLS_TMP_DIR", None) is not None
+    else gettempdir()
+)
 
-GRASS_TMP: str = gettempdir()
+GRASS_TMP: str = (
+    os.environ["HYDROTOOLS_TMP_DIR"]
+    if os.environ.get("HYDROTOOLS_TMP_DIR", None) is not None
+    else gettempdir()
+)
 
 GRASS_FLAGS: dict = {"quiet": True}
 
