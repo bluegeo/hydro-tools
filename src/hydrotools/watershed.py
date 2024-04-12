@@ -17,8 +17,12 @@ from hydrotools.utils import (
     indices_to_coords,
     transform_points,
     proj4_string,
+    TempRasterFile,
+    TempRasterFiles,
+    TempVectorFile
 )
-from hydrotools.raster import Raster, from_raster, TempRasterFile, vectorize
+from hydrotools.raster import Raster, from_raster, vectorize
+from fastws.watershed import delineate
 
 
 def condition_dem(dem: str, dem_cnd_dst: str):
@@ -41,6 +45,7 @@ def flow_direction_accumulation(
     accumulation_grid: str,
     single: bool = True,
     positive_only: bool = True,
+    beautify: bool = False,
     memory: Union[int, None] = None,
 ):
     """Generate Flow Direction and Flow Accumulation grids using GRASS r.watershed
@@ -62,6 +67,8 @@ def flow_direction_accumulation(
         flags += "s"
     if memory is not None:
         flags += "m"
+    if beautify:
+        flags += "b"
 
     kwargs = {"memory": memory} if memory is not None else {}
 
@@ -73,7 +80,7 @@ def flow_direction_accumulation(
             drainage="fd",
             accumulation="fa",
             flags=flags,
-            **kwargs
+            **kwargs,
         )
         gr.save_raster("fd", direction_grid)
         gr.save_raster("fa", accumulation_grid)
@@ -88,6 +95,20 @@ def area_to_cells(src: str, area: float):
     """
     r = Raster(src)
     return int(np.ceil(area / (r.csx * r.csy)))
+
+
+def length_to_cells(src: str, length: float):
+    """Convert a length into an approximate number of raster cells
+
+    Args:
+        src (str): Input raster dataset
+        area (float): A length in the raster's spatial reference
+    """
+    r = Raster(src)
+
+    mean_cell_length = (r.csx + r.csy + np.sqrt((r.csx**2) + (r.csy**2))) / 3.0
+
+    return int(np.ceil(length / mean_cell_length))
 
 
 def auto_basin(
@@ -123,6 +144,38 @@ def auto_basin(
         gr.save_raster("b", basin_dataset)
 
 
+def find_contributors(
+    dem: str, coverage: str, max_cells: int = 1000, memory: Union[int, None] = 4096
+):
+    with TempRasterFiles(2) as (fd, fa):
+        flow_direction_accumulation(dem, fd, fa, memory=memory)
+
+        fa_array = da.from_raster(fa)
+        coverage = ~da.ma.getmaskarray(from_raster(coverage))
+
+        contributors = da.zeros_like(fa_array, dtype=bool)
+
+        next_outlet = np.unravel_index(
+            da.nanargmax(
+                da.where(
+                    ~contributors & coverage & (fa_array > max_cells), fa_array, np.nan
+                ).ravel()
+            ),
+            fa_array.shape,
+        )[1:]
+
+        r = Raster(dem)
+        x, y = indices_to_coords(
+            ([next_outlet[0]], [next_outlet[1]]), r.top, r.left, r.csx, r.csy
+        )
+
+        _, _, _, ws = delineate(None, fd, fa, x[0], y[0], r.wkt)
+
+        with TempVectorFile() as vect:
+            with fiona.open(vect, "w", "GPKG", schema, r.wkt) as layer:
+                
+
+
 def extract_streams(
     dem: str,
     accumulation_src: str,
@@ -140,13 +193,15 @@ def extract_streams(
         `flow_direction_accumulation`
         stream_dst (str): Output Streams raster path
         direction_dst (str): Output flow direction raster path
-        min_area (float, optional): Minimum watershed area for streams. Defaults to 1e6.
-        min_length (float, optional): Minimum stream length. Defaults to 0.
+        min_area (float, optional): Minimum watershed area for streams in map units.
+        Defaults to 1e6, which assumes the map units are m.
+        min_length (float, optional): Minimum stream length in map units. Defaults to 0.
         memory (Union[int, None], optional): Manage memory during execution by assigning
         a maximum block size. Defaults to 4096 MB.
     """
     # Min Area needs to be converted to cells
     min_area_cells = area_to_cells(dem, min_area)
+    min_length_cells = length_to_cells(dem, min_length)
 
     with GrassRunner(dem) as gr:
         gr.run_command(
@@ -155,7 +210,7 @@ def extract_streams(
             (accumulation_src, "accum", "raster"),
             elevation="dem",
             accumulation="accum",
-            stream_length=float(min_length),
+            stream_length=min_length_cells,
             threshold=min_area_cells,
             stream_raster="streams",
             direction="direction",
