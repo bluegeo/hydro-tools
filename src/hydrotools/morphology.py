@@ -188,7 +188,7 @@ def bankfull_width_geometric(
     slope: str,
     bankfull_dst: str,
     lcp_dst: str = None,
-    max_cost: float = 13,
+    max_cost: float = 0.8,
     memory: int = None,
 ):
     """Calculate bankfull width as a product of the valley geometry. Slope is used as
@@ -202,7 +202,7 @@ def bankfull_width_geometric(
         bankfull_dst (str): Output Bankfull Width raster
         lcp_dst (str, optional): Output raster with the Least Cost Path surface.
         Defaults to None.
-        max_cost (float, optional): Maximum cost to constrain regions of bankfull 
+        max_cost (float, optional): Maximum cost to constrain regions of bankfull
         extent. Defaults to 0.13.
         memory (int, optional): Maximum memory usage for GRASS operations.
         Defaults to None.
@@ -210,38 +210,39 @@ def bankfull_width_geometric(
     raster_specs = Raster.raster_specs(slope)
     avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
 
-    stream_mask = ~da.ma.getmaskarray(from_raster(streams))
-
     # Generate cost surface (normalized slope, adjusted for cell size)
-    cost = (da.clip(from_raster(slope).astype(np.float64), 0.0, 90.0) / 90.0) * avg_cs * 100
-    # Make cost 0 where simulated streams exist
-    cost = raster_where(~stream_mask, cost, 0)
+    cost = (da.clip(from_raster(slope).astype(np.float64), 0.0, 90.0) / 90.0) * avg_cs
 
-    with TempRasterFiles(3) as (streams_path, cost_path, lcp_path):
+    with TempRasterFiles(2) as (cost_path, lcp_path):
         # Override temporary LCP path if one is provided
         if lcp_dst is not None:
             lcp_path = lcp_dst
 
         # Generate least cost surface and closest stream map
         to_raster(cost, slope, cost_path, as_cog=False)
-        to_raster(stream_mask, slope, streams_path, as_cog=False)
+
+        cmd_kwargs = {
+            "input": "cost",
+            "output": "cost_path",
+            "start_raster": "streams",
+            "flags": "k",
+        }
+
+        if memory is not None:
+            cmd_kwargs["memory"] = memory
 
         with GrassRunner(cost_path) as gr:
             gr.run_command(
                 "r.cost",
                 (cost_path, "cost", "raster"),
-                (streams_path, "streams", "raster"),
-                input="cost",
-                output="cost_path",
-                start_raster="streams",
-                max_cost=max_cost,
-                memory=memory if memory is not None else 300,
-                flags="k",
+                (streams, "streams", "raster"),
+                **cmd_kwargs,
             )
             gr.save_raster("cost_path", lcp_path, as_cog=lcp_dst is not None)
 
+        region = from_raster(lcp_path) < max_cost
+
         # Find the edges
-        region = ~da.ma.getmaskarray(from_raster(lcp_path))
         eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
         edges = region & ~eroded
 
@@ -249,6 +250,8 @@ def bankfull_width_geometric(
         edge_points = np.array(da.where(edges[0])).T.astype("float32")
         edge_points[:, 0] *= raster_specs["csy"]
         edge_points[:, 1] *= raster_specs["csx"]
+
+        stream_mask = ~da.ma.getmaskarray(from_raster(streams))
 
         stream_inds = np.array(da.where(stream_mask[0])).T
         stream_points = stream_inds.astype("float32")
@@ -287,7 +290,8 @@ def bankfull_width_geometric(
             stream_mask.shape[1:],
         )
         bfw = bfw.ravel()
-        bfw[locations] = griddata(points, values, xi)
+        avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
+        bfw[locations] = griddata(points, values, xi, fill_value=avg_cs)
 
         to_raster(
             bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks),

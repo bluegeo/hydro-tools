@@ -12,7 +12,7 @@ import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
 
-from hydrotools.utils import infer_nodata, translate_to_cog
+from hydrotools.utils import infer_nodata, translate_to_cog, compare_projections
 from hydrotools.utils import GrassRunner, TempRasterFile
 from hydrotools.config import CHUNKS, TMP_DIR, GDALWARP_ARGS
 
@@ -142,6 +142,7 @@ class TXTFactory:
         csy: float,
         out_txt: str,
         in_proj: Union[str, int],
+        out_proj: Union[str, int] = 4326,
         tiles: bool = False,
     ):
         if len(shape) != 3:
@@ -154,7 +155,7 @@ class TXTFactory:
         if self.out_txt.lower().endswith(".csv"):
             # Write headings
             with open(self.out_txt, "a") as f:
-                f.write("longitude,latitude,value\n")
+                f.write("x,y,value\n")
         elif tiles:
             self.tile_temp_dir = os.path.join(TMP_DIR, next(_get_candidate_names()))
             os.mkdir(self.tile_temp_dir)
@@ -167,7 +168,12 @@ class TXTFactory:
         self.csx = float(csx)
         self.csy = float(csy)
 
-        self.transformer = Transformer.from_crs(in_proj, 4326, always_xy=True)
+        if compare_projections(in_proj, out_proj):
+            self.transformer = lambda x, y: (x, y)
+        else:
+            self.transformer = Transformer.from_crs(
+                in_proj, out_proj, always_xy=True
+            ).transform
 
         # For dask
         self.ndim = 3
@@ -189,7 +195,7 @@ class TXTFactory:
             y = self.top - (row_off * self.csy) - (i * self.csy) - self.csy * 0.5
             x = self.left + (col_off * self.csx) + (j * self.csx) + self.csx * 0.5
 
-            x, y = self.transformer.transform(x, y)
+            x, y = self.transformer(x, y)
 
             data = np.char.mod("%f", np.vstack([x, y, a[i, j].data]).T)
 
@@ -304,6 +310,7 @@ def vectorize(
             r_specs["csy"],
             destination,
             r_specs["wkt"],
+            r_specs["wkt"],
         )
 
         da.store([a], [dst])
@@ -334,6 +341,7 @@ def to_vector_tiles(raster_source: str, tile_dst: str, band: int = 1):
         r_specs["csy"],
         tile_dst,
         r_specs["wkt"],
+        4326,
         True,
     )
 

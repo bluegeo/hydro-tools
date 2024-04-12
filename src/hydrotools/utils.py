@@ -21,9 +21,13 @@ from hydrotools.config import TMP_DIR, GRASS_TMP, GRASS_FLAGS, COG_ARGS
 warnings.filterwarnings("ignore")
 
 
+def named_temp_file(ext):
+    return os.path.join(TMP_DIR, f"{next(_get_candidate_names())}.{ext}")
+
+
 class TempRasterFile:
     def __init__(self):
-        self.path = os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
+        self.path = named_temp_file("tif")
 
     def __enter__(self):
         return self.path
@@ -35,10 +39,32 @@ class TempRasterFile:
 
 class TempRasterFiles:
     def __init__(self, num: int):
-        self.paths = [
-            os.path.join(TMP_DIR, next(_get_candidate_names()) + ".tif")
-            for _ in range(num)
-        ]
+        self.paths = [named_temp_file("tif") for _ in range(num)]
+
+    def __enter__(self) -> list:
+        return self.paths
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for path in self.paths:
+            if os.path.isfile(path):
+                os.remove(path)
+
+
+class TempVectorFile:
+    def __init__(self):
+        self.path = named_temp_file("gpkg")
+
+    def __enter__(self):
+        return self.path
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if os.path.isfile(self.path):
+            os.remove(self.path)
+
+
+class TempVectorFiles:
+    def __init__(self, num: int):
+        self.paths = [named_temp_file("gpkg") for _ in range(num)]
 
     def __enter__(self) -> list:
         return self.paths
