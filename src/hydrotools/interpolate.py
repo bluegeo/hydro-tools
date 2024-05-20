@@ -6,7 +6,7 @@ import numpy as np
 import dask.array as da
 from dask_image.ndmorph import binary_erosion
 from numba import njit
-from numba.typed import List
+from numba.typed import List, Dict
 from sklearn.neighbors import KNeighborsRegressor, BallTree
 
 from hydrotools.raster import Raster, from_raster, to_raster
@@ -103,7 +103,7 @@ def custom_raster_filter(
     )
 
     to_raster(
-        da.ma.masked_where(da.isnan(filter_result), filter_result),
+        da.ma.masked_where(da.isnan(filter_result), filter_result).astype(Raster(raster_source).dtype),
         raster_source,
         filter_dst,
     )
@@ -129,6 +129,7 @@ def raster_filter(
                 "sum",
                 "min",
                 "max",
+                "mode",
                 "diff",
                 "mean",
                 "median",
@@ -160,6 +161,35 @@ def raster_filter(
         @njit
         def func(sample):
             return np.nanmax(sample)
+        
+    elif method == "mode":
+
+        @njit
+        def func(sample):
+            flat_sample = sample.ravel()
+
+            modals = Dict.empty(
+                key_type=np.float64,
+                value_type=np.int64,
+            )
+
+            for i in range(flat_sample.size):
+                if np.isnan(flat_sample[i]):
+                    continue
+
+                try:
+                    modals[flat_sample[i]] += 1
+                except:
+                    modals[flat_sample[i]] = 1
+
+            _max = 0
+            result = np.nan
+            for key, val in modals.items():
+                if val > _max:
+                    _max = val
+                    result = key
+
+            return result
 
     elif method == "diff":
 

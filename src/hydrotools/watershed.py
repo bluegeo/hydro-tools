@@ -42,6 +42,7 @@ def flow_direction_accumulation(
     single: bool = True,
     positive_only: bool = True,
     memory: Union[int, None] = None,
+    beautify: Union[bool, None] = None,
 ):
     """Generate Flow Direction and Flow Accumulation grids using GRASS r.watershed
 
@@ -54,6 +55,7 @@ def flow_direction_accumulation(
         Defaults to True.
         memory (Union[int, None], optional): Manage memory during execution by assigning
         a maximum block size. Defaults to 4096 MB.
+        beautify (Union[bool, None]): make streams follow nicer paths over flat regions.
     """
     flags = ""
     if positive_only:
@@ -62,6 +64,8 @@ def flow_direction_accumulation(
         flags += "s"
     if memory is not None:
         flags += "m"
+    if beautify:
+        flags += "b"
 
     kwargs = {"memory": memory} if memory is not None else {}
 
@@ -73,7 +77,7 @@ def flow_direction_accumulation(
             drainage="fd",
             accumulation="fa",
             flags=flags,
-            **kwargs
+            **kwargs,
         )
         gr.save_raster("fd", direction_grid)
         gr.save_raster("fa", accumulation_grid)
@@ -163,6 +167,44 @@ def extract_streams(
         )
         gr.save_raster("streams", stream_dst)
         gr.save_raster("direction", direction_dst)
+
+
+def stream_basins(
+    fd: str,
+    stream_src: str,
+    basins_dst: str,
+    smooth_corners: bool = True,
+    memory: Union[int, None] = 4096,
+):
+    """Create basins for a stream network extracted using `extract_streams`
+
+    Args:
+        fd (str): An input Flow Direction grid.
+        stream_src (str): Streams derived using `extract_streams`.
+        basins_dst (str): An output vector file for basins.
+        memory (Union[int, None], optional): Manage memory during execution by assigning
+        a maximum block size. Defaults to 4096 MB.
+    """
+    flags = ""
+    if memory is not None:
+        flags += "m"
+
+    kwargs = {"memory": memory} if memory is not None else {}
+
+    with TempRasterFile() as basins_rast:
+        with GrassRunner(fd) as gr:
+            gr.run_command(
+                "r.stream.basins",
+                (fd, "fd", "raster"),
+                (stream_src, "streams", "raster"),
+                direction="fd",
+                stream_rast="streams",
+                basins="basins",
+                **kwargs,
+            )
+            gr.save_raster("basins", basins_rast)
+
+        vectorize(basins_rast, basins_dst, smooth_corners=smooth_corners)
 
 
 def stream_order(
