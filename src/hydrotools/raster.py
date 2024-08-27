@@ -693,7 +693,9 @@ def from_raster(src: Union[Raster, str], chunks: tuple = CHUNKS) -> da.Array:
     return a
 
 
-def to_raster(data: da.Array, template: str, destination: str, as_cog: bool = True):
+def to_raster(
+    data: da.Array, template: str, destination: str, as_cog: bool = True, **kwargs
+):
     """Compute a dask array and store it in a destination raster dataset
 
     Args:
@@ -710,7 +712,7 @@ def to_raster(data: da.Array, template: str, destination: str, as_cog: bool = Tr
         dtype = "uint8"
         data = da.ma.masked_where(~data, data.astype("uint8"))
 
-    nodata = infer_nodata(data)
+    nodata = kwargs.get("nodata_value", infer_nodata(data))
 
     da.ma.set_fill_value(data, nodata)
 

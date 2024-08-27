@@ -139,7 +139,7 @@ def stream_slope(
     dem: str,
     streams: str,
     slope_dst: str,
-    units: str = "degress",
+    units: str = "degrees",
     scale: float = 1,
     focal_mean_dist: Union[None, float] = None,
 ):
