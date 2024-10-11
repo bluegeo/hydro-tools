@@ -134,6 +134,7 @@ def extract_streams(
     direction_dst: str,
     min_area: float = 1e6,
     min_length: float = 0,
+    mexp: float = None,
     memory: Union[int, None] = 4096,
 ):
     """Extract simulated streams
@@ -152,18 +153,25 @@ def extract_streams(
     # Min Area needs to be converted to cells
     min_area_cells = area_to_cells(dem, min_area)
 
+    kwargs = {
+        "elevation": "dem",
+        "accumulation": "accum",
+        "stream_length": float(min_length),
+        "threshold": min_area_cells,
+        "stream_raster": "streams",
+        "direction": "direction",
+        "memory": memory,
+    }
+
+    if mexp is not None:
+        kwargs["mexp"] = mexp
+
     with GrassRunner(dem) as gr:
         gr.run_command(
             "r.stream.extract",
             (dem, "dem", "raster"),
             (accumulation_src, "accum", "raster"),
-            elevation="dem",
-            accumulation="accum",
-            stream_length=float(min_length),
-            threshold=min_area_cells,
-            stream_raster="streams",
-            direction="direction",
-            memory=memory,
+            **kwargs,
         )
         gr.save_raster("streams", stream_dst)
         gr.save_raster("direction", direction_dst)
@@ -215,6 +223,7 @@ def stream_order(
     order_dst: str,
     use_accum: bool = False,
     zero_bg: bool = False,
+    only_topology: bool = False,
     memory: Union[int, None] = 4096,
 ):
     """Calculate stream order using the following data:
@@ -238,6 +247,9 @@ def stream_order(
         created.
         use_accum (bool): Use flow accumulation to trace Horton and Hack orders.
         zero_bg (bool): Use a background value of 0 instead of nodata
+        only_topology (bool): Do not run stream order, only vectorize the streams and
+        add topology. Defaults to False. **Note** this requires a modified version of
+        the GRASS r.stream.order tool.
         memory (Union[int, None], optional): Manage memory during execution by assigning
         a maximum block size. Defaults to 4096 MB.
     """
@@ -258,8 +270,9 @@ def stream_order(
         flags += "a"
 
     with GrassRunner(dem) as gr:
+        # r.stream.topology is the r.stream.order tool with the stream order portions removed
         gr.run_command(
-            "r.stream.order",
+            "r.stream.topology" if only_topology else "r.stream.order",
             (dem, "dem", "raster"),
             (stream_src, "streams", "raster"),
             (direction_src, "direction", "raster"),

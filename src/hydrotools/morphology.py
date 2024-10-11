@@ -36,7 +36,7 @@ from hydrotools.interpolate import (
     raster_filter,
     PointInterpolator,
     raster_filter,
-    width_transform,
+    distance_transform,
     normalize,
 )
 
@@ -188,8 +188,10 @@ def bankfull_width_geometric(
     slope: str,
     bankfull_dst: str,
     lcp_dst: str = None,
+    method: str = "balltree",
     max_cost: float = 0.8,
     memory: int = None,
+    input_lcp=None,
 ):
     """Calculate bankfull width as a product of the valley geometry. Slope is used as
     cost for a Least Cost Path surface originating at streams. A threshold cost is
@@ -207,97 +209,208 @@ def bankfull_width_geometric(
         memory (int, optional): Maximum memory usage for GRASS operations.
         Defaults to None.
     """
+
+    @njit
+    def filled_dfe(edges, dfe, dfe_order, cs):
+        offsets = [
+            [-1, -1],
+            [-1, 0],
+            [-1, 1],
+            [0, -1],
+            [0, 1],
+            [1, -1],
+            [1, 0],
+            [1, 1],
+        ]
+
+        shape = edges.shape
+
+        width = np.zeros_like(dfe)
+
+        for o_i in range(dfe_order.shape[0]):
+            r_i, r_j = dfe_order[o_i]
+
+            if dfe[r_i, r_j] == -1:
+                continue
+
+            width_val = dfe[r_i, r_j] * 2 if dfe[r_i, r_j] > 0 else cs
+
+            width[r_i, r_j] = width_val
+            dfe[r_j, r_j] = -1
+
+            i = r_i
+            j = r_j
+            while True:
+                edge_encounter = False
+                min_i, min_j = -1, -1
+                _m = np.inf
+                for i_off, j_off in offsets:
+                    i_nbr = i + i_off
+                    j_nbr = j + j_off
+                    if (
+                        i_nbr == shape[0]
+                        or i_nbr < 0
+                        or j_nbr == shape[1]
+                        or j_nbr < 0
+                        or dfe[i_nbr, j_nbr] == -1
+                    ):
+                        continue
+
+                    if dfe[i_nbr, j_nbr] < _m:
+                        _m = dfe[i_nbr, j_nbr]
+                        min_i, min_j = i_nbr, j_nbr
+
+                    if edges[i_nbr, j_nbr]:
+                        edge_encounter = True
+
+                if min_i == -1 or min_j == -1:
+                    break
+
+                dfe[min_i, min_j] = -1
+                width[min_i, min_j] = width[r_i, r_j]
+                i, j = min_i, min_j
+
+                if edge_encounter:
+                    break
+
+        return width
+
     raster_specs = Raster.raster_specs(slope)
     avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
 
-    # Generate cost surface (normalized slope, adjusted for cell size)
-    cost = (da.clip(from_raster(slope).astype(np.float64), 0.0, 90.0) / 90.0) * avg_cs
+    with TempRasterFiles(4) as (cost_path, lcp_path, edges_src, dt_from_edges_src):
+        if input_lcp is None:
+            # Generate cost surface (normalized slope, adjusted for cell size)
+            cost = (
+                da.clip(from_raster(slope).astype(np.float64), 0.0, 90.0) / 90.0
+            ) * avg_cs
 
-    with TempRasterFiles(2) as (cost_path, lcp_path):
-        # Override temporary LCP path if one is provided
-        if lcp_dst is not None:
-            lcp_path = lcp_dst
+            # Override temporary LCP path if one is provided
+            if lcp_dst is not None:
+                lcp_path = lcp_dst
 
-        # Generate least cost surface and closest stream map
-        to_raster(cost, slope, cost_path, as_cog=False)
+            # Generate least cost surface and closest stream map
+            to_raster(cost, slope, cost_path, as_cog=False)
 
-        cmd_kwargs = {
-            "input": "cost",
-            "output": "cost_path",
-            "start_raster": "streams",
-            "flags": "k",
-        }
+            cmd_kwargs = {
+                "input": "cost",
+                "output": "cost_path",
+                "start_raster": "streams",
+                "flags": "k",
+            }
 
-        if memory is not None:
-            cmd_kwargs["memory"] = memory
+            if memory is not None:
+                cmd_kwargs["memory"] = memory
 
-        with GrassRunner(cost_path) as gr:
-            gr.run_command(
-                "r.cost",
-                (cost_path, "cost", "raster"),
-                (streams, "streams", "raster"),
-                **cmd_kwargs,
-            )
-            gr.save_raster("cost_path", lcp_path, as_cog=lcp_dst is not None)
+            with GrassRunner(cost_path) as gr:
+                gr.run_command(
+                    "r.cost",
+                    (cost_path, "cost", "raster"),
+                    (streams, "streams", "raster"),
+                    **cmd_kwargs,
+                )
+                gr.save_raster("cost_path", lcp_path, as_cog=lcp_dst is not None)
+        else:
+            lcp_path = input_lcp
 
-        region = from_raster(lcp_path) < max_cost
+            region = from_raster(lcp_path) < max_cost
 
-        # Find the edges
-        eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
-        edges = region & ~eroded
+            # Find the edges
+            eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
+            edges = region & ~eroded
 
-        # Accumulate the distance to edges along streams
-        edge_points = np.array(da.where(edges[0])).T.astype("float32")
-        edge_points[:, 0] *= raster_specs["csy"]
-        edge_points[:, 1] *= raster_specs["csx"]
+            if method == "growfill":
+                # Distance transform to edges
+                to_raster(edges, slope, edges_src, as_cog=False)
 
-        stream_mask = ~da.ma.getmaskarray(from_raster(streams))
+                distance_transform(edges_src, dt_from_edges_src)
 
-        stream_inds = np.array(da.where(stream_mask[0])).T
-        stream_points = stream_inds.astype("float32")
-        stream_points[:, 0] *= raster_specs["csy"]
-        stream_points[:, 1] *= raster_specs["csx"]
+                dfe = from_raster(dt_from_edges_src)
 
-        bt = BallTree(stream_points)
-        distances, indices = map(lambda x: x.ravel(), bt.query(edge_points, 1))
+                dfe = da.ma.filled(da.where(region, dfe, -1), -1).compute()[0, ...]
 
-        bins = np.bincount(indices, distances)
-        indices, counts = np.unique(indices, return_counts=True)
-        # Distance is the average of distance to surrounding banks * 2 to account for
-        # the entire valley width.
-        distances = (bins[indices] / counts) * 2
+                dfe_order = np.unravel_index(np.argsort(dfe.ravel())[::-1], dfe.shape)
 
-        # Assign widths to output streams
-        locations = np.ravel_multi_index(
-            (stream_inds[indices][:, 0], stream_inds[indices][:, 1]),
-            stream_mask.shape[1:],
-        )
+                width = filled_dfe(
+                    da.ma.filled(edges, False).compute()[0, ...],
+                    dfe,
+                    np.array(dfe_order).T,
+                    avg_cs,
+                )
 
-        bfw = da.zeros(
-            stream_mask.shape, dtype="float32", chunks=stream_mask.chunks
-        ).ravel()
-        bfw[locations] = distances
-        bfw = bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks)
-        bfw = da.ma.masked_equal(bfw, 0)
+                width = da.from_array(width.reshape(edges.shape), chunks=edges.chunks)
+                width = da.ma.masked_where(width == 0, width)
 
-        # Interpolate where streams are missing values
-        points = np.array(da.where(bfw[0])).T
-        values = bfw[~da.ma.getmaskarray(bfw)].compute()
-        xi = np.array(da.where((da.ma.getmaskarray(bfw) & stream_mask)[0])).T
+                to_raster(
+                    width,
+                    lcp_path,
+                    bankfull_dst,
+                )
+            elif method == "balltree":
+                # Accumulate the distance to edges along streams
+                edge_points = np.array(da.where(edges[0])).T.astype("float32")
+                edge_points[:, 0] *= raster_specs["csy"]
+                edge_points[:, 1] *= raster_specs["csx"]
 
-        locations = np.ravel_multi_index(
-            (xi[:, 0], xi[:, 1]),
-            stream_mask.shape[1:],
-        )
-        bfw = bfw.ravel()
-        avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
-        bfw[locations] = griddata(points, values, xi, fill_value=avg_cs)
+                stream_mask = ~da.ma.getmaskarray(from_raster(streams))
 
-        to_raster(
-            bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks),
-            cost_path,
-            bankfull_dst,
-        )
+                stream_inds = np.array(da.where(stream_mask[0])).T
+                stream_points = stream_inds.astype("float32")
+                stream_points[:, 0] *= raster_specs["csy"]
+                stream_points[:, 1] *= raster_specs["csx"]
+
+                bt = BallTree(stream_points)
+                distances, indices = map(lambda x: x.ravel(), bt.query(edge_points, 1))
+
+                bins = np.bincount(indices, distances)
+                indices, counts = np.unique(indices, return_counts=True)
+                # Distance is the average of distance to surrounding banks * 2 to account for
+                # the entire valley width.
+                distances = (bins[indices] / counts) * 2
+
+                # Assign widths to output streams
+                locations = np.ravel_multi_index(
+                    (stream_inds[indices][:, 0], stream_inds[indices][:, 1]),
+                    stream_mask.shape[1:],
+                )
+
+                bfw = da.zeros(
+                    stream_mask.shape, dtype="float32", chunks=stream_mask.chunks
+                ).ravel()
+                bfw[locations] = distances
+                bfw = bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks)
+                bfw = da.ma.masked_equal(bfw, 0)
+
+                # Interpolate where streams are missing values
+                points = np.array(da.where(bfw[0])).T
+                values = bfw[~da.ma.getmaskarray(bfw)].compute()
+                xi = np.array(da.where((da.ma.getmaskarray(bfw) & stream_mask)[0])).T
+
+                locations = np.ravel_multi_index(
+                    (xi[:, 0], xi[:, 1]),
+                    stream_mask.shape[1:],
+                )
+                bfw = bfw.ravel()
+                avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
+                bfw[locations] = griddata(points, values, xi, fill_value=avg_cs)
+
+                to_raster(
+                    bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks),
+                    lcp_path,
+                    bankfull_dst,
+                )
+
+
+def valley_width(
+    streams: str,
+    slope: str,
+    dst: str,
+    lcp_dst: str = None,
+    max_cost: float = 1,
+    memory: int = None,
+):
+    """Mirror of bankfull_width_geometric"""
+    return bankfull_width_geometric(streams, slope, dst, lcp_dst, max_cost, memory)
 
 
 def bankfull_width(
@@ -549,9 +662,9 @@ def bankfull_extent(
 
 def valley_confinement(
     bankfull_width_src: str,
-    twi_src: str,
+    valley_width_src: str,
     valley_confinement_dst: str,
-    twi_threshold: float = 745,
+    max_width: float = 1000,
 ):
     """Calculate a valley confinement index - the ratio of valley width to estimated
     bankfull width.
@@ -559,26 +672,20 @@ def valley_confinement(
     Args:
         bankfull_width_src (str): Bankfull width data source calculated using
         `morphology.bankfull_width`.
-        twi_src (str): Topographic Wetness Index data source calculated using
-        `morphology.topographic_wetness`.
+        valley_width (str): Valley width calculated using `morphology.valley_width`.
         valley_confinement_dst (str): Output raster with valley confinement index
         values.
-        twi_threshold (float): The maximum topographic wetness used to constrain the
-        valley bottom. Defaults to 3500.
     """
     bfw = from_raster(bankfull_width_src)
-    valleys = da.ma.filled(from_raster(twi_src) >= twi_threshold, False).astype(bool)
+    valleys = from_raster(valley_width_src)
 
-    with TempRasterFiles(2) as (valley_dst, valley_width_dst):
-        to_raster(valleys, bankfull_width_src, valley_dst)
+    vc = da.clip(valleys, 0, max_width) / da.ma.masked_where(bfw <= 0, bfw)
 
-        width_transform(valley_dst, valley_width_dst)
-
-        to_raster(
-            from_raster("valley_width.tif") / da.ma.masked_where(bfw <= 0, bfw),
-            bankfull_width_src,
-            valley_confinement_dst,
-        )
+    to_raster(
+        vc,
+        bankfull_width_src,
+        valley_confinement_dst,
+    )
 
 
 def topographic_wetness(

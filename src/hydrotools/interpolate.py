@@ -103,7 +103,9 @@ def custom_raster_filter(
     )
 
     to_raster(
-        da.ma.masked_where(da.isnan(filter_result), filter_result).astype(Raster(raster_source).dtype),
+        da.ma.masked_where(da.isnan(filter_result), filter_result).astype(
+            Raster(raster_source).dtype
+        ),
         raster_source,
         filter_dst,
     )
@@ -161,7 +163,7 @@ def raster_filter(
         @njit
         def func(sample):
             return np.nanmax(sample)
-        
+
     elif method == "mode":
 
         @njit
