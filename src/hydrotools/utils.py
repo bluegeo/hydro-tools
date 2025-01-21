@@ -76,7 +76,10 @@ class TempVectorFiles:
 
 
 def translate_to_cog(src: str, dst: str):
-    run(["gdal_edit.py", "-stats", src], check=True)
+    try:
+        run(["gdal_edit.py", "-stats", src], check=True)
+    except:
+        print("Warning: no valid pixels found")
 
     run(
         ["gdal_translate"]
