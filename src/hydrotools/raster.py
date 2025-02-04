@@ -1,6 +1,6 @@
 import os
 from shutil import rmtree
-from typing import Union, Tuple
+from typing import Union, Tuple, Generator
 from contextlib import contextmanager
 from subprocess import run
 from tempfile import _get_candidate_names
@@ -650,7 +650,7 @@ class Raster:
         return self.parse_slice(s, self.shape)
 
     @contextmanager
-    def ds(self, mode="r") -> rasterio.DatasetReader:
+    def ds(self, mode="r") -> Generator[rasterio.DatasetReader, None, None]:
         """Open the underlying raster dataset
 
         Returns:
@@ -917,3 +917,53 @@ def clip_raster(
                 mask_dst,
                 dst,
             )
+
+
+def xy_align(
+    src_1: str,
+    src_2: str,
+    dst_1: str,
+    dst_2: str,
+    align: str = "min",
+    resample_method: str = "bilinear",
+):
+    """Align two rasters by the intersection of their extents and resolution
+
+    Args:
+        src_1 (str): Input Raster 1
+        src_2 (str): Input Raster 2
+        dst_1 (str): Output Raster 1
+        dst_2 (str): Output Raster 2
+        align (str, optional): Align with the minimum resolution using "min" or maximum resolution using "max".
+        resample_method (str, optional): _description_. Defaults to "bilinear".
+    """
+    r1 = Raster(src_1)
+    r2 = Raster(src_2)
+
+    top = max(r1.top, r2.top)
+    bottom = min(r1.bottom, r2.bottom)
+    left = min(r1.left, r2.left)
+    right = max(r1.right, r2.right)
+
+    cs_method = min if align.lower() == "min" else max
+
+    csx = cs_method(r1.csx, r2.csx)
+    csy = cs_method(r1.csy, r2.csy)
+
+    warp(
+        src_1,
+        dst_1,
+        (left, bottom, right, top),
+        csx,
+        csy,
+        resample_method=resample_method,
+    )
+
+    warp(
+        src_2,
+        dst_2,
+        (left, bottom, right, top),
+        csx,
+        csy,
+        resample_method=resample_method,
+    )
