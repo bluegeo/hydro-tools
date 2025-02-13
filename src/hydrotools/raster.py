@@ -81,7 +81,10 @@ def warp(
     else:
         run(cmd + [destination], check=True)
 
-        run(["gdal_edit.py", "-stats", destination], check=True)
+        try:
+            run(["gdal_edit.py", "-stats", destination], check=True)
+        except:
+            pass
 
 
 def warp_like(
@@ -743,7 +746,10 @@ def to_raster(
 
         else:
             save_tif(data, template, destination)
-            run(["gdal_edit.py", "-stats", destination], check=True)
+            try:
+                run(["gdal_edit.py", "-stats", destination], check=True)
+            except:
+                pass
 
 
 def raster_where(
