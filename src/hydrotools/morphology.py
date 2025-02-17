@@ -693,6 +693,8 @@ def topographic_wetness(
     slope_src: str,
     topographic_wetness_dst: str,
     max_cost: float = 750.0,
+    knights_move: bool = True,
+    memory=4096
 ):
     """Calculate a topographic wetness index
 
@@ -703,6 +705,7 @@ def topographic_wetness(
         topographic_wetness_dst (str): Output TWI grid
         max_cost (float): Maximum cost used to scale and invert the TWI values.
         Defaults to 750.
+        memory (int, optional): Maximum memory usage for GRASS operations.
     """
     raster_specs = Raster.raster_specs(slope_src)
     avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
@@ -721,15 +724,24 @@ def topographic_wetness(
         to_raster(cost, slope_src, cost_path, as_cog=False)
         to_raster(streams, slope_src, streams_path, as_cog=False)
 
+        kwargs = {
+            "input": "cost",
+            "output": "cost_path",
+            "start_raster": "streams",
+        }
+
+        if knights_move:
+            kwargs["flags"] = "k"
+
+        if memory is not None:
+            kwargs["memory"] = memory
+
         with GrassRunner(cost_path) as gr:
             gr.run_command(
                 "r.cost",
                 (cost_path, "cost", "raster"),
                 (streams_path, "streams", "raster"),
-                input="cost",
-                output="cost_path",
-                start_raster="streams",
-                flags="k",
+                **kwargs
             )
             gr.save_raster("cost_path", cost_surface)
 
@@ -888,7 +900,7 @@ class RiparianConnectivity:
         self.streams = streams
         self.flow_accumulation = fa
 
-    def calc_twi(self):
+    def calc_twi(self, memory: int = 4096):
         """Calculate a Topographic Wetness Attribute, which is also used to constrain the
         riparian extent.
         """
@@ -903,7 +915,7 @@ class RiparianConnectivity:
             self.slope = slope_dst
 
         twi_dst = self.raster_path("twi")
-        topographic_wetness(self.streams, self.slope, twi_dst)
+        topographic_wetness(self.streams, self.slope, twi_dst, memory=memory)
         self.twi = twi_dst
 
     def define_region(self, twi_cutoff: float = 745.0):
