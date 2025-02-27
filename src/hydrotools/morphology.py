@@ -694,7 +694,7 @@ def topographic_wetness(
     topographic_wetness_dst: str,
     max_cost: float = 750.0,
     knights_move: bool = True,
-    memory=4096
+    memory=4096,
 ):
     """Calculate a topographic wetness index
 
@@ -741,7 +741,7 @@ def topographic_wetness(
                 "r.cost",
                 (cost_path, "cost", "raster"),
                 (streams_path, "streams", "raster"),
-                **kwargs
+                **kwargs,
             )
             gr.save_raster("cost_path", cost_surface)
 
@@ -958,18 +958,27 @@ class RiparianConnectivity:
             obs_locations_dask, obs_dask, pred_locations_dask
         )
 
-        pred_z = PointInterpolator(
-            np.vstack(obs_locations).T[:, 1:],
-            obs,
-            np.vstack(pred_locations).T[:, 1:],
-        ).idw(int(round(200 / ((self.csx + self.csy) / 2.0))))
-
         nodata = np.finfo("float32").min
-        output = da.full(out_shape[1] * out_shape[2], nodata, "float32")
-        output[np.ravel_multi_index(pred_locations, out_shape)] = pred_z
+        output = np.full(out_shape[1] * out_shape[2], nodata, "float32")
+
+        chunks = list(range(0, pred_locations.shape[0].shape, 10000))
+        for chunk_min, chunk_max in zip(chunks[:-1], chunks[1:]):
+            pred_chunk = (
+                pred_locations[0][chunk_min:chunk_max],
+                pred_locations[1][chunk_min:chunk_max],
+            )
+
+            pred_z = PointInterpolator(
+                np.vstack(obs_locations).T[:, 1:],
+                obs,
+                np.vstack(pred_chunk).T[:, 1:],
+            ).idw(int(round(200 / ((self.csx + self.csy) / 2.0))))
+
+            output[np.ravel_multi_index(pred_chunk, out_shape)] = pred_z
+
         output[np.ravel_multi_index(obs_locations, out_shape)] = obs
 
-        output = output.reshape(out_shape).rechunk(CHUNKS)
+        output = da.from_array(output.reshape(out_shape)).rechunk(CHUNKS)
         output = da.ma.masked_where(output == nodata, output)
 
         to_raster(output, src, dst)
