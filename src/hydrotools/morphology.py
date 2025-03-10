@@ -948,20 +948,20 @@ class RiparianConnectivity:
         self.region = region_dst
 
     def interpolate_into_region(self, src, dst):
-        pred_locations_dask = da.where(~da.ma.getmaskarray(from_raster(self.region)))
-        obs_dask = from_raster(src)
-        out_shape = obs_dask.shape
-        obs_locations_dask = da.where(~da.ma.getmaskarray(obs_dask))
-        obs_dask = da.ma.getdata(obs_dask)[~da.ma.getmaskarray(obs_dask)]
+        obs = from_raster(src).compute()[0]
+        out_shape = obs.shape
+        obs_locations = np.where(~np.ma.getmaskarray(obs))
+        obs = obs[obs_locations]
 
-        obs_locations, obs, pred_locations = da.compute(
-            obs_locations_dask, obs_dask, pred_locations_dask
-        )
+        pred_locations = from_raster(self.region).compute()[0]
+        pred_locations = np.where(~np.ma.getmaskarray(pred_locations))
 
         nodata = np.finfo("float32").min
-        output = np.full(out_shape[1] * out_shape[2], nodata, "float32")
+        output = np.full(out_shape, nodata, "float32")
 
-        chunks = list(range(0, pred_locations.shape[0].shape, 10000))
+        obs_points = np.vstack(obs_locations).T
+
+        chunks = list(range(0, pred_locations[0].shape[0], 10000)) + [pred_locations[0].shape[0]]
         for chunk_min, chunk_max in zip(chunks[:-1], chunks[1:]):
             pred_chunk = (
                 pred_locations[0][chunk_min:chunk_max],
@@ -969,19 +969,20 @@ class RiparianConnectivity:
             )
 
             pred_z = PointInterpolator(
-                np.vstack(obs_locations).T[:, 1:],
+                obs_points,
                 obs,
-                np.vstack(pred_chunk).T[:, 1:],
+                np.vstack(pred_chunk).T,
             ).idw(int(round(200 / ((self.csx + self.csy) / 2.0))))
 
-            output[np.ravel_multi_index(pred_chunk, out_shape)] = pred_z
+            output[pred_chunk] = pred_z
 
-        output[np.ravel_multi_index(obs_locations, out_shape)] = obs
+        output[obs_locations] = obs
 
-        output = da.from_array(output.reshape(out_shape)).rechunk(CHUNKS)
-        output = da.ma.masked_where(output == nodata, output)
+        output_dask = da.from_array(
+            output.reshape((1, out_shape[0], out_shape[1]))
+        ).rechunk(CHUNKS)
 
-        to_raster(output, src, dst)
+        to_raster(da.ma.masked_where(output_dask == nodata, output_dask), src, dst)
 
     def calc_bankfull_width(self, annual_precip_src: str, cutoff: float = 10.0):
         """Calculate a Bankfull Width attribute, which is normalized and  expanded to
