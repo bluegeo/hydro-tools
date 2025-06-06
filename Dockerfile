@@ -13,9 +13,16 @@ RUN apt-get update && apt-get install -y \
     libgif-dev \
     grass \
     grass-doc \
+    grass-dev \
     rasterio
 
-COPY . /hydro-tools
+# Install GRASS Addons
+RUN grass --tmp-location EPSG:4326 --exec g.extension -s extension=r.stream.order operation=add
+
+COPY src/ /hydro-tools/src/
+COPY entrypoint.sh /hydro-tools/entrypoint.sh
+COPY pyproject.toml /hydro-tools/pyproject.toml
+COPY setup.cfg /hydro-tools/setup.cfg
 
 RUN cd /hydro-tools \
     && python3 -m venv hydro-tools \
