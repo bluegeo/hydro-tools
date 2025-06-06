@@ -1,6 +1,6 @@
+from typing import Union, Tuple, Generator, List
 import os
 from shutil import rmtree
-from typing import Union, Tuple, Generator
 from contextlib import contextmanager
 from subprocess import run
 from tempfile import _get_candidate_names
@@ -673,6 +673,47 @@ class Raster:
 
         plt.imshow(a)
         plt.show()
+
+    def data_and_index_iter(
+        self, band=1
+    ) -> Generator[Tuple[list, List[List[int]]], None, None]:
+        """Iterate values and index locations from valid data
+
+        Args:
+            band (int, optional): Band to collect data from. Defaults to 1.
+
+        Returns:
+            (Generator[Tuple[list, List[List[int]]], None, None]): Values and a list
+            of indices.
+        """
+        with rasterio.open(self.src) as rast:
+            for _, window in rast.block_windows(band):
+                a = rast.read(band, window=window)
+
+                i, j = np.where(a != self.nodata)
+
+                yield a[(i, j)].tolist(), [
+                    [i_, j_] for i_, j_ in zip(i + window.row_off, j + window.col_off)
+                ]
+
+    def data_and_index(self, band: int = 1) -> Tuple[list, List[List[int]]]:
+        """Collect values and index locations from valid data
+
+        Args:
+            band (int, optional): Band to collect data from. Defaults to 1.
+
+        Returns:
+            (Tuple[list, List[List[int]]]): Values and index locations in the form
+            [[i, j], ...]
+        """
+        values = []
+        indices = []
+
+        for v, i in self.data_and_index_iter(band):
+            values += v
+            indices += i
+
+        return values, indices
 
 
 def from_raster(src: Union[Raster, str], chunks: tuple = CHUNKS) -> da.Array:

@@ -682,16 +682,16 @@ class PointInterpolator:
     """Utility for custom interpolation"""
 
     def __init__(self, obs: np.ndarray, obs_z: np.ndarray, pred: np.ndarray):
-        self.obs = np.asarray(obs, dtype="float64")
-        self.obs_z = np.asarray(obs_z, dtype="float64")
-        self.pred = np.asarray(pred, dtype="float64")
+        self.obs = np.asarray(obs, dtype="float32")
+        self.obs_z = np.asarray(obs_z, dtype="float32")
+        self.pred = np.asarray(pred, dtype="float32")
 
-        if obs.shape[0] != obs_z.shape[0]:
+        if self.obs.shape[0] != self.obs_z.shape[0]:
             raise ValueError(
                 "Number of observed points and observed values (z) do not match"
             )
 
-        if obs.size == 0:
+        if self.obs.size == 0:
             raise ValueError("At least one observed point required")
 
     def chunks(self, n_chunks: int, return_obs: bool, *args):

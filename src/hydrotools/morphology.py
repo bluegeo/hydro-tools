@@ -948,38 +948,39 @@ class RiparianConnectivity:
         self.region = region_dst
 
     def interpolate_into_region(self, src, dst):
-        obs = from_raster(src).compute()[0]
-        out_shape = obs.shape
-        obs_locations = np.where(~np.ma.getmaskarray(obs))
-        obs = obs[obs_locations]
+        obs_raster = Raster(src)
+        obs, obs_points = Raster(src).data_and_index()
 
-        pred_locations = from_raster(self.region).compute()[0]
-        pred_locations = np.where(~np.ma.getmaskarray(pred_locations))
+        obs_points = np.asarray(obs_points, dtype="float32")
+
+        region_values, pred_points = Raster(self.region).data_and_index()
+
+        del region_values
+
+        pred_points = np.asarray(pred_points, dtype="float32")
+
+        pred_z = PointInterpolator(
+            obs_points,
+            obs,
+            pred_points,
+        ).idw(int(round(200 / ((self.csx + self.csy) / 2.0))))
 
         nodata = np.finfo("float32").min
-        output = np.full(out_shape, nodata, "float32")
+        output = np.full(obs_raster.shape[1:], nodata, "float32")
 
-        obs_points = np.vstack(obs_locations).T
+        pred_points = pred_points.astype("int64")
+        output[(pred_points[:, 0], pred_points[:, 1])] = pred_z
 
-        chunks = list(range(0, pred_locations[0].shape[0], 10000)) + [pred_locations[0].shape[0]]
-        for chunk_min, chunk_max in zip(chunks[:-1], chunks[1:]):
-            pred_chunk = (
-                pred_locations[0][chunk_min:chunk_max],
-                pred_locations[1][chunk_min:chunk_max],
-            )
+        del pred_points, pred_z
 
-            pred_z = PointInterpolator(
-                obs_points,
-                obs,
-                np.vstack(pred_chunk).T,
-            ).idw(int(round(200 / ((self.csx + self.csy) / 2.0))))
+        obs_points = obs_points.astype("int64")
 
-            output[pred_chunk] = pred_z
+        output[(obs_points[:, 0], obs_points[:, 1])] = obs
 
-        output[obs_locations] = obs
+        del obs, obs_points
 
         output_dask = da.from_array(
-            output.reshape((1, out_shape[0], out_shape[1]))
+            output.reshape(obs_raster.shape)
         ).rechunk(CHUNKS)
 
         to_raster(da.ma.masked_where(output_dask == nodata, output_dask), src, dst)

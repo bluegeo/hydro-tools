@@ -234,7 +234,7 @@ def add_grass_extension(extension_name: str):
 
 
 def infer_nodata(
-    a: Union[np.ndarray, da.Array, str, float, int, bool]
+    a: Union[np.ndarray, da.Array, str, float, int, bool],
 ) -> Union[float, int, bool]:
     """Collect a nodata value based on a dataset's data type
 
