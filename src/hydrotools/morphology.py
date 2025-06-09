@@ -313,92 +313,92 @@ def bankfull_width_geometric(
         else:
             lcp_path = input_lcp
 
-            region = from_raster(lcp_path) < max_cost
+        region = from_raster(lcp_path) < max_cost
 
-            # Find the edges
-            eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
-            edges = region & ~eroded
+        # Find the edges
+        eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
+        edges = region & ~eroded
 
-            if method == "growfill":
-                # Distance transform to edges
-                to_raster(edges, slope, edges_src, as_cog=False)
+        if method == "growfill":
+            # Distance transform to edges
+            to_raster(edges, slope, edges_src, as_cog=False)
 
-                distance_transform(edges_src, dt_from_edges_src)
+            distance_transform(edges_src, dt_from_edges_src)
 
-                dfe = from_raster(dt_from_edges_src)
+            dfe = from_raster(dt_from_edges_src)
 
-                dfe = da.ma.filled(da.where(region, dfe, -1), -1).compute()[0, ...]
+            dfe = da.ma.filled(da.where(region, dfe, -1), -1).compute()[0, ...]
 
-                dfe_order = np.unravel_index(np.argsort(dfe.ravel())[::-1], dfe.shape)
+            dfe_order = np.unravel_index(np.argsort(dfe.ravel())[::-1], dfe.shape)
 
-                width = filled_dfe(
-                    da.ma.filled(edges, False).compute()[0, ...],
-                    dfe,
-                    np.array(dfe_order).T,
-                    avg_cs,
-                )
+            width = filled_dfe(
+                da.ma.filled(edges, False).compute()[0, ...],
+                dfe,
+                np.array(dfe_order).T,
+                avg_cs,
+            )
 
-                width = da.from_array(width.reshape(edges.shape), chunks=edges.chunks)
-                width = da.ma.masked_where(width == 0, width)
+            width = da.from_array(width.reshape(edges.shape), chunks=edges.chunks)
+            width = da.ma.masked_where(width == 0, width)
 
-                to_raster(
-                    width,
-                    lcp_path,
-                    bankfull_dst,
-                )
-            elif method == "balltree":
-                # Accumulate the distance to edges along streams
-                edge_points = np.array(da.where(edges[0])).T.astype("float32")
-                edge_points[:, 0] *= raster_specs["csy"]
-                edge_points[:, 1] *= raster_specs["csx"]
+            to_raster(
+                width,
+                lcp_path,
+                bankfull_dst,
+            )
+        elif method == "balltree":
+            # Accumulate the distance to edges along streams
+            edge_points = np.array(da.where(edges[0])).T.astype("float32")
+            edge_points[:, 0] *= raster_specs["csy"]
+            edge_points[:, 1] *= raster_specs["csx"]
 
-                stream_mask = ~da.ma.getmaskarray(from_raster(streams))
+            stream_mask = ~da.ma.getmaskarray(from_raster(streams))
 
-                stream_inds = np.array(da.where(stream_mask[0])).T
-                stream_points = stream_inds.astype("float32")
-                stream_points[:, 0] *= raster_specs["csy"]
-                stream_points[:, 1] *= raster_specs["csx"]
+            stream_inds = np.array(da.where(stream_mask[0])).T
+            stream_points = stream_inds.astype("float32")
+            stream_points[:, 0] *= raster_specs["csy"]
+            stream_points[:, 1] *= raster_specs["csx"]
 
-                bt = BallTree(stream_points)
-                distances, indices = map(lambda x: x.ravel(), bt.query(edge_points, 1))
+            bt = BallTree(stream_points)
+            distances, indices = map(lambda x: x.ravel(), bt.query(edge_points, 1))
 
-                bins = np.bincount(indices, distances)
-                indices, counts = np.unique(indices, return_counts=True)
-                # Distance is the average of distance to surrounding banks * 2 to account for
-                # the entire valley width.
-                distances = (bins[indices] / counts) * 2
+            bins = np.bincount(indices, distances)
+            indices, counts = np.unique(indices, return_counts=True)
+            # Distance is the average of distance to surrounding banks * 2 to account for
+            # the entire valley width.
+            distances = (bins[indices] / counts) * 2
 
-                # Assign widths to output streams
-                locations = np.ravel_multi_index(
-                    (stream_inds[indices][:, 0], stream_inds[indices][:, 1]),
-                    stream_mask.shape[1:],
-                )
+            # Assign widths to output streams
+            locations = np.ravel_multi_index(
+                (stream_inds[indices][:, 0], stream_inds[indices][:, 1]),
+                stream_mask.shape[1:],
+            )
 
-                bfw = da.zeros(
-                    stream_mask.shape, dtype="float32", chunks=stream_mask.chunks
-                ).ravel()
-                bfw[locations] = distances
-                bfw = bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks)
-                bfw = da.ma.masked_equal(bfw, 0)
+            bfw = da.zeros(
+                stream_mask.shape, dtype="float32", chunks=stream_mask.chunks
+            ).ravel()
+            bfw[locations] = distances
+            bfw = bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks)
+            bfw = da.ma.masked_equal(bfw, 0)
 
-                # Interpolate where streams are missing values
-                points = np.array(da.where(bfw[0])).T
-                values = bfw[~da.ma.getmaskarray(bfw)].compute()
-                xi = np.array(da.where((da.ma.getmaskarray(bfw) & stream_mask)[0])).T
+            # Interpolate where streams are missing values
+            points = np.array(da.where(bfw[0])).T
+            values = bfw[~da.ma.getmaskarray(bfw)].compute()
+            xi = np.array(da.where((da.ma.getmaskarray(bfw) & stream_mask)[0])).T
 
-                locations = np.ravel_multi_index(
-                    (xi[:, 0], xi[:, 1]),
-                    stream_mask.shape[1:],
-                )
-                bfw = bfw.ravel()
-                avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
-                bfw[locations] = griddata(points, values, xi, fill_value=avg_cs)
+            locations = np.ravel_multi_index(
+                (xi[:, 0], xi[:, 1]),
+                stream_mask.shape[1:],
+            )
+            bfw = bfw.ravel()
+            avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
+            bfw[locations] = griddata(points, values, xi, fill_value=avg_cs)
 
-                to_raster(
-                    bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks),
-                    lcp_path,
-                    bankfull_dst,
-                )
+            to_raster(
+                bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks),
+                lcp_path,
+                bankfull_dst,
+            )
 
 
 def valley_width(
