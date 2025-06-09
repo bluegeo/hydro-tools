@@ -410,7 +410,9 @@ def valley_width(
     memory: int = None,
 ):
     """Mirror of bankfull_width_geometric"""
-    return bankfull_width_geometric(streams, slope, dst, lcp_dst, max_cost, memory)
+    return bankfull_width_geometric(
+        streams, slope, dst, lcp_dst=lcp_dst, max_cost=max_cost, memory=memory
+    )
 
 
 def bankfull_width(
@@ -979,9 +981,7 @@ class RiparianConnectivity:
 
         del obs, obs_points
 
-        output_dask = da.from_array(
-            output.reshape(obs_raster.shape)
-        ).rechunk(CHUNKS)
+        output_dask = da.from_array(output.reshape(obs_raster.shape)).rechunk(CHUNKS)
 
         to_raster(da.ma.masked_where(output_dask == nodata, output_dask), src, dst)
 
