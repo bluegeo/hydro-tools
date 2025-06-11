@@ -108,21 +108,30 @@ def warp_like(
     kwargs:
         Override any parameters compatible with `warp`
     """
-    rs = Raster(template)
+    if isinstance(source, str):
+        rs_dtype = Raster(source).dtype
+    else:
+        # Most common data type
+        dtypes, counts = np.unique(
+            [Raster(s).dtype for s in source], return_counts=True
+        )
+        rs_dtype = dtypes[np.argmax(counts)]
+
+    rt = Raster(template)
 
     warp(
         source,
         destination,
         (
-            kwargs.get("left", rs.left),
-            kwargs.get("bottom", rs.bottom),
-            kwargs.get("right", rs.right),
-            kwargs.get("top", rs.top),
+            kwargs.get("left", rt.left),
+            kwargs.get("bottom", rt.bottom),
+            kwargs.get("right", rt.right),
+            kwargs.get("top", rt.top),
         ),
-        kwargs.get("csx", rs.csx),
-        kwargs.get("csy", rs.csy),
-        rs.wkt,
-        kwargs.get("dtype", rs.dtype),
+        kwargs.get("csx", rt.csx),
+        kwargs.get("csy", rt.csy),
+        rt.wkt,
+        kwargs.get("dtype", rs_dtype),
         resample_method,
         additional_args=kwargs.get("additional_args", []),
         as_cog=as_cog,
