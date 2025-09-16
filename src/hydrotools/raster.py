@@ -61,8 +61,6 @@ def warp(
         + ([] if t_srs is None else ["-t_srs", t_srs])
         + [
             "-multi",
-            "-wo",
-            "NUM_THREADS=ALL_CPUS",
             "-r",
             resample_method,
             "-ot",

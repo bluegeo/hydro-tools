@@ -420,9 +420,9 @@ def bankfull_width(
     accumulation: str,
     precip: str,
     bankfull: str,
-    bw_coeff: float = 0.196,
-    a_exp: float = 0.280,
-    p_exp: float = 0.355,
+    bw_coeff: float = 0.042,
+    a_exp: float = 0.48,
+    p_exp: float = 0.74,
 ):
     """Estimate bankfull width with empirically-derived constants using:
 

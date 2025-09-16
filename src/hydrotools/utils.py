@@ -14,6 +14,7 @@ from scipy.ndimage import distance_transform_edt
 # Implicitly becomes available after importing grass_session
 from grass.script import core as grass  # noqa
 from grass.pygrass.modules.shortcuts import raster as graster  # noqa
+from grass.script import array as garray  # noqa
 
 from hydrotools.config import TMP_DIR, GRASS_TMP, GRASS_FLAGS, COG_ARGS
 
@@ -359,3 +360,8 @@ def kernel_from_distance(distance: float, csx: float, csy: float) -> np.ndarray:
     dt = distance_transform_edt(kernel, (csy, csx))
 
     return dt <= distance
+
+
+from subprocess import run
+
+run("git clone https://github.com/bluegeo/fast-watershed.git")
