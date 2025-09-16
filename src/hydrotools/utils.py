@@ -360,8 +360,3 @@ def kernel_from_distance(distance: float, csx: float, csy: float) -> np.ndarray:
     dt = distance_transform_edt(kernel, (csy, csx))
 
     return dt <= distance
-
-
-from subprocess import run
-
-run("git clone https://github.com/bluegeo/fast-watershed.git")
