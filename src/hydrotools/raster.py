@@ -303,7 +303,7 @@ def vectorize(
             cmd = ["gdal_polygonize.py", "-8", raster_source, destination]
             run(cmd, check=True)
     elif geometry == "point":
-        extensions = [".csv", ".geojsond.json"]
+        extensions = [".csv", ".geojsonl", ".ndjson", ".jsonl"]
 
         if not any([destination.lower().endswith(ext) for ext in extensions]):
             raise ValueError("Only .geojsond.json and .csv files supported")
