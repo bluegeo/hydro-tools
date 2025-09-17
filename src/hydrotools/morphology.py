@@ -1,5 +1,5 @@
 import os
-from typing import Union
+from typing import Union, Optional
 from collections import OrderedDict
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
@@ -30,7 +30,7 @@ from hydrotools.utils import (
     kernel_from_distance,
     compare_projections,
 )
-from hydrotools.watershed import extract_streams, flow_direction_accumulation
+from hydrotools.watershed import WatershedIndex, extract_streams, flow_direction_accumulation
 from hydrotools.elevation import slope
 from hydrotools.interpolate import (
     raster_filter,
@@ -368,34 +368,25 @@ def bankfull_width_geometric(
             # the entire valley width.
             distances = (bins[indices] / counts) * 2
 
-            # Assign widths to output streams
-            locations = np.ravel_multi_index(
-                (stream_inds[indices][:, 0], stream_inds[indices][:, 1]),
-                stream_mask.shape[1:],
-            )
-
-            bfw = da.zeros(
-                stream_mask.shape, dtype="float32", chunks=stream_mask.chunks
-            ).ravel()
-            bfw[locations] = distances
-            bfw = bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks)
-            bfw = da.ma.masked_equal(bfw, 0)
+            bfw = np.full(stream_mask.shape[1:], -1, np.float32)
+            bfw[(stream_inds[indices][:, 0], stream_inds[indices][:, 1])] = distances
+            avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
+            bfw[bfw == 0] = avg_cs
 
             # Interpolate where streams are missing values
-            points = np.array(da.where(bfw[0])).T
-            values = bfw[~da.ma.getmaskarray(bfw)].compute()
-            xi = np.array(da.where((da.ma.getmaskarray(bfw) & stream_mask)[0])).T
+            valid_bfw = bfw != -1
+            points = np.array(np.where(valid_bfw)).T
+            values = bfw[valid_bfw]
+            xi = np.array(np.where(~valid_bfw & stream_mask.compute()[0])).T
 
-            locations = np.ravel_multi_index(
-                (xi[:, 0], xi[:, 1]),
-                stream_mask.shape[1:],
-            )
-            bfw = bfw.ravel()
-            avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
-            bfw[locations] = griddata(points, values, xi, fill_value=avg_cs)
+            bfw[(xi[:, 0], xi[:, 1])] = griddata(points, values, xi, fill_value=avg_cs)
+
+            out_dask = da.from_array(
+                bfw.reshape(stream_mask.shape)
+            ).rechunk(stream_mask.chunks)
 
             to_raster(
-                bfw.reshape(stream_mask.shape).rechunk(stream_mask.chunks),
+                da.ma.masked_where(out_dask == -1, out_dask),
                 lcp_path,
                 bankfull_dst,
             )
@@ -423,6 +414,10 @@ def bankfull_width(
     bw_coeff: float = 0.042,
     a_exp: float = 0.48,
     p_exp: float = 0.74,
+    precip_approx: bool = True,
+    flow_direction: Optional[str] = None,
+    watershed_index_dst: Optional[str] = None,
+    watershed_index_src: Optional[str] = None
 ):
     """Estimate bankfull width with empirically-derived constants using:
 
@@ -486,6 +481,39 @@ def bankfull_width(
 
     # Convert precipitation to cm
     precip_cm = from_raster(precip).astype("float32") / 10
+
+    if not precip_approx:
+        with TemporaryDirectory() as tmp_dir:
+            # Calculate mean precip over all contributing areas
+            if watershed_index_src is not None:
+                wi = WatershedIndex(watershed_index_src)
+            else:
+                if watershed_index_dst is not None:
+                    index_file = watershed_index_dst
+                else:
+                    index_file = os.path.join(tmp_dir, "ws_index.idx")
+
+                wi = WatershedIndex.create_index(flow_direction, accumulation, index_file)
+
+            precip_dst = os.path.join(tmp_dir, "precip.tif")
+            to_raster(precip_cm, precip, precip_dst)
+
+            precip_mean_dst = os.path.join(tmp_dir, "precip_mean.gpkg")
+            wi.calculate_stats(precip_dst, precip_mean_dst)
+
+            # Convert the points back into a raster
+            with fiona.open(precip_mean_dst) as layer:
+                points = np.array(
+                    [(feat["geometry"]["coordinates"][0], feat["geometry"]["coordinates"][1], feat["properties"]["mean"]) for feat in layer]
+                )
+
+            a = np.zeros(precip_cm.shape[1:], dtype="float32")
+
+            i = (((ca_specs.top - (ca_specs.csy / 2)) - points[:, 1]) / ca_specs.csy).astype("int32")
+            j = ((points[:, 0] - (ca_specs.left + (ca_specs.csx / 2))) / ca_specs.csx).astype("int32")
+            a[(i, j)] = points[:, 2]
+
+            precip_cm = da.from_array(a).reshape(precip_cm.shape).rechunk(CHUNKS)
 
     bankfull_width = bw_coeff * (contrib_area**a_exp) * (precip_cm**p_exp)
 
