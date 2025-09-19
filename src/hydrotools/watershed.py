@@ -354,7 +354,7 @@ class WatershedIndex:
     Returned stats include "min", "max", "sum", and "mean"
     """
 
-    def __init__(self, idx_path: str, idx=None):
+    def __init__(self, idx_path: str):
         """Load an existing index from a path
 
         Args:
@@ -370,27 +370,7 @@ class WatershedIndex:
             header_len = int.from_bytes(f.read(8), "big")
             self.__dict__.update(pickle.loads(f.read(header_len)))
 
-        self.inmem_idx = idx
-
-    @staticmethod
-    def save(path, domain, idx):
-        """Save the index and parameters to a file
-
-        Args:
-            path (str): Path of the output file
-            domain (dict): Specifications of the index domain
-            (read from the accumulation dataset)
-            idx (list): Index tree (nested lists)
-        """
-        with open(path, "wb") as f:
-            header = pickle.dumps(domain)
-            header_len = len(header)
-            seek_bytes = header_len.to_bytes(8, "big")
-
-            f.write(seek_bytes)
-            f.write(header)
-            for ws in idx:
-                f.write(gzip.compress(pickle.dumps(ws)))
+        self.inmem_idx = None
 
     @property
     def idx(self) -> list:
@@ -610,18 +590,25 @@ class WatershedIndex:
 
             return ci, [[j for j in i if j != -1] for i in ni]
 
-        # Run the alg
-        coord = next_ws()
-        watersheds = []
-        while coord is not None:
-            i, j = coord
-            ci, ni = delineate(fd, streams, i, j, visited)
-            watersheds.append((ci, ni))
+        with open(index_path, "wb") as f:
+            header = pickle.dumps(domain_spec)
+            header_len = len(header)
+            seek_bytes = header_len.to_bytes(8, "big")
+
+            f.write(seek_bytes)
+            f.write(header)
+
+            # Run the alg
             coord = next_ws()
+            while coord is not None:
+                i, j = coord
+                ci, ni = delineate(fd, streams, i, j, visited)
 
-        cls.save(index_path, domain_spec, watersheds)
+                f.write(gzip.compress(pickle.dumps((ci, ni))))
 
-        return cls(index_path, idx=watersheds)
+                coord = next_ws()
+
+        return cls(index_path)
 
     def save_locations(
         self, dst: str, data: dict = None, output_crs: Union[str, int] = None
