@@ -389,11 +389,12 @@ class WatershedIndex:
 
             f.write(seek_bytes)
             f.write(header)
-            f.write(gzip.compress(pickle.dumps(idx)))
+            for ws in idx:
+                f.write(gzip.compress(pickle.dumps(ws)))
 
     @property
     def idx(self) -> list:
-        """Load the index from the initialization file
+        """Load the entire index from the initialization file into memory
 
         Returns:
             list: Watershed index graph of nested lists
@@ -404,11 +405,31 @@ class WatershedIndex:
         with open(self.path, "rb") as f:
             header_len = int.from_bytes(f.read(8), "big")
             f.seek(header_len + 8)
-            idx = pickle.loads(gzip.decompress(f.read()))
+            self.inmem_idx = []
+            while True:
+                try:
+                    ws = pickle.loads(gzip.decompress(f.read()))
+                    self.inmem_idx.append(ws)
+                except EOFError:
+                    break
 
-            self.inmem_idx = idx
+        return self.inmem_idx
+    
+    def __iter__(self):
+        """Iterate over each watershed in the index
 
-        return idx
+        Yields:
+            tuple: A tuple of (contributing_index, nested_index) for each watershed
+        """
+        with open(self.path, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "big")
+            f.seek(header_len + 8)
+            while True:
+                try:
+                    ws = pickle.loads(gzip.decompress(f.read()))
+                    yield ws
+                except EOFError:
+                    break
 
     @classmethod
     def index_from_dem(
@@ -616,7 +637,7 @@ class WatershedIndex:
         points = []
         networks = []
         network_id = 0
-        for coords, _ in self.idx:
+        for coords, _ in self:
             networks += [network_id] * len(coords)
             network_id += 1
             y, x = indices_to_coords(
@@ -765,7 +786,7 @@ class WatershedIndex:
                 val if val != np.finfo("float32").max else None for val in res.tolist()
             ]
 
-        for ci, ni in self.idx:
+        for ci, ni in self:
             _min, _max, _sum, _mean = summarize((ci, ni))
             stat_output["min"] += map_results(_min)
             stat_output["max"] += map_results(_max)
