@@ -386,12 +386,8 @@ class WatershedIndex:
             header_len = int.from_bytes(f.read(8), "big")
             f.seek(header_len + 8)
             self.inmem_idx = []
-            while True:
-                try:
-                    ws = pickle.loads(gzip.decompress(f.read()))
-                    self.inmem_idx.append(ws)
-                except EOFError:
-                    break
+            for ws_blob in f:
+                self.inmem_idx.append(pickle.loads(gzip.decompress(ws_blob)))
 
         return self.inmem_idx
     
@@ -404,12 +400,8 @@ class WatershedIndex:
         with open(self.path, "rb") as f:
             header_len = int.from_bytes(f.read(8), "big")
             f.seek(header_len + 8)
-            while True:
-                try:
-                    ws = pickle.loads(gzip.decompress(f.read()))
-                    yield ws
-                except EOFError:
-                    break
+            for ws_blob in f:
+                yield pickle.loads(gzip.decompress(ws_blob))
 
     @classmethod
     def index_from_dem(
@@ -604,7 +596,7 @@ class WatershedIndex:
                 i, j = coord
                 ci, ni = delineate(fd, streams, i, j, visited)
 
-                f.write(gzip.compress(pickle.dumps((ci, ni))))
+                f.write(gzip.compress(pickle.dumps((ci, ni))) + b"\n")
 
                 coord = next_ws()
 
