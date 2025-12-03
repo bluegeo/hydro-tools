@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from copy import deepcopy
+import json
 import os
 import pickle
 import gzip
@@ -18,7 +19,7 @@ from hydrotools.utils import (
     transform_points,
     proj4_string,
 )
-from hydrotools.raster import Raster, from_raster, TempRasterFile, vectorize
+from hydrotools.raster import Raster, from_raster, to_raster, TempRasterFile, vectorize
 
 
 def condition_dem(dem: str, dem_cnd_dst: str):
@@ -330,6 +331,97 @@ def basin(flow_direction: str, x: float, y: float, dst: str):
             vectorize(tmp_rast, dst, smooth_corners=True)
 
 
+class FlowAccumulation:
+    """
+    Use the GRASS method r.flowaccumulation to summarize sums
+    and means of raster parameters.
+
+    NOTE: This requires the r.flowaccumulation GRASS addon
+    """
+
+    def __init__(self, direction: str):
+        """Initialize a FlowAccumulation analysis
+
+        Args:
+            direction (str): Path to a flow direction raster generated using r.stream.extract
+        """
+        self.direction = direction
+
+        self.wkdir = TemporaryDirectory()
+
+        self._modals = None
+
+    @property
+    def modals(self):
+        if self._modals is None:
+            self._modals = os.path.join(self.wkdir.name, "modals.tif")
+            with GrassRunner(self.direction) as gr:
+                gr.run_command(
+                    "r.flowaccumulation",
+                    (self.direction, "direction", "raster"),
+                    input="direction",
+                    output="modals",
+                    type="FCELL",
+                )
+                gr.save_raster("modals", self._modals, as_cog=False)
+
+        return self._modals
+
+    def calculate(self, raster_source: str, dst: str, method: str = "sum"):
+        """Calculate flow accumulation statistics
+
+        Args:
+            raster_source (str): Path to a raster dataset to calculate stats on
+            dst (str): Path to save the output geopackage
+        """
+        # Ensure the raster_source aligns with the input grids
+        if not Raster(raster_source).matches(self.direction):
+            raise ValueError("Input raster does not align with direction grid")
+
+        # Accumulate
+        sum_result = (
+            dst if method == "sum" else os.path.join(self.wkdir.name, "sum_result.tif")
+        )
+        with GrassRunner(self.direction) as gr:
+            gr.run_command(
+                "r.flowaccumulation",
+                (self.direction, "direction", "raster"),
+                (raster_source, "source", "raster"),
+                input="direction",
+                weight="source",
+                output="sum_result",
+                type="DCELL",
+            )
+            gr.save_raster("sum_result", sum_result, as_cog=True)
+
+        if method == "mean":
+            modals = from_raster(self.modals)
+            avg = da.ma.masked_where(
+                modals == 0, from_raster(sum_result) / modals
+            ).astype("float32")
+
+            to_raster(avg, self.direction, dst)
+
+    def contributing_area(self, dst: str):
+        """Save the general contributing area raster in km**2
+
+        Args:
+            dst (str): Path to the contributing area raster
+        """
+        r = Raster(self.modals)
+        ca = (from_raster(self.modals) * r.csx * r.csy) / 1e6
+
+        to_raster(
+            da.ma.masked_where(ca == 0, ca),
+            self.direction,
+            dst,
+        )
+
+    def __del__(self):
+        """Clean up temporary working directory"""
+        self.wkdir.cleanup()
+
+
 class WatershedIndex:
     """
     Build and cache an index of all contributing cells to every location on  a stream grid
@@ -365,10 +457,9 @@ class WatershedIndex:
         """
         self.path = idx_path
 
-        with open(idx_path, "rb") as f:
+        with gzip.open(idx_path, "rb") as f:
             # Initialize from the header
-            header_len = int.from_bytes(f.read(8), "big")
-            self.__dict__.update(pickle.loads(f.read(header_len)))
+            self.__dict__.update(pickle.load(f))
 
         self.inmem_idx = None
 
@@ -382,26 +473,36 @@ class WatershedIndex:
         if self.inmem_idx is not None:
             return self.inmem_idx
 
-        with open(self.path, "rb") as f:
-            header_len = int.from_bytes(f.read(8), "big")
-            f.seek(header_len + 8)
+        with gzip.open(self.path, "rb") as f:
+            # Seek past the header
+            _ = pickle.load(f)
             self.inmem_idx = []
-            for ws_blob in f:
-                self.inmem_idx.append(pickle.loads(gzip.decompress(ws_blob)))
+
+            while True:
+                try:
+                    self.inmem_idx.append(pickle.load(f))
+                except EOFError:
+                    break
 
         return self.inmem_idx
-    
+
     def __iter__(self):
         """Iterate over each watershed in the index
 
         Yields:
             tuple: A tuple of (contributing_index, nested_index) for each watershed
         """
-        with open(self.path, "rb") as f:
-            header_len = int.from_bytes(f.read(8), "big")
-            f.seek(header_len + 8)
-            for ws_blob in f:
-                yield pickle.loads(gzip.decompress(ws_blob))
+        with gzip.open(self.path, "rb") as f:
+            # Seek past the header
+            _ = pickle.load(f)
+
+            while True:
+                try:
+                    ws = pickle.load(f)
+                except EOFError:
+                    break
+
+                yield ws
 
     @classmethod
     def index_from_dem(
@@ -523,6 +624,7 @@ class WatershedIndex:
 
         @njit
         def delineate(fd, streams, i, j, visited):
+            # i: 22980, j: 16240
             directions = [[7, 6, 5], [8, 0, 4], [1, 2, 3]]
 
             # Elements contributing to each coordinate - the first element is always on the stream
@@ -537,68 +639,76 @@ class WatershedIndex:
 
             cursor = 0
             while True:
-                # Collect a new element to test
+                # print("Collect a new element to test")
                 if ci_e[cursor] < len(ci[cursor]):
                     i, j = ci[cursor][ci_e[cursor]]
                     ci_e[cursor] += 1
                 else:
-                    # Backtrack or break out of the algo
+                    # print("Backtrack or break out of the algo")
                     cursor -= 1
                     if cursor < 0:
                         break
                     continue
 
-                # Test the current element at location (i, j)
+                # print("Test the current element at location (i, j)")
                 stream_elems = []
                 for row_offset in range(-1, 2):
                     for col_offset in range(-1, 2):
                         t_i, t_j = i + row_offset, j + col_offset
 
+                        if (
+                            t_i < 0
+                            or t_i >= fd.shape[0]
+                            or t_j < 0
+                            or t_j >= fd.shape[1]
+                        ):
+                            continue
+
                         if visited[t_i, t_j]:
                             continue
 
-                        # Check if the element at this offset contributes to the element being tested
+                        # print("Check if the element at this offset contributes to the element being tested")
                         if fd[t_i, t_j] == directions[row_offset + 1][col_offset + 1]:
-                            # This element has now been visited
+                            # print("This element has now been visited")
                             visited[t_i, t_j] = True
 
                             if streams[t_i, t_j]:
-                                # This element comprises a stream - add as a nested element
+                                # print("This element comprises a stream - add as a nested element")
                                 stream_elems.append((t_i, t_j))
                             else:
-                                # Add to contributing stack, and the testing queue
+                                # print("Add to contributing stack, and the testing queue")
                                 ci[cursor].append((t_i, t_j))
 
-                # Add nested locations and propagate past any stream elements
+                # print(" Add nested locations and propagate past any stream elements")
                 this_index = cursor
                 for se in stream_elems:
-                    # Add nested to current
+                    # print("Add nested to current")
                     cursor = len(ci_e)
                     ni[this_index].append(cursor)
-                    # New list item
+                    # print("New list item")
                     ci.append([se])
                     ci_e.append(0)
                     ni.append([-1])
 
             return ci, [[j for j in i if j != -1] for i in ni]
 
-        with open(index_path, "wb") as f:
-            header = pickle.dumps(domain_spec)
-            header_len = len(header)
-            seek_bytes = header_len.to_bytes(8, "big")
-
-            f.write(seek_bytes)
-            f.write(header)
+        with gzip.open(index_path, "wb") as f:
+            pickle.dump(domain_spec, f)
 
             # Run the alg
             coord = next_ws()
+            watershed_cnt = 0
             while coord is not None:
+                watershed_cnt += 1
                 i, j = coord
+
                 ci, ni = delineate(fd, streams, i, j, visited)
 
-                f.write(gzip.compress(pickle.dumps((ci, ni))) + b"\n")
+                pickle.dump((ci, ni), f)
 
                 coord = next_ws()
+
+        print(f"Index at {index_path} created")
 
         return cls(index_path)
 
@@ -686,11 +796,13 @@ class WatershedIndex:
             output_crs (Union[int, str]): Output coordinate reference system for points.
             Defaults to None, whereby the domain CRS will be used.
         """
+        print(f"Calculating stats for {os.path.basename(raster_source)}")
+
         src = Raster(raster_source)
 
         if any(
             [
-                src.shape != self.shape,
+                tuple(src.shape) != tuple(self.shape),
                 not np.isclose(src.top, self.top),
                 not np.isclose(src.left, self.left),
             ]
@@ -771,6 +883,8 @@ class WatershedIndex:
             stat_output["max"] += map_results(_max)
             stat_output["sum"] += map_results(_sum)
             stat_output["mean"] += map_results(_mean)
+
+        print(f"Saving stat results to {os.path.basename(destination)}")
 
         self.save_locations(
             destination, data=stat_output, output_crs=kwargs.get("output_crs", None)

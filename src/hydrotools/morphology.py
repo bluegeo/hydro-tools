@@ -30,7 +30,12 @@ from hydrotools.utils import (
     kernel_from_distance,
     compare_projections,
 )
-from hydrotools.watershed import WatershedIndex, extract_streams, flow_direction_accumulation
+from hydrotools.watershed import (
+    WatershedIndex,
+    extract_streams,
+    flow_direction_accumulation,
+    FlowAccumulation,
+)
 from hydrotools.elevation import slope
 from hydrotools.interpolate import (
     raster_filter,
@@ -381,9 +386,9 @@ def bankfull_width_geometric(
 
             bfw[(xi[:, 0], xi[:, 1])] = griddata(points, values, xi, fill_value=avg_cs)
 
-            out_dask = da.from_array(
-                bfw.reshape(stream_mask.shape)
-            ).rechunk(stream_mask.chunks)
+            out_dask = da.from_array(bfw.reshape(stream_mask.shape)).rechunk(
+                stream_mask.chunks
+            )
 
             to_raster(
                 da.ma.masked_where(out_dask == -1, out_dask),
@@ -408,16 +413,12 @@ def valley_width(
 
 def bankfull_width(
     streams: str,
-    accumulation: str,
+    flow_direction: str,
     precip: str,
-    bankfull: str,
+    dst: str,
     bw_coeff: float = 0.042,
     a_exp: float = 0.48,
     p_exp: float = 0.74,
-    precip_approx: bool = True,
-    flow_direction: Optional[str] = None,
-    watershed_index_dst: Optional[str] = None,
-    watershed_index_src: Optional[str] = None
 ):
     """Estimate bankfull width with empirically-derived constants using:
 
@@ -432,28 +433,27 @@ def bankfull_width(
 
     Note, ensure the spatial reference of the rasters is a projected system in metres.
 
-    An example workflow that starts with a DEM and uses streams with a minumum
+    An example workflow that starts with a DEM and uses streams with a minimum
     contributing area could look like this:
 
     ```python
     with TempRasterFile() as tmp_flow_direction:
-        # Compute flow accumulation. The resulting flow direction is not needed here
+        # Extract streams
         flow_direction_accumulation(
             dem_path,
             tmp_flow_direction,
-            accumulation_dst,
-            False,  # Multiple flow-direction
-            False,  # Allow negatives
+            accumulation_dst
         )
 
-        # Compute streams with a minimum length of 0 while saving flow direction
+        # Calculate flow direction and streams (example uses a 1km2 threshold)
         extract_streams(
             dem_path, accumulation_dst, stream_dst, flow_direction_dst, 1e6, 0
         )
 
+        # Calculate bankfull width
         bankfull_width(
             stream_dst,
-            accumulation_dst,
+            flow_direction_dst,
             avg_annual_precip,
             bankfull_dst,
         )
@@ -462,68 +462,33 @@ def bankfull_width(
     Args:
         streams: Grid with stream locations
         (generated using `watershed.extract_streams`),
-        accumulation (str): Flow accumulation dataset
-        (generated using `watershed.flow_direction_accumulation`)
+        direction: Grid with flow direction
+        (generated using `watershed.extract_streams`),
         precip (str): Mean annual precipitation grid in mm
-        bankfull (str): Destination raster for bankfull grid
-        streams (Union[str, None], optional): Input streams raster. Defaults to None.
+        dst (str): Destination raster for bankfull grid
         bw_coeff (float): Bankfull width coefficient. Defaults to 0.196.
         a_exp (float): Area expenential scale. Defaults to 0.280.
         p_exp (float): Precip expenential scale. Defaults to 0.355.
     """
-    # Contributing area in km**2
-    ca_specs = Raster(accumulation)
-    fa = from_raster(accumulation)
-    contrib_area = da.ma.masked_where(
-        da.ma.getmaskarray(from_raster(streams)),
-        da.abs(fa.astype("float32")) * ((ca_specs.csx * ca_specs.csy) / 1e6),
-    )
+    # Calculate contributing area and mean annual precip
+    with TempRasterFiles(2) as (ca, mean_precip):
+        fd = FlowAccumulation(flow_direction)
+        fd.contributing_area(ca)
+        fd.calculate(precip, mean_precip, "mean")
 
-    # Convert precipitation to cm
-    precip_cm = from_raster(precip).astype("float32") / 10
+        precip_a = from_raster(mean_precip) / 10  # mm -> cm
+        ca_a = from_raster(ca)
 
-    if not precip_approx:
-        with TemporaryDirectory() as tmp_dir:
-            # Calculate mean precip over all contributing areas
-            if watershed_index_src is not None:
-                wi = WatershedIndex(watershed_index_src)
-            else:
-                if watershed_index_dst is not None:
-                    index_file = watershed_index_dst
-                else:
-                    index_file = os.path.join(tmp_dir, "ws_index.idx")
+        bankfull_width = bw_coeff * (ca_a**a_exp) * (precip_a**p_exp)
 
-                wi = WatershedIndex.create_index(flow_direction, accumulation, index_file)
+        # Isolate streams
+        streams_a = from_raster(streams)
 
-            precip_dst = os.path.join(tmp_dir, "precip.tif")
-            to_raster(precip_cm, precip, precip_dst)
-
-            precip_mean_dst = os.path.join(tmp_dir, "precip_mean.gpkg")
-            wi.calculate_stats(precip_dst, precip_mean_dst)
-
-            # Convert the points back into a raster
-            with fiona.open(precip_mean_dst) as layer:
-                points = np.array(
-                    [(feat["geometry"]["coordinates"][0], feat["geometry"]["coordinates"][1], feat["properties"]["mean"]) for feat in layer]
-                )
-
-            a = np.zeros(precip_cm.shape[1:], dtype="float32")
-
-            i = (((ca_specs.top - (ca_specs.csy / 2)) - points[:, 1]) / ca_specs.csy).astype("int32")
-            j = ((points[:, 0] - (ca_specs.left + (ca_specs.csx / 2))) / ca_specs.csx).astype("int32")
-            a[(i, j)] = points[:, 2]
-
-            precip_cm = da.from_array(a).reshape(precip_cm.shape).rechunk(CHUNKS)
-
-    bankfull_width = bw_coeff * (contrib_area**a_exp) * (precip_cm**p_exp)
-
-    to_raster(
-        da.ma.masked_where(
-            da.isinf(bankfull_width) | da.isnan(bankfull_width), bankfull_width
-        ),
-        accumulation,
-        bankfull,
-    )
+        to_raster(
+            da.ma.masked_where(da.ma.getmaskarray(streams_a), bankfull_width),
+            streams,
+            dst,
+        )
 
 
 def bankfull_depth(

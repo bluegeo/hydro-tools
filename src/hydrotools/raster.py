@@ -670,6 +670,30 @@ class Raster:
         yield ds
         ds.close()
 
+    def matches(
+        self, other_raster: Union[str, "Raster"], tolerance: float = 1e-6
+    ) -> bool:
+        """Check if the spatial parameters matche another raster
+
+        Args:
+            other_raster (Union[str, Raster]): Raster to compare against
+        Returns:
+            (bool): True if the rasters match, False otherwise
+        """
+        if isinstance(other_raster, str):
+            other_raster = Raster(other_raster)
+
+        return (
+            self.shape == other_raster.shape
+            and self.wkt == other_raster.wkt
+            and np.isclose(self.csx, other_raster.csx, atol=tolerance)
+            and np.isclose(self.csy, other_raster.csy, atol=tolerance)
+            and np.isclose(self.top, other_raster.top, atol=tolerance)
+            and np.isclose(self.left, other_raster.left, atol=tolerance)
+            and np.isclose(self.bottom, other_raster.bottom, atol=tolerance)
+            and np.isclose(self.right, other_raster.right, atol=tolerance)
+        )
+
     def plot(self):
         import matplotlib.pyplot as plt
         from matplotlib.pyplot import figure
