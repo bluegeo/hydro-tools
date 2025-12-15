@@ -1045,3 +1045,83 @@ def xy_align(
         csy,
         resample_method=resample_method,
     )
+
+
+def vector_to_raster(
+    vector_src: str,
+    raster_template: str,
+    raster_dst: str,
+    burn_value: float | int | None = None,
+    burn_field: str | None = None,
+    as_mask: bool = False,
+    as_cog: bool = True,
+    **kwargs,
+):
+    """
+    Docstring for vector_to_raster
+
+    Args:
+        vector_src (str): Path to the input vector file.
+        raster_template (str): Path to the template raster file for spatial reference.
+        raster_dst (str): Path to the output raster file.
+        burn_value (float | int | None, optional): Value to burn into the raster. Defaults to None.
+        burn_field (str | None, optional): Field from the vector attribute table to burn into the raster. Defaults to None.
+    """
+    if as_mask and (burn_value is not None or burn_field is not None):
+        raise ValueError(
+            "When 'as_mask' is True, do not specify 'burn_value' or 'burn_field'"
+        )
+
+    if burn_value is not None and burn_field is not None:
+        raise ValueError("Specify only one of 'burn_value' or 'burn_field'")
+
+    ot = ["-ot", "Byte"] if as_mask else ["-ot", "Float32"]
+    at = ["-at"] if kwargs.get("all_touched", False) else []
+    burn = (
+        ["-burn", "1"]
+        if as_mask
+        else ["-burn", str(kwargs.get("burn_value"))] if burn_value is not None else []
+    )
+    field = ["-a", burn_field] if burn_field is not None else []
+    no_data = (
+        ["-a_nodata", "0"] if as_mask else ["-a_nodata", str(np.finfo(np.float32).min)]
+    )
+
+    src = Raster(raster_template)
+
+    with TempRasterFile() as tmp_raster:
+        if not as_cog:
+            tmp_raster = raster_dst
+
+        cmd = (
+            [
+                "gdal_rasterize",
+                "-te",
+                str(src.left),
+                str(src.bottom),
+                str(src.right),
+                str(src.top),
+                "-tr",
+                str(src.csx),
+                str(src.csy),
+                "-a_srs",
+                src.wkt,
+                "-co",
+                "TILED=YES",
+                "-co",
+                "COMPRESS=LZW",
+                "-co",
+                "BIGTIFF=YES",
+            ]
+            + ot
+            + at
+            + burn
+            + field
+            + no_data
+            + [vector_src, tmp_raster]
+        )
+
+        run(cmd, check=True)
+
+        if as_cog:
+            translate_to_cog(tmp_raster, raster_dst)

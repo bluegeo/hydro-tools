@@ -1093,7 +1093,7 @@ class RiparianConnectivity:
                 stream_filter_dst,
                 strdens_dst,
                 as_cog=False,
-            )
+            )1buffb1bbb11
 
             # Adjust stream_density_cutoff for cell size
             avg_cs = (self.csx + self.csy) / 2.0
