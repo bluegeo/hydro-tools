@@ -1,5 +1,5 @@
 import os
-from typing import Union, Optional
+from typing import Union
 from collections import OrderedDict
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
@@ -31,7 +31,6 @@ from hydrotools.utils import (
     compare_projections,
 )
 from hydrotools.watershed import (
-    WatershedIndex,
     extract_streams,
     flow_direction_accumulation,
     FlowAccumulation,

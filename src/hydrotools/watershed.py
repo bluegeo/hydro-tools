@@ -3,7 +3,6 @@ from copy import deepcopy
 import os
 import pickle
 import gzip
-from sysconfig import get_path
 from tempfile import TemporaryDirectory
 from typing import Union
 
@@ -12,9 +11,7 @@ import numpy as np
 from numba import njit
 import fiona
 from fiona.crs import from_string
-from skimage.measure import label as image_label
 
-from hydrotools.morphology import stream_slope
 from hydrotools.utils import (
     GrassRunner,
     indices_to_coords,
@@ -26,10 +23,7 @@ from hydrotools.raster import (
     from_raster,
     to_raster,
     TempRasterFile,
-    TempRasterFiles,
-    vectorize,
-    warp_like,
-    vector_to_raster,
+    vectorize
 )
 
 
@@ -248,6 +242,10 @@ def stream_order(
 
     * Flow Accumulation derived from `hydrotools.watershed.flow_direction_accumulation`
 
+    If using the `only_topology` option, stream topology is calculated but stream order
+    is not. `r.stream.topology` is a modified version of the GRASS `r.stream.order` tool
+    and simply requires the stream order portions of the tool to be removed.
+
     Args:
         dem (str): An input Digital Elevation Model.
         stream_src (str): Streams derived using `extract_streams`.
@@ -431,159 +429,6 @@ class FlowAccumulation:
     def __del__(self):
         """Clean up temporary working directory"""
         self.wkdir.cleanup()
-
-
-def stream_analysis(
-    dem: str,
-    precipitation: str,
-    lakes: str,
-    min_area: float = 1e6,
-    min_length: float = 25,
-    **kwargs,
-):
-    """
-    Run a watershed analysis by extracting streams from a DEM and applying
-    attributes to stream reaches.
-
-    Args:
-        dem (str): Path to a Digital Elevation Model raster
-        min_area (float, optional): Minimum watershed area for streams. Defaults to 1e6.
-        min_length (float, optional): Minimum stream length. Defaults to 25.
-        lakes (str | None, optional): Path to a lakes vector file to mask out lakes from
-        the watershed analysis. Defaults to None.
-        precipitation (str | None, optional): Path to a precipitation raster file. Defaults to None.
-    """
-    with TempRasterFiles(12) as (
-        fd_tmp,
-        fd,
-        fa,
-        fa_scaled,
-        streams,
-        lakes_src,
-        precip_src,
-        area,
-        mean_precip,
-        bfw,
-        gradient,
-        reaches
-    ):
-        flow_direction_accumulation(
-            dem,
-            fd_tmp,
-            fa,
-        )
-
-        fa_data = fa_data = from_raster(fa).astype("float32")
-
-        # Weight flow accumulation by precipitation
-        warp_like(precipitation, precip_src, dem, as_cog=False)
-
-        precip = from_raster(precip_src)
-        precip_scaled = da.clip(
-            precip, 0, kwargs.get("precip_max_mm", 3000)
-        ) / kwargs.get("precip_max_mm", 3000)
-
-        fa_data *= precip_scaled
-
-        vector_to_raster(
-            lakes, dem, lakes_src, as_mask=True, all_touched=True, as_cog=False
-        )
-
-        lakes_a = ~da.ma.getmaskarray(from_raster(lakes_src))
-
-        fa_data = da.where(lakes_a, 0, fa_data)
-
-        fa_data = da.ma.masked_where(da.ma.getmaskarray(from_raster(fa)), fa_data)
-
-        to_raster(fa_data, fa, fa_scaled, as_cog=False)
-
-        extract_streams(
-            dem,
-            fa_scaled,
-            streams,
-            fd,
-            min_area=min_area,
-            min_length=min_length,
-        )
-
-        # -------------------------
-        # Bankfull width estimation
-        # -------------------------
-        flow_accum = FlowAccumulation(fd)
-        flow_accum.contributing_area(area)
-        flow_accum.calculate(precip, mean_precip, "mean")
-
-        precip_a = from_raster(mean_precip) / 10  # mm -> cm
-
-        ca_a = from_raster(area)
-
-        bankfull_width = (
-            kwargs.get("bw_coeff", 0.042)
-            * (ca_a ** kwargs.get("a_exp", 0.48))
-            * (precip_a ** kwargs.get("p_exp", 0.74))
-        )
-
-        # Isolate streams
-        streams_a = from_raster(streams)
-
-        to_raster(
-            da.ma.masked_where(da.ma.getmaskarray(streams_a), bankfull_width),
-            streams,
-            bfw,
-        )
-
-        # -------------------------
-        # Stream Gradient
-        # -------------------------
-        stream_slope(
-            dem,
-            streams,
-            gradient,
-            focal_mean_dist=kwargs.get("gradient_focal_mean_dist", 25),
-        )
-
-        # -------------------------
-        # Reach Break Classification
-        # ------------------------
-        grad_a = from_raster(gradient)
-        gradient_breaks = np.arange(0, 90, kwargs.get("gradient_break_interval", 1))
-        grad_classes = da.digitize(grad_a, gradient_breaks) + 1
-
-        bfw_data = from_raster(bfw)
-        bfw_breaks = np.arange(0, 100, kwargs.get("bfw_break_interval", 1))
-        bfw_classes = da.digitize(bfw_data, bfw_breaks) + 1
-
-        # Combine the classes to create unique reaches
-        reach_classes = (
-            streams_a.astype("uint64") * 1000000
-            + bfw_classes.astype("uint64") * 1000
-            + grad_classes.astype("uint64") * 10
-            + lakes_a.astype("uint64")
-        )
-
-        new_stream_labels = image_label(
-            da.where(da.ma.getmaskarray(streams_a), 0, reach_classes).compute(),
-            connectivity=2,
-        )
-
-        reach_labels = da.from_array(
-            new_stream_labels,
-            chunks=streams_a.chunks,
-        )
-
-        to_raster(
-            da.ma.masked_where(
-                da.ma.getmaskarray(streams_a),
-                reach_labels.astype("uint32"),
-            ),
-            streams,
-            reaches,
-            nodata_value=0,
-        )
-
-        # -------------------------
-        # Reach Break Classification
-        # ------------------------
 
 
 class WatershedIndex:
