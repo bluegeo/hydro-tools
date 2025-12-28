@@ -11,6 +11,7 @@ from skimage.measure import label as image_label
 from shapely import geometry
 from rtree import Index
 
+from hydrotools.config import TMP_DIR
 from hydrotools.utils import TempRasterFile, TempRasterFiles
 from hydrotools.raster import from_raster, to_raster, warp_like, vector_to_raster
 from hydrotools.watershed import (
@@ -19,7 +20,7 @@ from hydrotools.watershed import (
     FlowAccumulation,
     stream_order,
 )
-from hydrotools.elevation import slope, solar_radiation
+from hydrotools.elevation import slope, solar_radiation, terrain_ruggedness_index
 from hydrotools.morphology import bankfull_width_geometric, stream_slope
 
 
@@ -30,6 +31,7 @@ def stream_analysis(
     streams_dst: str,
     min_area: float = 1e6,
     min_length: float = 25,
+    working_directory: str = TMP_DIR,
     **kwargs,
 ):
     """
@@ -54,57 +56,62 @@ def stream_analysis(
         bfw_break_interval (int, optional): Interval for bankfull width breaks. Defaults to 2.
         geometric_bfw_max_cost (float, optional): Maximum cost for geometric bankfull width. Defaults to 0.8.
     """
-    with TempRasterFiles(15) as (
-        fd_tmp,
-        fd,
-        fa,
-        fa_scaled,
-        streams,
-        lakes_src,
-        precip_src,
-        area,
-        mean_precip,
-        bfw,
-        gradient,
-        valley_width,
-        valley_conf,
-        reaches,
-        solrad,
-    ):
+    # Output Rasters
+    rasters = SimpleNamespace(
+        fd=os.path.join(working_directory, "fd.tif"),
+        fa=os.path.join(working_directory, "fa.tif"),
+        fa_scaled=os.path.join(working_directory, "fa_scaled.tif"),
+        streams=os.path.join(working_directory, "streams.tif"),
+        lakes_src=os.path.join(working_directory, "lakes.tif"),
+        precip_src=os.path.join(working_directory, "precip.tif"),
+        area=os.path.join(working_directory, "area.tif"),
+        mean_precip=os.path.join(working_directory, "mean_precip.tif"),
+        bfw=os.path.join(working_directory, "bfw.tif"),
+        gradient=os.path.join(working_directory, "gradient.tif"),
+        valley_width=os.path.join(working_directory, "valley_width.tif"),
+        valley_conf=os.path.join(working_directory, "valley_conf.tif"),
+        reaches=os.path.join(working_directory, "reaches.tif"),
+        solrad=os.path.join(working_directory, "solrad.tif"),
+        tri=os.path.join(working_directory, "tri.tif"),
+        slope_dst=os.path.join(working_directory, "slope_dst.tif"),
+    )
+
+    with TempRasterFile() as fd_tmp:
         flow_direction_accumulation(
             dem,
             fd_tmp,
-            fa,
+            rasters.fa,
         )
 
-        fa_data = fa_data = from_raster(fa).astype("float32")
+        fa_data = fa_data = from_raster(rasters.fa).astype("float32")
 
         # Weight flow accumulation by precipitation
-        warp_like(precipitation, precip_src, dem, as_cog=False)
+        warp_like(precipitation, rasters.precip_src, dem, as_cog=False)
 
-        precip = from_raster(precip_src)
+        precip = from_raster(rasters.precip_src)
         precip_max_mm = kwargs.get("precip_max_mm", 3000)
         precip_scaled = da.clip(precip, 0, precip_max_mm) / precip_max_mm
 
         fa_data *= precip_scaled
 
         vector_to_raster(
-            lakes, dem, lakes_src, as_mask=True, all_touched=True, as_cog=False
+            lakes, dem, rasters.lakes_src, as_mask=True, all_touched=True, as_cog=False
         )
 
-        lakes_a = ~da.ma.getmaskarray(from_raster(lakes_src))
+        lakes_a = ~da.ma.getmaskarray(from_raster(rasters.lakes_src))
 
         fa_data = da.where(lakes_a, 0, fa_data)
 
-        fa_data = da.ma.masked_where(da.ma.getmaskarray(from_raster(fa)), fa_data)
-
-        to_raster(fa_data, fa, fa_scaled, as_cog=False)
+        fa_data = da.ma.masked_where(
+            da.ma.getmaskarray(from_raster(rasters.fa)), fa_data
+        )
+        to_raster(fa_data, rasters.fa, rasters.fa_scaled, as_cog=False)
 
         extract_streams(
             dem,
-            fa_scaled,
-            streams,
-            fd,
+            rasters.fa_scaled,
+            rasters.streams,
+            rasters.fd,
             min_area=min_area,
             min_length=min_length,
         )
@@ -112,13 +119,13 @@ def stream_analysis(
         # -------------------------
         # Bankfull width estimation
         # -------------------------
-        flow_accum = FlowAccumulation(fd)
-        flow_accum.contributing_area(area)
-        flow_accum.calculate(precip_src, mean_precip, "mean")
+        flow_accum = FlowAccumulation(rasters.fd)
+        flow_accum.contributing_area(rasters.area)
+        flow_accum.calculate(rasters.precip_src, rasters.mean_precip, "mean")
 
-        precip_a = from_raster(mean_precip) / 10  # mm -> cm
+        precip_a = from_raster(rasters.mean_precip) / 10  # mm -> cm
 
-        ca_a = from_raster(area)
+        ca_a = from_raster(rasters.area)
 
         bankfull_width = (
             kwargs.get("bw_coeff", 0.196)
@@ -127,12 +134,12 @@ def stream_analysis(
         )
 
         # Isolate streams
-        streams_a = from_raster(streams)
+        streams_a = from_raster(rasters.streams)
 
         to_raster(
             da.ma.masked_where(da.ma.getmaskarray(streams_a), bankfull_width),
-            streams,
-            bfw,
+            rasters.streams,
+            rasters.bfw,
         )
 
         # -------------------------
@@ -140,39 +147,38 @@ def stream_analysis(
         # -------------------------
         stream_slope(
             dem,
-            streams,
-            gradient,
+            rasters.streams,
+            rasters.gradient,
             focal_mean_dist=kwargs.get("gradient_focal_mean_dist", 25),
         )
 
-        with TempRasterFile() as slope_dst:
-            slope(dem, slope_dst)
+        slope(dem, rasters.slope_dst)
 
-            bankfull_width_geometric(
-                streams,
-                slope_dst,
-                valley_width,
-                max_cost=kwargs.get("geometric_bfw_max_cost", 0.8),
-            )
+        bankfull_width_geometric(
+            rasters.streams,
+            rasters.slope_dst,
+            rasters.valley_width,
+            max_cost=kwargs.get("geometric_bfw_max_cost", 0.8),
+        )
 
-        vc = from_raster(valley_width) / from_raster(bfw)
+        vc = from_raster(rasters.valley_width) / from_raster(rasters.bfw)
         vc = da.where((vc < 0) | da.isnan(vc) | da.isinf(vc), 0, vc)
-        vc = da.ma.masked_where(da.ma.getmaskarray(from_raster(streams)), vc)
+        vc = da.ma.masked_where(da.ma.getmaskarray(from_raster(rasters.streams)), vc)
 
         to_raster(
             vc,
             dem,
-            valley_conf,
+            rasters.valley_conf,
         )
 
         # -------------------------
         # Reach Break Classification
         # -------------------------
-        grad_a = from_raster(gradient)
+        grad_a = from_raster(rasters.gradient)
         gradient_breaks = np.arange(0, 90, kwargs.get("gradient_break_interval", 1))
         grad_classes = da.digitize(grad_a, gradient_breaks) + 1
 
-        bfw_data = from_raster(bfw)
+        bfw_data = from_raster(rasters.bfw)
         bfw_breaks = np.arange(0, 100, kwargs.get("bfw_break_interval", 2))
         bfw_classes = da.digitize(bfw_data, bfw_breaks) + 1
 
@@ -199,14 +205,16 @@ def stream_analysis(
                 da.ma.getmaskarray(streams_a),
                 reach_labels.astype("uint32"),
             ),
-            streams,
-            reaches,
+            rasters.streams,
+            rasters.reaches,
             nodata_value=0,
         )
 
         # -------------------------
-        # Solar Radiation
+        # Additional Topographic Calculations
         # -------------------------
+
+        # Solar Radiation
         days = list(range(15, 365, 30))
         all_rads = []
         with TempRasterFiles(len(days)) as solrads:
@@ -215,7 +223,9 @@ def stream_analysis(
 
                 all_rads.append(from_raster(sr))
 
-            to_raster(da.dstack(all_rads).mean(axis=0), dem, solrad)
+            to_raster(da.dstack(all_rads).mean(axis=2), dem, rasters.solrad)
+
+        terrain_ruggedness_index(dem, rasters.tri)
 
         # -------------------------
         # Stream topology and order
@@ -232,9 +242,12 @@ def stream_analysis(
             "out_dist",
         ]
         attrs = {
-            "avg_bfw": rasterio.open(bfw),
-            "avg_vw": rasterio.open(valley_width),
-            "avg_conf": rasterio.open(valley_conf),
+            "avg_bfw": rasterio.open(rasters.bfw),
+            "avg_vw": rasterio.open(rasters.valley_width),
+            "avg_conf": rasterio.open(rasters.valley_conf),
+            "avg_solrad": rasterio.open(rasters.solrad),
+            "avg_tri": rasterio.open(rasters.tri),
+            "avg_slope": rasterio.open(rasters.slope_dst),
         }
 
         def attr_to_line(line, attr, method="mean"):
@@ -278,9 +291,9 @@ def stream_analysis(
             # First, add topology to reach breaks
             stream_order(
                 dem,
-                reaches,
-                fd,
-                fa,
+                rasters.reaches,
+                rasters.fd,
+                rasters.fa,
                 topo_dst,
                 only_topology=True,
             )
@@ -288,9 +301,9 @@ def stream_analysis(
             # Proceed with normal Calculation of stream order on streams without breaks
             stream_order(
                 dem,
-                streams,
-                fd,
-                fa,
+                rasters.streams,
+                rasters.fd,
+                rasters.fa,
                 order_dst,
             )
 
