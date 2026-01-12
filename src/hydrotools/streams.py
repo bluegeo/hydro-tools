@@ -11,6 +11,7 @@ from skimage.measure import label as image_label
 from shapely import geometry
 from rtree import Index
 
+from numba import njit
 from hydrotools.config import TMP_DIR
 from hydrotools.utils import TempRasterFile, TempRasterFiles
 from hydrotools.raster import (
@@ -28,6 +29,100 @@ from hydrotools.watershed import (
 )
 from hydrotools.elevation import slope, solar_radiation, terrain_ruggedness_index
 from hydrotools.morphology import bankfull_width_geometric, stream_slope
+
+
+@njit
+def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
+    labels = np.full(reaches.shape, -1, dtype=np.int64)
+
+    rows, cols = reaches.shape
+
+    current_label = 0
+    nbrs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    for i in range(rows):
+        for j in range(cols):
+            if reaches[i, j] != nodata and labels[i, j] == -1:
+                current_val = reaches[i, j]
+
+                # Delineate this reach
+                current_label += 1
+                labels[i, j] = current_label
+                stack = [(i, j)]
+
+                while len(stack) > 0:
+                    ci, cj = stack.pop()
+
+                    current_fa = fa[ci, cj]
+
+                    # Find next downstream neighbour
+                    dif = 1000000
+                    test_i, test_j = -1, -1
+                    for di, dj in nbrs:
+                        ni, nj = ci + di, cj + dj
+                        if (
+                            ni > 0
+                            and ni < rows
+                            and nj > 0
+                            and nj < cols
+                            and labels[ni, nj] == -1
+                            and reaches[ni, nj] != nodata
+                        ):
+                            nd = abs(fa[ni, nj] - current_fa)
+                            if fa[ni, nj] < current_fa and nd < dif:
+                                dif = nd
+                                test_i, test_j = ni, nj
+
+                    if (
+                        test_i != -1
+                        and test_j != -1
+                        and reaches[test_i, test_j] == current_val
+                    ):
+                        labels[test_i, test_j] = current_label
+                        stack.append((test_i, test_j))
+
+                    # Find the next upstream neighbour
+                    dif = 1000000
+                    test_i, test_j = -1, -1
+                    for di, dj in nbrs:
+                        ni, nj = ci + di, cj + dj
+                        if (
+                            ni > 0
+                            and ni < rows
+                            and nj > 0
+                            and nj < cols
+                            and labels[ni, nj] == -1
+                            and reaches[ni, nj] != nodata
+                        ):
+                            nd = abs(fa[ni, nj] - current_fa)
+                            if fa[ni, nj] > current_fa and nd < dif:
+                                dif = nd
+                                test_i, test_j = ni, nj
+
+                    if (
+                        test_i != -1
+                        and test_j != -1
+                        and reaches[test_i, test_j] == current_val
+                    ):
+                        labels[test_i, test_j] = current_label
+                        stack.append((test_i, test_j))
+
+    return labels
+
+
+def _fa_label(reaches_array: np.ndarray, nodata: float | int, fa: str, labels_dst: str):
+    fa_array = from_raster(fa)[0, ...].compute()
+
+    labels = _fa_label_task(reaches_array, fa_array, nodata)
+    labels_dask = da.from_array(
+        labels.reshape(1, *labels.shape), chunks=from_raster(fa).chunks
+    )
+    labels_dask = da.ma.masked_where(labels_dask == -1, labels_dask)
+
+    to_raster(
+        labels_dask,
+        fa,
+        labels_dst,
+    )
 
 
 class Feat(SimpleNamespace):
@@ -262,24 +357,11 @@ def stream_analysis(
         + lakes_a.astype("uint64")
     )
 
-    new_stream_labels = image_label(
-        da.where(da.ma.getmaskarray(streams_a), 0, reach_classes).compute(),
-        connectivity=2,
-    )
-
-    reach_labels = da.from_array(
-        new_stream_labels,
-        chunks=streams_a.chunks,
-    )
-
-    to_raster(
-        da.ma.masked_where(
-            da.ma.getmaskarray(streams_a),
-            reach_labels.astype("uint32"),
-        ),
-        rasters.streams,
+    _fa_label(
+        da.where(da.ma.getmaskarray(streams_a), 0, reach_classes).compute()[0, ...],
+        0,
+        rasters.area,
         rasters.reaches,
-        nodata_value=0,
     )
 
     # -------------------------
