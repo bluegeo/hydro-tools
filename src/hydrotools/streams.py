@@ -121,9 +121,9 @@ def stream_analysis(
         streams=os.path.join(working_directory, "streams.tif"),
         lakes_src=os.path.join(working_directory, "lakes.tif"),
         precip_src=os.path.join(working_directory, "precip.tif"),
-        t_min_src=os.path.join(working_directory, "t_min.tif"),
-        t_max_src=os.path.join(working_directory, "t_max.tif"),
-        swe_src=os.path.join(working_directory, "swe.tif"),
+        t_min=os.path.join(working_directory, "t_min.tif"),
+        t_max=os.path.join(working_directory, "t_max.tif"),
+        swe=os.path.join(working_directory, "swe.tif"),
         area=os.path.join(working_directory, "area.tif"),
         mean_precip=os.path.join(working_directory, "mean_precip.tif"),
         bfw=os.path.join(working_directory, "bfw.tif"),
@@ -395,7 +395,7 @@ def stream_analysis(
             dem,
             rasters.reaches,
             rasters.fd,
-            rasters.fa,
+            rasters.fa_scaled,
             topo_dst,
             only_topology=True,
         )
@@ -405,7 +405,7 @@ def stream_analysis(
             dem,
             rasters.streams,
             rasters.fd,
-            rasters.fa,
+            rasters.fa_scaled,
             order_dst,
         )
 
@@ -481,7 +481,6 @@ def stream_analysis(
                 # Spelling corrections
                 setattr(feat.props, "straight", feat.props.stright)
                 delattr(feat.props, "stright")
-                del schema["properties"]["stright"]
 
                 # Remove unneeded fields
                 for attr in remove_attrs:
@@ -542,6 +541,8 @@ def stream_analysis(
 
             del a
 
+            del schema["properties"]["stright"]
+            schema["properties"]["straight"] = "float"
             for attr in remove_attrs:
                 del schema["properties"][attr]
             for attr in attrs.keys():
