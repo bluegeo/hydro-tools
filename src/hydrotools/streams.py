@@ -33,7 +33,7 @@ from hydrotools.morphology import bankfull_width_geometric, stream_slope
 
 @njit
 def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
-    labels = np.full(reaches.shape, -1, dtype=np.int64)
+    labels = np.full(reaches.shape, -1, dtype=np.int32)
 
     rows, cols = reaches.shape
 
@@ -60,11 +60,10 @@ def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
                     for di, dj in nbrs:
                         ni, nj = ci + di, cj + dj
                         if (
-                            ni > 0
+                            ni >= 0
                             and ni < rows
-                            and nj > 0
+                            and nj >= 0
                             and nj < cols
-                            and labels[ni, nj] == -1
                             and reaches[ni, nj] != nodata
                         ):
                             nd = abs(fa[ni, nj] - current_fa)
@@ -75,6 +74,7 @@ def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
                     if (
                         test_i != -1
                         and test_j != -1
+                        and labels[test_i, test_j] == -1
                         and reaches[test_i, test_j] == current_val
                     ):
                         labels[test_i, test_j] = current_label
@@ -86,11 +86,10 @@ def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
                     for di, dj in nbrs:
                         ni, nj = ci + di, cj + dj
                         if (
-                            ni > 0
+                            ni >= 0
                             and ni < rows
-                            and nj > 0
+                            and nj >= 0
                             and nj < cols
-                            and labels[ni, nj] == -1
                             and reaches[ni, nj] != nodata
                         ):
                             nd = abs(fa[ni, nj] - current_fa)
@@ -101,6 +100,7 @@ def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
                     if (
                         test_i != -1
                         and test_j != -1
+                        and labels[test_i, test_j] == -1
                         and reaches[test_i, test_j] == current_val
                     ):
                         labels[test_i, test_j] = current_label
@@ -110,7 +110,7 @@ def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
 
 
 def _fa_label(reaches_array: np.ndarray, nodata: float | int, fa: str, labels_dst: str):
-    fa_array = from_raster(fa)[0, ...].compute()
+    fa_array = from_raster(fa)[0, ...].compute().filled(0)
 
     labels = _fa_label_task(reaches_array, fa_array, nodata)
     labels_dask = da.from_array(
