@@ -32,16 +32,28 @@ from hydrotools.morphology import bankfull_width_geometric, stream_slope
 
 
 @njit
-def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
-    labels = np.full(reaches.shape, -1, dtype=np.int32)
+def _fa_label_task(reaches: np.ndarray, fd: np.ndarray, nodata: float | int):
+    nbrs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    directions = [
+        None,
+        [-1, 1],
+        [-1, 0],
+        [-1, -1],
+        [0, -1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+        [0, 1],
+    ]
+
+    labels = np.full(reaches.shape, 0, dtype=np.uint32)
 
     rows, cols = reaches.shape
 
     current_label = 0
-    nbrs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
     for i in range(rows):
         for j in range(cols):
-            if reaches[i, j] != nodata and labels[i, j] == -1:
+            if reaches[i, j] != nodata and labels[i, j] == 0:
                 current_val = reaches[i, j]
 
                 # Delineate this reach
@@ -52,59 +64,37 @@ def _fa_label_task(reaches: np.ndarray, fa: np.ndarray, nodata: float | int):
                 while len(stack) > 0:
                     ci, cj = stack.pop()
 
-                    current_fa = fa[ci, cj]
+                    current_fd = fd[ci, cj]
 
                     # Find next downstream neighbour
-                    dif = 1000000
-                    test_i, test_j = -1, -1
-                    for di, dj in nbrs:
-                        ni, nj = ci + di, cj + dj
-                        if (
-                            ni >= 0
-                            and ni < rows
-                            and nj >= 0
-                            and nj < cols
-                            and reaches[ni, nj] != nodata
-                        ):
-                            nd = abs(fa[ni, nj] - current_fa)
-                            if fa[ni, nj] < current_fa and nd < dif:
-                                dif = nd
-                                test_i, test_j = ni, nj
+                    i_offset, j_offset = directions[current_fd]
+                    test_i, test_j = ci + i_offset, cj + j_offset
 
                     if (
-                        test_i != -1
-                        and test_j != -1
-                        and labels[test_i, test_j] == -1
+                        labels[test_i, test_j] == 0
                         and reaches[test_i, test_j] == current_val
                     ):
                         labels[test_i, test_j] = current_label
                         stack.append((test_i, test_j))
 
                     # Find the next upstream neighbour
-                    dif = 1000000
-                    test_i, test_j = -1, -1
-                    for di, dj in nbrs:
-                        ni, nj = ci + di, cj + dj
-                        if (
-                            ni >= 0
-                            and ni < rows
-                            and nj >= 0
-                            and nj < cols
-                            and reaches[ni, nj] != nodata
-                        ):
-                            nd = abs(fa[ni, nj] - current_fa)
-                            if fa[ni, nj] > current_fa and nd < dif:
-                                dif = nd
-                                test_i, test_j = ni, nj
+                    for ni, nj in nbrs:
+                        nbr_i, nbr_j = ci + ni, cj + nj
 
-                    if (
-                        test_i != -1
-                        and test_j != -1
-                        and labels[test_i, test_j] == -1
-                        and reaches[test_i, test_j] == current_val
-                    ):
-                        labels[test_i, test_j] = current_label
-                        stack.append((test_i, test_j))
+                        # Downstream cell of this offset
+                        i_offset, j_offset = directions[fd[nbr_i, nbr_j]]
+                        test_i, test_j = nbr_i + i_offset, nbr_j + j_offset
+
+                        # Check if the downstream cell is the current cell,
+                        # it is on a reach, and hasn't been labeled yet
+                        if (
+                            test_i == ci
+                            and test_j == cj
+                            and labels[nbr_i, nbr_j] == 0
+                            and reaches[nbr_i, nbr_j] == current_val
+                        ):
+                            labels[nbr_i, nbr_j] = current_label
+                            stack.append((nbr_i, nbr_j))
 
     return labels
 
@@ -116,7 +106,8 @@ def _fa_label(reaches_array: np.ndarray, nodata: float | int, fa: str, labels_ds
     labels_dask = da.from_array(
         labels.reshape(1, *labels.shape), chunks=from_raster(fa).chunks
     )
-    labels_dask = da.ma.masked_where(labels_dask == -1, labels_dask)
+
+    labels_dask = da.ma.masked_where(labels_dask == 0, labels_dask)
 
     to_raster(
         labels_dask,
