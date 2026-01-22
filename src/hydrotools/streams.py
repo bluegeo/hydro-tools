@@ -7,7 +7,6 @@ import numpy as np
 import dask.array as da
 import rasterio.mask
 import fiona
-from skimage.measure import label as image_label
 from shapely import geometry
 from rtree import Index
 
@@ -66,52 +65,56 @@ def _fa_label_task(reaches: np.ndarray, fd: np.ndarray, nodata: float | int):
 
                     current_fd = fd[ci, cj]
 
-                    # Find next downstream neighbour
-                    i_offset, j_offset = directions[current_fd]
-                    test_i, test_j = ci + i_offset, cj + j_offset
+                    if current_fd > 0:
+                        # Find next downstream neighbour
+                        i_offset, j_offset = directions[current_fd]
+                        test_i, test_j = ci + i_offset, cj + j_offset
 
-                    if (
-                        labels[test_i, test_j] == 0
-                        and reaches[test_i, test_j] == current_val
-                    ):
-                        labels[test_i, test_j] = current_label
-                        stack.append((test_i, test_j))
+                        if (
+                            labels[test_i, test_j] == 0
+                            and reaches[test_i, test_j] == current_val
+                        ):
+                            labels[test_i, test_j] = current_label
+                            stack.append((test_i, test_j))
 
                     # Find the next upstream neighbour
                     for ni, nj in nbrs:
                         nbr_i, nbr_j = ci + ni, cj + nj
 
                         # Downstream cell of this offset
-                        i_offset, j_offset = directions[fd[nbr_i, nbr_j]]
-                        test_i, test_j = nbr_i + i_offset, nbr_j + j_offset
+                        nbr_fd = fd[nbr_i, nbr_j]
 
-                        # Check if the downstream cell is the current cell,
-                        # it is on a reach, and hasn't been labeled yet
-                        if (
-                            test_i == ci
-                            and test_j == cj
-                            and labels[nbr_i, nbr_j] == 0
-                            and reaches[nbr_i, nbr_j] == current_val
-                        ):
-                            labels[nbr_i, nbr_j] = current_label
-                            stack.append((nbr_i, nbr_j))
+                        if nbr_fd > 0:
+                            i_offset, j_offset = directions[nbr_fd]
+                            test_i, test_j = nbr_i + i_offset, nbr_j + j_offset
+
+                            # Check if the downstream cell is the current cell,
+                            # it is on a reach, and hasn't been labeled yet
+                            if (
+                                test_i == ci
+                                and test_j == cj
+                                and labels[nbr_i, nbr_j] == 0
+                                and reaches[nbr_i, nbr_j] == current_val
+                            ):
+                                labels[nbr_i, nbr_j] = current_label
+                                stack.append((nbr_i, nbr_j))
 
     return labels
 
 
-def _fa_label(reaches_array: np.ndarray, nodata: float | int, fa: str, labels_dst: str):
-    fa_array = from_raster(fa)[0, ...].compute().filled(0)
+def _fa_label(reaches_array: np.ndarray, nodata: float | int, fd: str, labels_dst: str):
+    fd_array = from_raster(fd)[0, ...].compute().filled(-1)
 
-    labels = _fa_label_task(reaches_array, fa_array, nodata)
+    labels = _fa_label_task(reaches_array, fd_array, nodata)
     labels_dask = da.from_array(
-        labels.reshape(1, *labels.shape), chunks=from_raster(fa).chunks
+        labels.reshape(1, *labels.shape), chunks=from_raster(fd).chunks
     )
 
     labels_dask = da.ma.masked_where(labels_dask == 0, labels_dask)
 
     to_raster(
         labels_dask,
-        fa,
+        fd,
         labels_dst,
     )
 
@@ -351,7 +354,7 @@ def stream_analysis(
     _fa_label(
         da.where(da.ma.getmaskarray(streams_a), 0, reach_classes).compute()[0, ...],
         0,
-        rasters.area,
+        rasters.fd,
         rasters.reaches,
     )
 
