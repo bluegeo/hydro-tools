@@ -31,6 +31,294 @@ from hydrotools.morphology import bankfull_width_geometric, stream_slope
 
 
 @njit
+def _ind_to_coord(i: int, j: int, top: float, left: float, csx: float, csy: float):
+    x = left + (j + 0.5) * csx
+    y = top - (i + 0.5) * csy
+
+    return x, y
+
+
+@njit
+def _stream_topology_task(
+    reaches: np.ndarray,
+    fd: np.ndarray,
+    nodata: float | int,
+    top: float,
+    left: float,
+    csx: float,
+    csy: float,
+):
+    nbrs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    directions = [
+        None,
+        [-1, 1],
+        [-1, 0],
+        [-1, -1],
+        [0, -1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+        [0, 1],
+    ]
+
+    complete = np.full(reaches.shape, False, dtype=bool)
+    # Init reaches and stream ID's with dummy to set types
+    output_reaches = [[(0.0, 0.0)]]
+    reach_ids = [0]
+    next_reach_ids = [0]
+
+    rows, cols = reaches.shape
+
+    for i in range(rows):
+        for j in range(cols):
+            if reaches[i, j] != nodata and not complete[i, j]:
+                current_val = reaches[i, j]
+
+                # Delineate this reach
+                complete[i, j] = True
+                reach = [_ind_to_coord(i, j, top, left, csx, csy)]
+                reach_ids.append(current_val)
+
+                # Upstream cells
+                stack = [(i, j)]
+                while len(stack) > 0:
+                    ci, cj = stack.pop()
+
+                    # Find the next upstream neighbour
+                    for ni, nj in nbrs:
+                        nbr_i, nbr_j = ci + ni, cj + nj
+
+                        if (
+                            reaches[nbr_i, nbr_j] != current_val
+                            or complete[nbr_i, nbr_j]
+                        ):
+                            continue
+
+                        # Downstream cell of this offset
+                        nbr_fd = fd[nbr_i, nbr_j]
+
+                        if nbr_fd > 0:
+                            i_offset, j_offset = directions[nbr_fd]
+                            test_i, test_j = nbr_i + i_offset, nbr_j + j_offset
+
+                            # Check if the downstream cell is the current cell
+                            if test_i == ci and test_j == cj:
+                                complete[nbr_i, nbr_j] = True
+                                stack.append((nbr_i, nbr_j))
+                                reach.append(
+                                    _ind_to_coord(nbr_i, nbr_j, top, left, csx, csy)
+                                )
+
+                # Reverse the upstream cells (upstream to downstream)
+                # and add downstream cells
+                reach = reach[::-1]
+
+                stack = [(i, j)]
+                while len(stack) > 0:
+                    ci, cj = stack.pop()
+
+                    current_fd = fd[ci, cj]
+
+                    if current_fd > 0:
+                        # Find next downstream neighbour
+                        i_offset, j_offset = directions[current_fd]
+                        test_i, test_j = ci + i_offset, cj + j_offset
+
+                        if (
+                            not complete[test_i, test_j]
+                            and reaches[test_i, test_j] == current_val
+                        ):
+                            complete[test_i, test_j] = True
+                            stack.append((test_i, test_j))
+                            reach.append(
+                                _ind_to_coord(test_i, test_j, top, left, csx, csy)
+                            )
+
+                # Extend the reach to include the next downstream cell to
+                # ensure reaches are connected
+                if reaches[test_i, test_j] != nodata and current_fd > 0:
+                    reach.append(_ind_to_coord(test_i, test_j, top, left, csx, csy))
+                    next_reach_ids.append(reaches[test_i, test_j])
+                else:
+                    next_reach_ids.append(-1)
+
+                output_reaches.append(reach)
+
+    return output_reaches[1:], reach_ids[1:], next_reach_ids[1:]
+
+
+def _stream_topology(
+    reaches_array: np.ndarray, nodata: float | int, fd: str, dst: str
+) -> list[list[tuple[int, int]]]:
+    fd_array = from_raster(fd)[0, ...].compute().filled(-1)
+
+    fd_rast = Raster(fd)
+
+    reaches, reach_ids, next_reach_ids = _stream_topology_task(
+        reaches_array,
+        fd_array,
+        nodata,
+        fd_rast.top,
+        fd_rast.left,
+        fd_rast.csx,
+        fd_rast.csy,
+    )
+
+    reach_mapping = {}
+    for reach_id, next_reach_id in zip(reach_ids, next_reach_ids):
+        if next_reach_id == -1:
+            continue
+        reach_enum = 0
+        while True:
+            reach_enum += 1
+            key = f"{next_reach_id}:{reach_enum}"
+
+            try:
+                reach_mapping[key]
+            except KeyError:
+                break
+
+        reach_mapping[key] = reach_id
+
+    num_prv_fields = max([int(f.split(":")[1]) for f in reach_mapping.keys()])
+
+    stream_features = []
+    for reach, reach_id, next_reach_id in zip(reaches, reach_ids, next_reach_ids):
+        if len(reach) < 2:
+            continue
+
+        props = {"rid": reach_id, "next_rid": next_reach_id}
+
+        for i in range(num_prv_fields):
+            key = f"{reach_id}:{i + 1}"
+            try:
+                props[f"prev_rid0{i + 1}"] = reach_mapping[key]
+            except KeyError:
+                props[f"prev_rid0{i + 1}"] = -1
+
+        stream_features.append(
+            {
+                "geometry": geometry.mapping(geometry.LineString(reach)),
+                "properties": props,
+            }
+        )
+
+    # Calculate strahler order for each reach.
+    # Dangling reaches (those that flow into a single point) are also fixed here.
+    reach_mapping = {reach["properties"]["rid"]: reach for reach in stream_features}
+
+    # Start with all leaf nodes (furthest upstream segments)
+    stack = [
+        reach for reach in stream_features if reach["properties"]["prev_rid01"] == -1
+    ]
+    while len(stack) > 0:
+        reach = stack.pop(0)
+
+        # Determine the strahler order for this node
+        try:
+            upstream_strahlers = [
+                reach_mapping[value]["properties"]["strahler"]
+                for field, value in reach["properties"].items()
+                if "prev_rid" in field and value != -1
+            ]
+        except KeyError:
+            # Not all upstream reaches have been processed yet.
+            # Save this one until later.
+            stack.append(reach)
+            continue
+
+        if len(upstream_strahlers) == 0:
+            strahler = 1
+        else:
+            max_strahler = max(upstream_strahlers)
+
+            if sum([s == max_strahler for s in upstream_strahlers]) == 1:
+                strahler = max_strahler
+            else:
+                strahler = max_strahler + 1
+
+        reach["properties"]["strahler"] = strahler
+
+        # Traverse to the next node
+        while True:
+            next_reach_id = reach["properties"]["next_rid"]
+
+            if next_reach_id == -1:
+                break
+
+            try:
+                reach = reach_mapping[next_reach_id]
+            except KeyError:
+                # This is the end - the downstream was a single point
+                reach["properties"]["next_rid"] = -1
+                break
+
+            # Check if a new node (confluence)
+            if reach["properties"]["prev_rid02"] != -1:
+                if reach["properties"]["rid"] not in [
+                    r["properties"]["rid"] for r in stack
+                ]:
+                    stack.append(reach)
+                break
+
+            reach["properties"]["strahler"] = strahler
+
+    # Calculate geometric parameters and distances from outlets
+    outlets = [
+        reach for reach in stream_features if reach["properties"]["next_rid"] == -1
+    ]
+
+    net_id = 0
+    for outlet in outlets:
+        net_id += 1
+
+        nodes = [(outlet, 0.0)]
+        while len(nodes) > 0:
+            reach, distance = nodes.pop(0)
+            props = reach["properties"]
+
+            line = geometry.shape(reach["geometry"])
+
+            length = line.length
+            sinuosity = (
+                length / geometry.LineString([line.coords[0], line.coords[-1]]).length
+            )
+            distance += length
+
+            props["netID"] = net_id
+            props["length"] = length
+            props["sinuosity"] = sinuosity
+            props["upDist"] = distance
+
+            for field, value in props.items():
+                if "prev_rid" in field and value != -1:
+                    nodes.append((reach_mapping[value], distance))
+
+    with fiona.open(
+        dst,
+        "w",
+        driver="GPKG",
+        crs=fd_rast.wkt,
+        schema={
+            "geometry": "LineString",
+            "properties": {
+                "rid": "int",
+                "next_rid": "int",
+                **OrderedDict(
+                    {f"prev_rid0{i + 1}": "int" for i in range(num_prv_fields)}
+                ),
+                "strahler": "int",
+                "netID": "int",
+                "length": "float",
+                "sinuosity": "float",
+                "upDist": "float",
+            },
+        },
+    ) as layer:
+        layer.writerecords(stream_features)
+
+
+@njit
 def _fa_label_task(reaches: np.ndarray, fd: np.ndarray, nodata: float | int):
     nbrs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
     directions = [
@@ -81,6 +369,12 @@ def _fa_label_task(reaches: np.ndarray, fd: np.ndarray, nodata: float | int):
                     for ni, nj in nbrs:
                         nbr_i, nbr_j = ci + ni, cj + nj
 
+                        if (
+                            reaches[nbr_i, nbr_j] != current_val
+                            or labels[nbr_i, nbr_j] != 0
+                        ):
+                            continue
+
                         # Downstream cell of this offset
                         nbr_fd = fd[nbr_i, nbr_j]
 
@@ -88,14 +382,8 @@ def _fa_label_task(reaches: np.ndarray, fd: np.ndarray, nodata: float | int):
                             i_offset, j_offset = directions[nbr_fd]
                             test_i, test_j = nbr_i + i_offset, nbr_j + j_offset
 
-                            # Check if the downstream cell is the current cell,
-                            # it is on a reach, and hasn't been labeled yet
-                            if (
-                                test_i == ci
-                                and test_j == cj
-                                and labels[nbr_i, nbr_j] == 0
-                                and reaches[nbr_i, nbr_j] == current_val
-                            ):
+                            # Check if the downstream cell is the current cell
+                            if test_i == ci and test_j == cj:
                                 labels[nbr_i, nbr_j] = current_label
                                 stack.append((nbr_i, nbr_j))
 
@@ -208,6 +496,7 @@ def stream_analysis(
         fa=os.path.join(working_directory, "fa.tif"),
         fa_scaled=os.path.join(working_directory, "fa_scaled.tif"),
         streams=os.path.join(working_directory, "streams.tif"),
+        mean_elev=os.path.join(working_directory, "mean_elev.tif"),
         lakes_src=os.path.join(working_directory, "lakes.tif"),
         precip_src=os.path.join(working_directory, "precip.tif"),
         t_min=os.path.join(working_directory, "t_min.tif"),
@@ -221,6 +510,7 @@ def stream_analysis(
         valley_conf=os.path.join(working_directory, "valley_conf.tif"),
         reaches=os.path.join(working_directory, "reaches.tif"),
         solrad=os.path.join(working_directory, "solrad.tif"),
+        solrad_sum=os.path.join(working_directory, "solrad_sum.tif"),
         tri=os.path.join(working_directory, "tri.tif"),
         slope_dst=os.path.join(working_directory, "slope.tif"),
     )
@@ -336,7 +626,7 @@ def stream_analysis(
     # -------------------------
     print("Classifying Reach Breaks...")
     grad_a = from_raster(rasters.gradient)
-    gradient_breaks = np.arange(0, 90, kwargs.get("gradient_break_interval", 1))
+    gradient_breaks = np.arange(0, 90, kwargs.get("gradient_break_interval", 2))
     grad_classes = da.digitize(grad_a, gradient_breaks) + 1
 
     bfw_data = from_raster(rasters.bfw)
@@ -384,6 +674,9 @@ def stream_analysis(
             )
 
             summarize_on_streams(flow_accum, streams_a, mean_solrad, rasters.solrad)
+            summarize_on_streams(
+                flow_accum, streams_a, mean_solrad, rasters.solrad_sum, method="sum"
+            )
 
     print("Calculating Terrain Ruggedness Index...")
     with TempRasterFile() as tri:
@@ -431,136 +724,39 @@ def stream_analysis(
                     method="sum",
                 )
 
-    # -------------------------
-    # Stream topology and order
-    # -------------------------
-    remove_attrs = [
-        "cat",
-        "horton",
-        "shreve",
-        "hack",
-        "topo_dim",
-        "scheidegger",
-        "drwal_old",
-        "flow_accum",
-        "out_dist",
-    ]
-    attrs = {
-        "avg_bfw": rasters.bfw,
-        "avg_vw": rasters.valley_width,
-        "avg_conf": rasters.valley_conf,
-        "avg_solrad": rasters.solrad,
-        "avg_tri": rasters.tri,
-        "avg_slope": rasters.slope_dst,
-        "avg_precip_mm": rasters.mean_precip,
-        "avg_tmin": rasters.t_min,
-        "avg_tmax": rasters.t_max,
-        "avg_swe": rasters.swe,
-    }
-    attrs.update(
-        {lc_name: getattr(rasters, lc_name) for lc_name in landcover_mapping.values()}
-    )
+    # Summarize mean elevation on streams
+    summarize_on_streams(flow_accum, streams_a, dem, rasters.mean_elev)
 
+    # -------------------------
+    # Stream topology, order, and attributes
+    # -------------------------
     with TemporaryDirectory() as tmp_dir:
         topo_dst = os.path.join(tmp_dir, next(_get_candidate_names()) + ".gpkg")
-        order_dst = os.path.join(tmp_dir, next(_get_candidate_names()) + ".gpkg")
 
-        # First, add topology to reach breaks
-        print("Calculating Stream Topology and Order...")
-        stream_order(
-            dem,
-            rasters.reaches,
+        # Vectorize streams and calculate topology, strahler order, and geometric
+        # attributes
+        print("Calculating Stream Topology...")
+        _stream_topology(
+            da.where(
+                da.ma.getmaskarray(streams_a),
+                0,
+                from_raster(rasters.reaches),
+            ).compute()[0, ...],
+            0,
             rasters.fd,
-            rasters.fa_scaled,
             topo_dst,
-            only_topology=True,
         )
 
-        # Proceed with normal Calculation of stream order on streams without breaks
-        stream_order(
-            dem,
-            rasters.streams,
-            rasters.fd,
-            rasters.fa_scaled,
-            order_dst,
-        )
-
-        # Vectorize and add stream attributes
-        with fiona.open(topo_dst) as topo_layer, fiona.open(order_dst) as order_layer:
+        # Add stream attributes
+        with fiona.open(topo_dst) as topo_layer:
             crs = topo_layer.crs
             schema = topo_layer.schema
-            max_prv = 0
 
             topo_feats = [
                 feat
                 for feat in [Feat(feat) for feat in topo_layer]
                 if feat.geo is not None
             ]
-
-            topo_tree = Index(tree_gen(topo_feats))
-
-            order_feats = [
-                feat
-                for feat in [Feat(feat) for feat in order_layer]
-                if feat.geo is not None
-            ]
-
-            order_tree = Index(tree_gen(order_feats))
-
-            for root_feat in topo_feats:
-                # Set the stream order attributes
-                order_idx = order_tree.intersection(root_feat.geo.bounds)
-
-                order_feat_ints = [
-                    (order_feats[i], order_feats[i].geo.intersection(root_feat.geo))
-                    for i in order_idx
-                ]
-
-                order_feat = max(
-                    order_feat_ints,
-                    key=lambda x: x[1].length if hasattr(x[1], "length") else -1,
-                    default=None,
-                )[0]
-
-                root_feat.props.strahler = order_feat.props.strahler
-                root_feat.props.horton = order_feat.props.horton
-                root_feat.props.shreve = order_feat.props.shreve
-                root_feat.props.hack = order_feat.props.hack
-
-                # Set the previous stream attributes
-                for field in list(root_feat.props.__dict__.keys()):
-                    if "prev_str" in field:
-                        delattr(root_feat.props, field)
-
-                topo_idx = topo_tree.intersection(root_feat.geo.buffer(0.1).bounds)
-
-                topo_proximal = [
-                    topo_feats[i].props.stream
-                    for i in topo_idx
-                    if topo_feats[i].props.next_stream == root_feat.props.stream
-                ]
-
-                max_prv = max(max_prv, len(topo_proximal))
-
-                for pidx, proximal in enumerate(topo_proximal):
-                    setattr(root_feat.props, f"prev_str0{pidx + 1}", proximal)
-
-            schema["properties"].update(
-                OrderedDict([(f"prev_str0{i + 1}", "int") for i in range(max_prv)])
-            )
-
-            for feat in topo_feats:
-                for i in range(max_prv):
-                    if not hasattr(feat.props, f"prev_str0{i + 1}"):
-                        setattr(feat.props, f"prev_str0{i + 1}", -1)
-
-                # Spelling corrections
-                setattr(feat.props, "straight", feat.props.stright)
-                delattr(feat.props, "stright")
-
-                # Remove unneeded fields
-                for attr in remove_attrs:
-                    delattr(feat.props, attr)
 
             # Add watershed area
             area = from_raster(rasters.area)[0, ...].compute()
@@ -596,7 +792,72 @@ def stream_analysis(
 
             del area
 
+            # Elevation
+            elev = from_raster(dem)[0, ...].compute()
+            rast = rasterio.open(dem)
+            print("Adding elevation to stream reaches...")
+            for feat in topo_feats:
+                setattr(
+                    feat.props,
+                    "elev_min",
+                    float(
+                        attr_to_line(
+                            feat.geo,
+                            rast,
+                            elev,
+                            method="min",
+                        )
+                    ),
+                )
+                schema["properties"]["elev_min"] = "float"
+                setattr(
+                    feat.props,
+                    "elev_max",
+                    float(
+                        attr_to_line(
+                            feat.geo,
+                            rast,
+                            elev,
+                            method="max",
+                        )
+                    ),
+                )
+                schema["properties"]["elev_max"] = "float"
+                setattr(
+                    feat.props,
+                    "elev_mean",
+                    float(
+                        attr_to_line(
+                            feat.geo,
+                            rast,
+                            elev,
+                            method="mean",
+                        )
+                    ),
+                )
+                schema["properties"]["elev_mean"] = "float"
+
+            del elev
+
             # Add attributes extracted from rasters
+            attrs = {
+                "gradient": rasters.gradient,
+                "bankfull_width": rasters.bfw,
+                "valley_width": rasters.valley_width,
+                "confinement": rasters.valley_conf,
+                "ws_mean_elev": rasters.mean_elev,
+                "ws_mean_solrad": rasters.solrad,
+                "ws_sum_solrad": rasters.solrad_sum,
+                "ws_mean_tri": rasters.tri,
+                "ws_mean_slope": rasters.slope_dst,
+                "ws_mean_precip_mm": rasters.mean_precip,
+                "ws_mean_tmin": rasters.t_min,
+                "ws_mean_tmax": rasters.t_max,
+                "ws_mean_swe": rasters.swe,
+            }
+            attrs.update(
+                {lc_name: getattr(rasters, lc_name) for lc_name in landcover_mapping.values()}
+            )
             for attr_name, attr_rast in attrs.items():
                 print(f"Adding {attr_name} to stream reaches...")
                 a = from_raster(attr_rast)[0, ...].compute()
@@ -617,10 +878,6 @@ def stream_analysis(
 
             del a
 
-            del schema["properties"]["stright"]
-            schema["properties"]["straight"] = "float"
-            for attr in remove_attrs:
-                del schema["properties"][attr]
             for attr in attrs.keys():
                 schema["properties"][attr] = "float"
 
