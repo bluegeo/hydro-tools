@@ -844,7 +844,7 @@ def stream_analysis(
             for feat in topo_feats:
                 setattr(
                     feat.props,
-                    "lake",
+                    "waterbody",
                     attr_to_line(
                         feat.geo,
                         rast,
@@ -853,7 +853,7 @@ def stream_analysis(
                     )
                     > 0,
                 )
-            schema["properties"]["lake"] = "bool"
+            schema["properties"]["waterbody"] = "bool"
 
             # Add attributes extracted from rasters
             attrs = {
