@@ -8,7 +8,6 @@ import dask.array as da
 import rasterio.mask
 import fiona
 from shapely import geometry
-from rtree import Index
 
 from numba import njit
 from hydrotools.config import TMP_DIR
@@ -24,7 +23,6 @@ from hydrotools.watershed import (
     flow_direction_accumulation,
     extract_streams,
     FlowAccumulation,
-    stream_order,
 )
 from hydrotools.elevation import slope, solar_radiation, terrain_ruggedness_index
 from hydrotools.morphology import bankfull_width_geometric, stream_slope
@@ -839,6 +837,24 @@ def stream_analysis(
 
             del elev
 
+            # Add lakes as a boolean attribute
+            lakes = from_raster(rasters.lakes_src)[0, ...].compute().filled(0)
+            rast = rasterio.open(rasters.lakes_src)
+            print("Adding lake presence to stream reaches...")
+            for feat in topo_feats:
+                setattr(
+                    feat.props,
+                    "lake",
+                    attr_to_line(
+                        feat.geo,
+                        rast,
+                        lakes,
+                        method="max",
+                    )
+                    > 0,
+                )
+            schema["properties"]["lake"] = "bool"
+
             # Add attributes extracted from rasters
             attrs = {
                 "gradient": rasters.gradient,
@@ -856,7 +872,10 @@ def stream_analysis(
                 "ws_mean_swe": rasters.swe,
             }
             attrs.update(
-                {lc_name: getattr(rasters, lc_name) for lc_name in landcover_mapping.values()}
+                {
+                    lc_name: getattr(rasters, lc_name)
+                    for lc_name in landcover_mapping.values()
+                }
             )
             for attr_name, attr_rast in attrs.items():
                 print(f"Adding {attr_name} to stream reaches...")
