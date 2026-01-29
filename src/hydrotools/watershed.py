@@ -1,6 +1,5 @@
 from collections import OrderedDict
 from copy import deepcopy
-import json
 import os
 import pickle
 import gzip
@@ -19,7 +18,13 @@ from hydrotools.utils import (
     transform_points,
     proj4_string,
 )
-from hydrotools.raster import Raster, from_raster, to_raster, TempRasterFile, vectorize
+from hydrotools.raster import (
+    Raster,
+    from_raster,
+    to_raster,
+    TempRasterFile,
+    vectorize
+)
 
 
 def condition_dem(dem: str, dem_cnd_dst: str):
@@ -224,7 +229,6 @@ def stream_order(
     order_dst: str,
     use_accum: bool = False,
     zero_bg: bool = False,
-    only_topology: bool = False,
     memory: Union[int, None] = 4096,
 ):
     """Calculate stream order using the following data:
@@ -248,9 +252,6 @@ def stream_order(
         created.
         use_accum (bool): Use flow accumulation to trace Horton and Hack orders.
         zero_bg (bool): Use a background value of 0 instead of nodata
-        only_topology (bool): Do not run stream order, only vectorize the streams and
-        add topology. Defaults to False. **Note** this requires a modified version of
-        the GRASS r.stream.order tool.
         memory (Union[int, None], optional): Manage memory during execution by assigning
         a maximum block size. Defaults to 4096 MB.
     """
@@ -273,7 +274,7 @@ def stream_order(
     with GrassRunner(dem) as gr:
         # r.stream.topology is the r.stream.order tool with the stream order portions removed
         gr.run_command(
-            "r.stream.topology" if only_topology else "r.stream.order",
+            "r.stream.order",
             (dem, "dem", "raster"),
             (stream_src, "streams", "raster"),
             (direction_src, "direction", "raster"),

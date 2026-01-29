@@ -3,8 +3,9 @@ import os
 from shutil import rmtree
 from contextlib import contextmanager
 from subprocess import run
-from tempfile import _get_candidate_names
+from tempfile import _get_candidate_names, TemporaryDirectory
 
+import fiona
 import numpy as np
 import dask.array as da
 from dask.diagnostics import ProgressBar
@@ -12,7 +13,12 @@ import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
 
-from hydrotools.utils import infer_nodata, translate_to_cog, compare_projections
+from hydrotools.utils import (
+    infer_nodata,
+    translate_to_cog,
+    compare_projections,
+    transform_bounds,
+)
 from hydrotools.utils import GrassRunner, TempRasterFile
 from hydrotools.config import CHUNKS, TMP_DIR, GDALWARP_ARGS
 
@@ -1045,3 +1051,118 @@ def xy_align(
         csy,
         resample_method=resample_method,
     )
+
+
+def vector_to_raster(
+    vector_src: str,
+    raster_template: str,
+    raster_dst: str,
+    burn_value: float | int | None = None,
+    burn_field: str | None = None,
+    as_mask: bool = False,
+    as_cog: bool = True,
+    **kwargs,
+):
+    """
+    Docstring for vector_to_raster
+
+    Args:
+        vector_src (str): Path to the input vector file.
+        raster_template (str): Path to the template raster file for spatial reference.
+        raster_dst (str): Path to the output raster file.
+        burn_value (float | int | None, optional): Value to burn into the raster. Defaults to None.
+        burn_field (str | None, optional): Field from the vector attribute table to burn into the raster. Defaults to None.
+    """
+    # Collect reprojected features that intersect the raster template
+    src = Raster(raster_template)
+    with fiona.open(vector_src) as layer:
+        vect_crs = layer.crs
+
+    # Reproject the raster extent to the srs of the vector
+    x_min, y_min, x_max, y_max = transform_bounds(
+        (src.left, src.bottom, src.right, src.top), src.wkt, vect_crs
+    )
+
+    with TemporaryDirectory() as tmp_dir:
+        vector_subset = os.path.join(tmp_dir, "vector_subset.gpkg")
+        cmd = [
+            "ogr2ogr",
+            "-spat",
+            str(x_min),
+            str(y_min),
+            str(x_max),
+            str(y_max),
+            "-clipsrc",
+            str(x_min),
+            str(y_min),
+            str(x_max),
+            str(y_max),
+            "-t_srs",
+            src.wkt,
+            "-makevalid",
+            "-skipfailures",
+            vector_subset,
+            vector_src,
+        ]
+        run(cmd, check=True)
+
+        if as_mask and (burn_value is not None or burn_field is not None):
+            raise ValueError(
+                "When 'as_mask' is True, do not specify 'burn_value' or 'burn_field'"
+            )
+
+        if burn_value is not None and burn_field is not None:
+            raise ValueError("Specify only one of 'burn_value' or 'burn_field'")
+
+        ot = ["-ot", "Byte"] if as_mask else ["-ot", "Float32"]
+        at = ["-at"] if kwargs.get("all_touched", False) else []
+        burn = (
+            ["-burn", "1"]
+            if as_mask
+            else (
+                ["-burn", str(kwargs.get("burn_value"))]
+                if burn_value is not None
+                else []
+            )
+        )
+        field = ["-a", burn_field] if burn_field is not None else []
+        no_data = (
+            ["-a_nodata", "0"]
+            if as_mask
+            else ["-a_nodata", str(np.finfo(np.float32).min)]
+        )
+
+        with TempRasterFile() as tmp_raster:
+            if not as_cog:
+                tmp_raster = raster_dst
+
+            cmd = (
+                [
+                    "gdal_rasterize",
+                    "-te",
+                    str(src.left),
+                    str(src.bottom),
+                    str(src.right),
+                    str(src.top),
+                    "-tr",
+                    str(src.csx),
+                    str(src.csy),
+                    "-co",
+                    "TILED=YES",
+                    "-co",
+                    "COMPRESS=LZW",
+                    "-co",
+                    "BIGTIFF=YES",
+                ]
+                + ot
+                + at
+                + burn
+                + field
+                + no_data
+                + [vector_subset, tmp_raster]
+            )
+
+            run(cmd, check=True)
+
+            if as_cog:
+                translate_to_cog(tmp_raster, raster_dst)

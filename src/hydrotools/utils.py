@@ -340,6 +340,38 @@ def transform_points(
     return list(zip(*t_points))
 
 
+def transform_bounds(
+    bounds: Tuple[float, float, float, float], in_proj, out_proj
+) -> Tuple[float, float, float, float]:
+    """Transform bounding box coordinates
+
+    Args:
+        bounds (Tuple[float, float, float, float]): Bounding box in the form
+        `(minx, miny, maxx, maxy)`
+        in_proj ([type]): Input coordinate reference system
+        out_proj ([type]): Output coordinate reference system
+
+    Returns:
+        Tuple[float, float, float, float]: Transformed bounding box in the form
+        `(minx, miny, maxx, maxy)`
+    """
+    minx, miny, maxx, maxy = bounds
+
+    transformer = Transformer.from_crs(in_proj, out_proj, always_xy=True)
+
+    blc = transformer.transform(minx, miny)
+    brc = transformer.transform(maxx, miny)
+    trc = transformer.transform(maxx, maxy)
+    tlc = transformer.transform(minx, maxy)
+
+    ret_minx = min(blc[0], brc[0], trc[0], tlc[0])
+    ret_maxx = max(blc[0], brc[0], trc[0], tlc[0])
+    ret_miny = min(blc[1], brc[1], trc[1], tlc[1])
+    ret_maxy = max(blc[1], brc[1], trc[1], tlc[1])
+
+    return (ret_minx, ret_miny, ret_maxx, ret_maxy)
+
+
 def kernel_from_distance(distance: float, csx: float, csy: float) -> np.ndarray:
     """
     Calculate a kernel mask using distance.
