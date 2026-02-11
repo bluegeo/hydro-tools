@@ -297,6 +297,34 @@ def indices_to_coords(
     return ((top - (csy / 2.0)) - (i * csy), (left + (csx / 2.0)) + (j * csx))
 
 
+def coords_to_indices(
+    coords: Tuple[Union[np.ndarray, list], Union[np.ndarray, list]],
+    top: float,
+    left: float,
+    csx: float,
+    csy: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert a tuple of geographic coordinates to indices
+
+    Args:
+        coords (Tuple[Union[np.ndarray, list], Union[np.ndarray, list]]): Coordinates
+        in the form: `([x...], [y...])`
+        top (float): Top corner coordinate
+        left (float): Left corner coordinate
+        csx (float): Cell size in the x-direction
+        csy (float): Cell size in the y-direction
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Indices in the form `([i...], [j...])`
+    """
+    x, y = np.asarray(coords[0]), np.asarray(coords[1])
+
+    return (
+        np.floor((top - y) / csy).astype(int),
+        np.floor((x - left) / csx).astype(int),
+    )
+
+
 def proj4_string(sr: Union[str, int]) -> str:
     """Collect a PROJ 4 string representation of a spatial reference input. This is
     primarily for `fiona`.
