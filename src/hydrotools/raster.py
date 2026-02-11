@@ -372,6 +372,20 @@ def to_vector_tiles(raster_source: str, tile_dst: str, band: int = 1):
 class Raster:
     """Abstract raster data using dask"""
 
+    band_count: int
+    wkt: str
+    left: float
+    csx: float
+    top: float
+    csy: float
+    shape: tuple
+    bottom: float
+    right: float
+    nodata: Union[int, float, bool, None]
+    bbox: tuple
+    dtype: str
+    ndim: int
+
     def __init__(self, src: str):
         """Open a raster
 

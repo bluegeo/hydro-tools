@@ -773,7 +773,7 @@ def stream_analysis(
                         )
                     ),
                 )
-                schema["properties"]["in_area_km2"] = "float"
+                
                 setattr(
                     feat.props,
                     "out_area_km2",
@@ -786,9 +786,10 @@ def stream_analysis(
                         )
                     ),
                 )
-                schema["properties"]["out_area_km2"] = "float"
 
             del area
+            schema["properties"]["in_area_km2"] = "float"
+            schema["properties"]["out_area_km2"] = "float"
 
             # Elevation
             elev = from_raster(dem)[0, ...].compute()
@@ -807,7 +808,7 @@ def stream_analysis(
                         )
                     ),
                 )
-                schema["properties"]["elev_min"] = "float"
+                
                 setattr(
                     feat.props,
                     "elev_max",
@@ -820,7 +821,7 @@ def stream_analysis(
                         )
                     ),
                 )
-                schema["properties"]["elev_max"] = "float"
+
                 setattr(
                     feat.props,
                     "elev_mean",
@@ -833,9 +834,12 @@ def stream_analysis(
                         )
                     ),
                 )
-                schema["properties"]["elev_mean"] = "float"
 
             del elev
+
+            schema["properties"]["elev_min"] = "float"
+            schema["properties"]["elev_max"] = "float"
+            schema["properties"]["elev_mean"] = "float"
 
             # Add lakes as a boolean attribute
             lakes = from_raster(rasters.lakes_src)[0, ...].compute().filled(0)
