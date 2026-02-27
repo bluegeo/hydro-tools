@@ -129,7 +129,7 @@ class GrassRunner(Session):
 
         Args:
             cmd (str): Grass command. Example `r.watershed`.
-            args (tuple): External data to use within the GRASS comand. This is a
+            args (tuple): External data to use within the GRASS command. This is a
             3-tuple with the following form:
                 ("/path/to/data...", "name", "vector | raster | None").
             The "name" attribute is used for GRASS inputs as kwargs, as described in the
@@ -174,7 +174,7 @@ class GrassRunner(Session):
                     "TILED=YES",
                     "COMPRESS=LZW",
                     "BLOCKXSIZE=512",
-                    "BLOCKYSiZE=512",
+                    "BLOCKYSIZE=512",
                 ],
                 "flags": "c",
             }
