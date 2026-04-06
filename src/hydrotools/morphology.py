@@ -1,5 +1,6 @@
+from logging import warning
 import os
-from typing import Union
+from typing import Union, Tuple
 from collections import OrderedDict
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
@@ -12,7 +13,9 @@ from dask_image.ndmorph import binary_erosion
 from numba import njit
 from numba.typed import List
 from scipy.interpolate import griddata
+from scipy.optimize import minimize
 import numpy as np
+from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.neighbors import BallTree
 
 from hydrotools.config import CHUNKS
@@ -394,6 +397,110 @@ def bankfull_width_geometric(
                 lcp_path,
                 bankfull_dst,
             )
+
+
+def fit_morphology_equation(
+    csv_data: str, obs_field: str, **kwargs
+) -> Tuple[float, float, float]:
+    """
+    Optimize the coeff, a_exp, and p_exp parameters in the stream morphology equation:
+
+    coeff * (ca_a**a_exp) * (precip_a**p_exp)
+
+    Where ca_a is the contributing area in km**2 and precip_a is the mean annual
+    precipitation in mm.
+
+    Args:
+        csv_data (str): Path to a CSV file containing columns "ca", and "precip" for
+        contributing area (in km**2), mean annual precipitation (in mm). The observed
+        field is specified using the `obs_field` argument.
+        obs_field (str): The name of the column in the CSV file that contains the
+        observed data to fit.
+
+    Kwargs:
+        performance_plot (bool): Whether to generate a performance plot comparing
+        observed and predicted values. Defaults to False.
+
+    Returns:
+        tuple: Fitted parameters (coeff, a_exp, p_exp).
+
+    """
+
+    def bfw_model(params, ca, precip):
+        bw_coeff, a_exp, p_exp = params
+        return bw_coeff * (ca**a_exp) * (precip**p_exp)
+
+    def objective_function(params, data):
+        predicted_bfw = bfw_model(params, data["ca"], data["precip"] / 10)
+        residuals = data[obs_field] - predicted_bfw
+        return np.sum(residuals**2)
+
+    def plot_performance(fitted_params, data, obs_field):
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            warning(
+                "matplotlib is not installed. Performance plot cannot be generated."
+            )
+            return
+
+        predicted_bfw = bfw_model(fitted_params, data["ca"], data["precip"] / 10)
+
+        # Calculate the model error and r2 to show on the plot
+        mse = mean_absolute_error(data[obs_field], predicted_bfw)
+        r2 = r2_score(data[obs_field], predicted_bfw)
+
+        plt.scatter(data[obs_field], predicted_bfw)
+        plt.plot(
+            [data[obs_field].min(), data[obs_field].max()],
+            [data[obs_field].min(), data[obs_field].max()],
+            "r--",
+            label="1:1 Line",
+        )
+        plt.xlabel("Observed")
+        plt.ylabel("Predicted")
+        plt.title("Morphologic Parameter model performance")
+        plt.legend()
+
+        plt.text(
+            0.05,
+            0.95,
+            f"MAE: {mse:.2f}\nR²: {r2:.2f}",
+            transform=plt.gca().transAxes,
+            verticalalignment="top",
+        )
+
+        plt.gca().set_aspect("equal", adjustable="box")
+
+        plt.show()
+
+    data = np.genfromtxt(csv_data, delimiter=",", names=True)
+
+    if (include_field := kwargs.get("include_field", None)) is not None:
+        data = data[data[include_field] == 1]
+
+    initial_params = [0.04, 0.5, 0.7]  # Initial guesses
+
+    result = minimize(
+        objective_function,
+        initial_params,
+        args=(data,),
+        method=kwargs.get("method", "Nelder-Mead"),
+    )
+
+    if result.success:
+        fitted_params = result.x
+
+        print(
+            f"Fitted parameters: coeff={fitted_params[0]}, a_exp={fitted_params[1]}, p_exp={fitted_params[2]}"
+        )
+
+        if kwargs.get("performance_plot", False):
+            plot_performance(fitted_params, data, obs_field)
+
+        return fitted_params
+    else:
+        raise RuntimeError("Optimization failed to converge.")
 
 
 def valley_width(
