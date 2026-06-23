@@ -773,7 +773,7 @@ def stream_analysis(
                         )
                     ),
                 )
-                
+
                 setattr(
                     feat.props,
                     "out_area_km2",
@@ -808,7 +808,7 @@ def stream_analysis(
                         )
                     ),
                 )
-                
+
                 setattr(
                     feat.props,
                     "elev_max",

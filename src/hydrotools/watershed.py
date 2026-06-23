@@ -23,7 +23,7 @@ from hydrotools.raster import (
     from_raster,
     to_raster,
     TempRasterFile,
-    vectorize
+    vectorize,
 )
 
 
@@ -360,7 +360,7 @@ class FlowAccumulation:
                 gr.run_command(
                     "r.flowaccumulation",
                     (self.direction, "direction", "raster"),
-                    input="direction",
+                    direction="direction",
                     output="modals",
                     type="FCELL",
                 )
@@ -388,7 +388,7 @@ class FlowAccumulation:
                 "r.flowaccumulation",
                 (self.direction, "direction", "raster"),
                 (raster_source, "source", "raster"),
-                input="direction",
+                direction="direction",
                 weight="source",
                 output="sum_result",
                 type="DCELL",
@@ -425,6 +425,8 @@ class FlowAccumulation:
 
 class WatershedIndex:
     """
+    __DEPRECATED__: Use `hydrotools.watershed.FlowAccumulation` instead
+
     Build and cache an index of all contributing cells to every location on  a stream grid
 
     To create a new index, save to a file, and initialize the index:
@@ -801,13 +803,11 @@ class WatershedIndex:
 
         src = Raster(raster_source)
 
-        if any(
-            [
-                tuple(src.shape) != tuple(self.shape),
-                not np.isclose(src.top, self.top),
-                not np.isclose(src.left, self.left),
-            ]
-        ):
+        if any([
+            tuple(src.shape) != tuple(self.shape),
+            not np.isclose(src.top, self.top),
+            not np.isclose(src.left, self.left),
+        ]):
             raise ValueError("Input data must spatially match index domain")
 
         data = np.squeeze(from_raster(src).compute())

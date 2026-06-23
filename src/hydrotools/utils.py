@@ -18,7 +18,6 @@ from grass.script import array as garray  # noqa
 
 from hydrotools.config import TMP_DIR, GRASS_TMP, GRASS_FLAGS, COG_ARGS
 
-
 warnings.filterwarnings("ignore")
 
 
