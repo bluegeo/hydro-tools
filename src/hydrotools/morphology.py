@@ -40,12 +40,117 @@ from hydrotools.watershed import (
 )
 from hydrotools.elevation import slope
 from hydrotools.interpolate import (
-    raster_filter,
     PointInterpolator,
     raster_filter,
     distance_transform,
     normalize,
 )
+
+
+@njit
+def _upstream_compute(
+    values_arr,
+    streams_mask,
+    fd_arr,
+    gradient_arr,
+    fd_off_i,
+    fd_off_j,
+    csx,
+    csy,
+    distance,
+    max_window,
+):
+    # upstream_dirs[di+1][dj+1] = the fd value a neighbour at offset (di, dj) must
+    # have to drain into the current cell — used to identify inlet cells.
+    upstream_dirs = [[7, 6, 5], [8, 0, 4], [1, 2, 3]]
+    diag = (csx**2 + csy**2) ** 0.5
+    n_rows = values_arr.shape[0]
+    n_cols = values_arr.shape[1]
+
+    # Circular buffers reused across inlet traversals.
+    # dist_buf stores the cumulative distance from the inlet to each entry so that
+    # the pop condition (current_cum_dist - dist_buf[head] > distance) correctly
+    # represents how far the oldest buffered cell is from the current cell.
+    val_buf = np.empty(max_window, dtype=np.float64)
+    dist_buf = np.empty(max_window, dtype=np.float64)
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if not streams_mask[i, j]:
+                continue
+
+            # Identify inlet cells: stream cells with no upstream stream neighbours
+            is_inlet = True
+            for di in range(-1, 2):
+                if not is_inlet:
+                    break
+                for dj in range(-1, 2):
+                    if di == 0 and dj == 0:
+                        continue
+                    ni = i + di
+                    nj = j + dj
+                    if ni < 0 or ni >= n_rows or nj < 0 or nj >= n_cols:
+                        continue
+                    if (
+                        streams_mask[ni, nj]
+                        and fd_arr[ni, nj] == upstream_dirs[di + 1][dj + 1]
+                    ):
+                        is_inlet = False
+                        break
+
+            if not is_inlet:
+                continue
+
+            # Seed the window with the inlet cell itself (cumulative distance = 0)
+            head = 0
+            tail = 1
+            size = 1
+            current_cum_dist = 0.0
+            val_buf[0] = values_arr[i, j]
+            dist_buf[0] = 0.0
+            val_sum = values_arr[i, j]
+
+            ci, cj = i, j
+
+            while True:
+                fd_val = fd_arr[ci, cj]
+                if fd_val <= 0 or fd_val > 8:
+                    break
+
+                ni = ci + fd_off_i[fd_val]
+                nj = cj + fd_off_j[fd_val]
+
+                if ni < 0 or ni >= n_rows or nj < 0 or nj >= n_cols:
+                    break
+                if not streams_mask[ni, nj]:
+                    break
+
+                step_dist = (
+                    diag
+                    if (fd_off_i[fd_val] != 0 and fd_off_j[fd_val] != 0)
+                    else (csx if fd_off_j[fd_val] != 0 else csy)
+                )
+                current_cum_dist += step_dist
+
+                # Push the downstream cell's value with its cumulative distance
+                val_buf[tail] = values_arr[ni, nj]
+                dist_buf[tail] = current_cum_dist
+                tail = (tail + 1) % max_window
+                size += 1
+                val_sum += values_arr[ni, nj]
+
+                # Pop entries whose distance from the current cell exceeds the window.
+                # The newest entry is always at distance 0, so it is never popped.
+                while current_cum_dist - dist_buf[head] > distance:
+                    val_sum -= val_buf[head]
+                    head = (head + 1) % max_window
+                    size -= 1
+
+                gradient_arr[ni, nj] = val_sum / size
+
+                ci, cj = ni, nj
+
+    return gradient_arr
 
 
 def sinuosity(
@@ -131,15 +236,13 @@ def sinuosity(
             schema=output_schema,
         ) as out_vect:
             for point in points:
-                out_vect.write(
-                    {
-                        "geometry": {
-                            "type": "Point",
-                            "coordinates": (point[0], point[1]),
-                        },
-                        "properties": OrderedDict([("sinuosity", point[2])]),
-                    }
-                )
+                out_vect.write({
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": (point[0], point[1]),
+                    },
+                    "properties": OrderedDict([("sinuosity", point[2])]),
+                })
 
 
 def stream_slope(
@@ -188,6 +291,78 @@ def stream_slope(
                 )
         else:
             slope(elev_dst, slope_dst, units, scale)
+
+
+def upstream_stats(
+    values: str,
+    streams: str,
+    flow_direction: str,
+    gradient_dst: str,
+    distance: float,
+):
+    """Compute a moving mean of any stream-aligned raster over a distance upstream.
+
+    All first-order stream inlets (cells with no upstream stream neighbours) are
+    identified.  From each inlet the stream network is traversed downstream.  A
+    sliding window of ``distance`` map units is maintained: the value at each
+    visited cell is added to the back of the window, and entries are dropped from
+    the front once they are more than ``distance`` upstream of the current cell.
+    The mean of the values in the window is recorded at each cell visited.
+
+    The ``values`` raster can be anything co-registered with the stream network —
+    a pre-computed slope (via ``stream_slope``), channel width, precipitation, etc.
+    Cells downstream of confluences may be visited by more than one inlet traversal;
+    the last write prevails.
+
+    Args:
+        values (str): Raster whose values are to be averaged upstream. Must be
+            co-registered with ``streams`` and cover all stream cell locations.
+        streams (str): Streams raster derived from ``watershed.extract_streams``.
+        flow_direction (str): Flow direction raster from ``watershed.extract_streams``.
+        gradient_dst (str): Output raster path.
+        distance (float): Sliding window length in CRS linear units (e.g. metres).
+    """
+    raster_specs = Raster.raster_specs(streams)
+    csx = float(raster_specs["csx"])
+    csy = float(raster_specs["csy"])
+
+    # Row/col offsets indexed by fd value 0-8 (0 is unused)
+    fd_off_i = np.array([0, -1, -1, -1, 0, 1, 1, 1, 0], dtype=np.int32)
+    fd_off_j = np.array([0, 1, 0, -1, -1, -1, 0, 1, 1], dtype=np.int32)
+
+    # +2: one for the inlet seed, one buffer slot so tail never catches head
+    max_window = int(np.ceil(distance / min(csx, csy))) + 2
+
+    streams_dask = from_raster(streams)
+    values_arr = np.squeeze(
+        da.ma.filled(from_raster(values), np.nan).compute()
+    ).astype(np.float64)
+    streams_mask = np.squeeze(~da.ma.getmaskarray(streams_dask).compute())
+    fd_arr = np.squeeze(
+        da.ma.filled(from_raster(flow_direction), 0).compute()
+    ).astype(np.int32)
+
+    n_rows, n_cols = values_arr.shape
+    gradient_arr = np.full((n_rows, n_cols), np.nan, dtype=np.float32)
+
+    gradient_arr = _upstream_compute(
+        values_arr,
+        streams_mask,
+        fd_arr,
+        gradient_arr,
+        fd_off_i,
+        fd_off_j,
+        csx,
+        csy,
+        float(distance),
+        max_window,
+    )
+
+    out = da.from_array(
+        gradient_arr.reshape(streams_dask.shape),
+        chunks=streams_dask.chunks,
+    )
+    to_raster(da.ma.masked_invalid(out), streams, gradient_dst)
 
 
 def bankfull_width_geometric(
@@ -934,18 +1109,16 @@ class RiparianConnectivity:
             src (str): Source Raster dataset.
         """
         src_specs = Raster(src)
-        if not all(
-            [
-                np.isclose(src_specs.csx, self.csx),
-                np.isclose(src_specs.csy, self.csy),
-                np.isclose(src_specs.top, self.top),
-                np.isclose(src_specs.bottom, self.bottom),
-                np.isclose(src_specs.left, self.left),
-                np.isclose(src_specs.right, self.right),
-                src_specs.shape == self.shape,
-                compare_projections(src_specs.wkt, self.wkt),
-            ]
-        ):
+        if not all([
+            np.isclose(src_specs.csx, self.csx),
+            np.isclose(src_specs.csy, self.csy),
+            np.isclose(src_specs.top, self.top),
+            np.isclose(src_specs.bottom, self.bottom),
+            np.isclose(src_specs.left, self.left),
+            np.isclose(src_specs.right, self.right),
+            src_specs.shape == self.shape,
+            compare_projections(src_specs.wkt, self.wkt),
+        ]):
             raise ValueError(f"Input raster {src} does not align with the study area.")
 
     # TODO: copy tmp_dir to a specified dir

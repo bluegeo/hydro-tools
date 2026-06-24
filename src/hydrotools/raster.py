@@ -8,7 +8,6 @@ from tempfile import _get_candidate_names, TemporaryDirectory
 import fiona
 import numpy as np
 import dask.array as da
-from dask.diagnostics import ProgressBar
 import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
@@ -834,18 +833,17 @@ def to_raster(
             ],
         )
 
-    with ProgressBar():
-        if as_cog:
-            with TempRasterFile() as tmp_dst:
-                save_tif(data, template, tmp_dst)
-                translate_to_cog(tmp_dst, destination)
+    if as_cog:
+        with TempRasterFile() as tmp_dst:
+            save_tif(data, template, tmp_dst)
+            translate_to_cog(tmp_dst, destination)
 
-        else:
-            save_tif(data, template, destination)
-            try:
-                run(["gdal_edit.py", "-stats", destination], check=True)
-            except:
-                pass
+    else:
+        save_tif(data, template, destination)
+        try:
+            run(["gdal_edit.py", "-stats", destination], check=True)
+        except:
+            pass
 
 
 def raster_where(
