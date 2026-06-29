@@ -18,13 +18,7 @@ from hydrotools.utils import (
     transform_points,
     proj4_string,
 )
-from hydrotools.raster import (
-    Raster,
-    from_raster,
-    to_raster,
-    TempRasterFile,
-    vectorize
-)
+from hydrotools.raster import Raster, from_raster, to_raster, TempRasterFile, vectorize
 
 
 def condition_dem(dem: str, dem_cnd_dst: str):
@@ -319,7 +313,7 @@ def basin(flow_direction: str, x: float, y: float, dst: str):
             gr.run_command(
                 "r.water.outlet",
                 (flow_direction, "fd", "raster"),
-                input="fd",
+                direction="fd",
                 output="basin",
                 coordinates=(x, y),
             )
@@ -360,7 +354,7 @@ class FlowAccumulation:
                 gr.run_command(
                     "r.flowaccumulation",
                     (self.direction, "direction", "raster"),
-                    input="direction",
+                    direction="direction",
                     output="modals",
                     type="FCELL",
                 )
@@ -388,7 +382,7 @@ class FlowAccumulation:
                 "r.flowaccumulation",
                 (self.direction, "direction", "raster"),
                 (raster_source, "source", "raster"),
-                input="direction",
+                direction="direction",
                 weight="source",
                 output="sum_result",
                 type="DCELL",
