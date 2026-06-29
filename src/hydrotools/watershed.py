@@ -27,20 +27,6 @@ from hydrotools.raster import (
 )
 
 
-def condition_dem(dem: str, dem_cnd_dst: str):
-    """Apply a hydrological conditioning to remove sinks.
-
-    Args:
-        dem (str): Digital Elevation Model raster.
-        dem_cnd_dst (str): Output conditioned Digital Elevation Model.
-    """
-    with GrassRunner(dem) as gr:
-        gr.run_command(
-            "r.hydrodem", (dem, "dem", "raster"), input="dem", output="dem_cnd"
-        )
-        gr.save_raster("dem_cnd", dem_cnd_dst)
-
-
 def flow_direction_accumulation(
     dem: str,
     direction_grid: str,
