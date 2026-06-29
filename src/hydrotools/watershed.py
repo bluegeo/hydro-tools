@@ -313,7 +313,7 @@ def basin(flow_direction: str, x: float, y: float, dst: str):
             gr.run_command(
                 "r.water.outlet",
                 (flow_direction, "fd", "raster"),
-                direction="fd",
+                input="fd",
                 output="basin",
                 coordinates=(x, y),
             )
