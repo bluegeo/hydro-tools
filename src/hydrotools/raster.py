@@ -8,10 +8,11 @@ from tempfile import _get_candidate_names, TemporaryDirectory
 import fiona
 import numpy as np
 import dask.array as da
-from dask.diagnostics import ProgressBar
 import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
+from shapely import geometry
+from shapely.ops import transform
 
 from hydrotools.utils import (
     infer_nodata,
@@ -257,13 +258,11 @@ class TXTFactory:
                 os.remove(out_dst)
 
     def consolidate_tiles(self):
-        tiles = " ".join(
-            [
-                os.path.join(self.tile_temp_dir, f)
-                for f in os.listdir(self.tile_temp_dir)
-                if os.path.isdir(os.path.join(self.tile_temp_dir, f))
-            ]
-        )
+        tiles = " ".join([
+            os.path.join(self.tile_temp_dir, f)
+            for f in os.listdir(self.tile_temp_dir)
+            if os.path.isdir(os.path.join(self.tile_temp_dir, f))
+        ])
 
         cmd = ["tile-join", "-e", self.out_txt, tiles]
         run(cmd, check=True)
@@ -743,9 +742,13 @@ class Raster:
 
                 i, j = np.where(a != self.nodata)
 
-                yield a[(i, j)].tolist(), [
-                    [i_, j_] for i_, j_ in zip(i + window.row_off, j + window.col_off)
-                ]
+                yield (
+                    a[(i, j)].tolist(),
+                    [
+                        [i_, j_]
+                        for i_, j_ in zip(i + window.row_off, j + window.col_off)
+                    ],
+                )
 
     def data_and_index(self, band: int = 1) -> Tuple[list, List[List[int]]]:
         """Collect values and index locations from valid data
@@ -830,18 +833,17 @@ def to_raster(
             ],
         )
 
-    with ProgressBar():
-        if as_cog:
-            with TempRasterFile() as tmp_dst:
-                save_tif(data, template, tmp_dst)
-                translate_to_cog(tmp_dst, destination)
+    if as_cog:
+        with TempRasterFile() as tmp_dst:
+            save_tif(data, template, tmp_dst)
+            translate_to_cog(tmp_dst, destination)
 
-        else:
-            save_tif(data, template, destination)
-            try:
-                run(["gdal_edit.py", "-stats", destination], check=True)
-            except:
-                pass
+    else:
+        save_tif(data, template, destination)
+        try:
+            run(["gdal_edit.py", "-stats", destination], check=True)
+        except:
+            pass
 
 
 def raster_where(
@@ -1180,3 +1182,47 @@ def vector_to_raster(
 
             if as_cog:
                 translate_to_cog(tmp_raster, raster_dst)
+
+
+def raster_vals_on_lines(
+    lines_vector: str, raster_src: str
+) -> Generator[Tuple[list, list, dict], None, None]:
+    """
+    Collect raster cell values that are coincident with vector lines.
+    Returns a generator of tuples containing the points and their corresponding values
+    in the crs of the raster.
+
+    Args:
+    lines_vector (str): Path to the input vector file containing lines.
+    raster_src (str): Path to the input raster file.
+    """
+    rast = rasterio.open(raster_src)
+    rast_data = from_raster(raster_src)[0, ...].compute()
+
+    with fiona.open(lines_vector) as layer:
+        transformer = Transformer.from_crs(
+            layer.crs, Raster(raster_src).wkt, always_xy=True
+        )
+
+        for feature in layer:
+            geom = transform(transformer.transform, geometry.shape(feature.geometry))
+
+            shape_mask, out_transform, window = rasterio.mask.raster_geometry_mask(
+                rast, [geom], crop=True
+            )
+
+            data = rast_data[
+                window.row_off : window.row_off + window.height,
+                window.col_off : window.col_off + window.width,
+            ]
+
+            valid_rows, valid_cols = np.where(~shape_mask)
+
+            # 5. Convert indices to X, Y coordinates (centers of pixels)
+            x_coords, y_coords = rasterio.transform.xy(
+                out_transform, valid_rows, valid_cols, offset="center"
+            )
+
+            values = data[~shape_mask]
+
+            yield list(zip(x_coords, y_coords)), values, dict(feature)

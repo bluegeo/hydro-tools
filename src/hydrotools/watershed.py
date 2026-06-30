@@ -18,21 +18,13 @@ from hydrotools.utils import (
     transform_points,
     proj4_string,
 )
-from hydrotools.raster import Raster, from_raster, to_raster, TempRasterFile, vectorize
-
-
-def condition_dem(dem: str, dem_cnd_dst: str):
-    """Apply a hydrological conditioning to remove sinks.
-
-    Args:
-        dem (str): Digital Elevation Model raster.
-        dem_cnd_dst (str): Output conditioned Digital Elevation Model.
-    """
-    with GrassRunner(dem) as gr:
-        gr.run_command(
-            "r.hydrodem", (dem, "dem", "raster"), input="dem", output="dem_cnd"
-        )
-        gr.save_raster("dem_cnd", dem_cnd_dst)
+from hydrotools.raster import (
+    Raster,
+    from_raster,
+    to_raster,
+    TempRasterFile,
+    vectorize,
+)
 
 
 def flow_direction_accumulation(
@@ -419,6 +411,8 @@ class FlowAccumulation:
 
 class WatershedIndex:
     """
+    __DEPRECATED__: Use `hydrotools.watershed.FlowAccumulation` instead
+
     Build and cache an index of all contributing cells to every location on  a stream grid
 
     To create a new index, save to a file, and initialize the index:

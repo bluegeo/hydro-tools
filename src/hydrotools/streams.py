@@ -1,7 +1,9 @@
 import os
+import shutil
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory, _get_candidate_names
 from collections import OrderedDict
+from typing import Optional
 
 import numpy as np
 import dask.array as da
@@ -194,12 +196,10 @@ def _stream_topology(
             except KeyError:
                 props[f"prev_rid0{i + 1}"] = -1
 
-        stream_features.append(
-            {
-                "geometry": geometry.mapping(geometry.LineString(reach)),
-                "properties": props,
-            }
-        )
+        stream_features.append({
+            "geometry": geometry.mapping(geometry.LineString(reach)),
+            "properties": props,
+        })
 
     # Calculate strahler order for each reach.
     # Dangling reaches (those that flow into a single point) are also fixed here.
@@ -302,9 +302,9 @@ def _stream_topology(
             "properties": {
                 "rid": "int",
                 "next_rid": "int",
-                **OrderedDict(
-                    {f"prev_rid0{i + 1}": "int" for i in range(num_prv_fields)}
-                ),
+                **OrderedDict({
+                    f"prev_rid0{i + 1}": "int" for i in range(num_prv_fields)
+                }),
                 "strahler": "int",
                 "netID": "int",
                 "length": "float",
@@ -455,15 +455,15 @@ def stream_analysis(
     dem: str,
     precipitation: str,
     lakes: str,
-    t_min: str,
-    t_max: str,
-    swe: str,
-    landcover: str,
-    landcover_mapping: dict,
     streams_dst: str,
     min_area: float = 1e6,
     min_length: float = 25,
-    working_directory: str = TMP_DIR,
+    t_min: Optional[str] = None,
+    t_max: Optional[str] = None,
+    swe: Optional[str] = None,
+    landcover: Optional[str] = None,
+    landcover_mapping: Optional[dict] = None,
+    working_directory: Optional[str] = None,
     **kwargs,
 ):
     """
@@ -488,36 +488,50 @@ def stream_analysis(
         bfw_break_interval (int, optional): Interval for bankfull width breaks. Defaults to 2.
         geometric_bfw_max_cost (float, optional): Maximum cost for geometric bankfull width. Defaults to 0.8.
     """
+    if working_directory is None:
+        wkdir = os.path.join(TMP_DIR, next(_get_candidate_names()))
+    else:
+        wkdir = working_directory
+
+    os.makedirs(wkdir, exist_ok=True)
+
     # Output Rasters that can be saved if desired
     rasters = SimpleNamespace(
-        fd=os.path.join(working_directory, "fd.tif"),
-        fa=os.path.join(working_directory, "fa.tif"),
-        fa_scaled=os.path.join(working_directory, "fa_scaled.tif"),
-        streams=os.path.join(working_directory, "streams.tif"),
-        mean_elev=os.path.join(working_directory, "mean_elev.tif"),
-        lakes_src=os.path.join(working_directory, "lakes.tif"),
-        precip_src=os.path.join(working_directory, "precip.tif"),
-        t_min=os.path.join(working_directory, "t_min.tif"),
-        t_max=os.path.join(working_directory, "t_max.tif"),
-        swe=os.path.join(working_directory, "swe.tif"),
-        area=os.path.join(working_directory, "area.tif"),
-        mean_precip=os.path.join(working_directory, "mean_precip.tif"),
-        bfw=os.path.join(working_directory, "bfw.tif"),
-        gradient=os.path.join(working_directory, "gradient.tif"),
-        valley_width=os.path.join(working_directory, "valley_width.tif"),
-        valley_conf=os.path.join(working_directory, "valley_conf.tif"),
-        reaches=os.path.join(working_directory, "reaches.tif"),
-        solrad=os.path.join(working_directory, "solrad.tif"),
-        solrad_sum=os.path.join(working_directory, "solrad_sum.tif"),
-        tri=os.path.join(working_directory, "tri.tif"),
-        slope_dst=os.path.join(working_directory, "slope.tif"),
+        fd=os.path.join(wkdir, "fd.tif"),
+        fa=os.path.join(wkdir, "fa.tif"),
+        fa_scaled=os.path.join(wkdir, "fa_scaled.tif"),
+        streams=os.path.join(wkdir, "streams.tif"),
+        mean_elev=os.path.join(wkdir, "mean_elev.tif"),
+        lakes_src=os.path.join(wkdir, "lakes.tif"),
+        precip_src=os.path.join(wkdir, "precip.tif"),
+        t_min=os.path.join(wkdir, "t_min.tif"),
+        t_max=os.path.join(wkdir, "t_max.tif"),
+        swe=os.path.join(wkdir, "swe.tif"),
+        area=os.path.join(wkdir, "area.tif"),
+        mean_precip=os.path.join(wkdir, "mean_precip.tif"),
+        bfw=os.path.join(wkdir, "bfw.tif"),
+        gradient=os.path.join(wkdir, "gradient.tif"),
+        valley_width=os.path.join(wkdir, "valley_width.tif"),
+        valley_conf=os.path.join(wkdir, "valley_conf.tif"),
+        reaches=os.path.join(wkdir, "reaches.tif"),
+        solrad=os.path.join(wkdir, "solrad.tif"),
+        solrad_sum=os.path.join(wkdir, "solrad_sum.tif"),
+        tri=os.path.join(wkdir, "tri.tif"),
+        slope_dst=os.path.join(wkdir, "slope.tif"),
     )
-    for lc_name in landcover_mapping.values():
-        setattr(
-            rasters,
-            lc_name,
-            os.path.join(working_directory, f"lc_{lc_name}.tif"),
-        )
+
+    if landcover is not None:
+        if landcover_mapping is None:
+            raise ValueError(
+                "Landcover mapping must be provided if landcover raster is provided."
+            )
+
+        for lc_name in landcover_mapping.values():
+            setattr(
+                rasters,
+                lc_name,
+                os.path.join(wkdir, f"lc_{lc_name}.tif"),
+            )
 
     print("Calculating Flow Direction and Accumulation...")
     with TempRasterFile() as fd_tmp:
@@ -662,7 +676,8 @@ def stream_analysis(
 
         with TempRasterFile() as mean_solrad:
             to_raster(
-                da.dstack(all_rads)
+                da
+                .dstack(all_rads)
                 .mean(axis=2)
                 .reshape(1, rt.shape[1], rt.shape[2])
                 .rechunk(rt.chunks),
@@ -685,42 +700,52 @@ def stream_analysis(
     # -------------------------
     # Other met parameters
     # -------------------------
-    print("Summarizing Meteorological Parameters...")
     with TempRasterFiles(3) as (t_min_src, t_max_src, swe_src):
-        warp_like(t_min, t_min_src, dem, as_cog=False)
-        warp_like(t_max, t_max_src, dem, as_cog=False)
-        warp_like(swe, swe_src, dem, as_cog=False)
+        if t_min is not None:
+            print("Summarizing Minimum Temperature...")
+            warp_like(t_min, t_min_src, dem, as_cog=False)
+            summarize_on_streams(flow_accum, streams_a, t_min_src, rasters.t_min)
 
-        summarize_on_streams(flow_accum, streams_a, t_min_src, rasters.t_min)
-        summarize_on_streams(flow_accum, streams_a, t_max_src, rasters.t_max)
-        summarize_on_streams(flow_accum, streams_a, swe_src, rasters.swe)
+        if t_max is not None:
+            print("Summarizing Maximum Temperature...")
+            warp_like(t_max, t_max_src, dem, as_cog=False)
+            summarize_on_streams(flow_accum, streams_a, t_max_src, rasters.t_max)
+
+        if swe is not None:
+            print("Summarizing Snow Water Equivalent...")
+            warp_like(swe, swe_src, dem, as_cog=False)
+            summarize_on_streams(flow_accum, streams_a, swe_src, rasters.swe)
 
     # -------------------------
     # Landcover
     # -------------------------
-    print("Summarizing Landcover...")
     with TempRasterFile() as landcover_src:
-        warp_like(landcover, landcover_src, dem, as_cog=False, resample_method="near")
+        if landcover is not None:
+            print("Summarizing Landcover...")
 
-        r = Raster(landcover_src)
-        lc_a = from_raster(landcover_src)
+            warp_like(
+                landcover, landcover_src, dem, as_cog=False, resample_method="near"
+            )
 
-        for lc_key, lc_name in landcover_mapping.items():
-            with TempRasterFile() as dst:
-                to_raster(
-                    (lc_a == lc_key).astype("float32") * r.csx * r.csy,
-                    landcover_src,
-                    dst,
-                    as_cog=False,
-                )
+            r = Raster(landcover_src)
+            lc_a = from_raster(landcover_src)
 
-                summarize_on_streams(
-                    flow_accum,
-                    streams_a,
-                    dst,
-                    getattr(rasters, lc_name),
-                    method="sum",
-                )
+            for lc_key, lc_name in landcover_mapping.items():
+                with TempRasterFile() as dst:
+                    to_raster(
+                        (lc_a == lc_key).astype("float32") * r.csx * r.csy,
+                        landcover_src,
+                        dst,
+                        as_cog=False,
+                    )
+
+                    summarize_on_streams(
+                        flow_accum,
+                        streams_a,
+                        dst,
+                        getattr(rasters, lc_name),
+                        method="sum",
+                    )
 
     # Summarize mean elevation on streams
     summarize_on_streams(flow_accum, streams_a, dem, rasters.mean_elev)
@@ -773,7 +798,7 @@ def stream_analysis(
                         )
                     ),
                 )
-                
+
                 setattr(
                     feat.props,
                     "out_area_km2",
@@ -808,7 +833,7 @@ def stream_analysis(
                         )
                     ),
                 )
-                
+
                 setattr(
                     feat.props,
                     "elev_max",
@@ -871,16 +896,21 @@ def stream_analysis(
                 "ws_mean_tri": rasters.tri,
                 "ws_mean_slope": rasters.slope_dst,
                 "ws_mean_precip_mm": rasters.mean_precip,
-                "ws_mean_tmin": rasters.t_min,
-                "ws_mean_tmax": rasters.t_max,
-                "ws_mean_swe": rasters.swe,
             }
-            attrs.update(
-                {
+
+            if t_min is not None:
+                attrs["ws_mean_tmin"] = rasters.t_min
+            if t_max is not None:
+                attrs["ws_mean_tmax"] = rasters.t_max
+            if swe is not None:
+                attrs["ws_mean_swe"] = rasters.swe
+
+            if landcover is not None:
+                attrs.update({
                     lc_name: getattr(rasters, lc_name)
                     for lc_name in landcover_mapping.values()
-                }
-            )
+                })
+
             for attr_name, attr_rast in attrs.items():
                 print(f"Adding {attr_name} to stream reaches...")
                 a = from_raster(attr_rast)[0, ...].compute()
@@ -909,3 +939,6 @@ def stream_analysis(
                 streams_dst, "w", "GPKG", schema=schema, crs=crs
             ) as out_layer:
                 out_layer.writerecords([feat.fiona_record for feat in topo_feats])
+
+    if working_directory is None:
+        shutil.rmtree(wkdir, ignore_errors=True)
