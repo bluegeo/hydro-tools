@@ -25,6 +25,7 @@ from hydrotools.raster import (
     from_raster,
     to_raster,
     vectorize,
+    warp_like,
 )
 from hydrotools.utils import (
     GrassRunner,
@@ -752,7 +753,11 @@ def bankfull_width(
         p_exp (float): Precip expenential scale. Defaults to 0.355.
     """
     # Calculate contributing area and mean annual precip
-    with TempRasterFiles(2) as (ca, mean_precip):
+    with TempRasterFiles(3) as (ca, mean_precip, precip_aligned):
+        if not Raster(precip).matches(flow_direction):
+            warp_like(precip, precip_aligned, flow_direction, resample_method="bilinear", as_cog=False)
+            precip = precip_aligned
+
         fd = FlowAccumulation(flow_direction)
         fd.contributing_area(ca)
         fd.calculate(precip, mean_precip, "mean")

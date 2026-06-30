@@ -75,11 +75,17 @@ class TempVectorFiles:
                 os.remove(path)
 
 
+def _compute_raster_stats(path: str):
+    exe = shutil.which("gdal_edit.py") or shutil.which("gdal_edit")
+    if exe:
+        try:
+            run([exe, "-stats", path], check=True)
+        except Exception:
+            print("Warning: no valid pixels found")
+
+
 def translate_to_cog(src: str, dst: str):
-    try:
-        run(["gdal_edit.py", "-stats", src], check=True)
-    except:
-        print("Warning: no valid pixels found")
+    _compute_raster_stats(src)
 
     run(
         ["gdal_translate"]
@@ -195,7 +201,7 @@ class GrassRunner(Session):
                 **kwargs,
             )
 
-            run(["gdal_edit.py", "-stats", out_path], check=True)
+            _compute_raster_stats(out_path)
 
     def save_vector(self, dataset: str, out_path: str, layer: str = None):
         """Save a dataset to a geopackage
