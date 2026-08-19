@@ -1,28 +1,34 @@
-from logging import warning
 import os
-from typing import Union, Tuple
 from collections import OrderedDict
+from logging import warning
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
 from tempfile import TemporaryDirectory
 
-import fiona
-from shapely.geometry import LineString, Point
 import dask.array as da
+import fiona
+import numpy as np
 from dask_image.ndmorph import binary_erosion
 from numba import njit
 from numba.typed import List
 from scipy.interpolate import griddata
 from scipy.optimize import minimize
-import numpy as np
+from shapely.geometry import LineString, Point
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.neighbors import BallTree
 
 from hydrotools.config import CHUNKS
+from hydrotools.elevation import slope
+from hydrotools.interpolate import (
+    PointInterpolator,
+    distance_transform,
+    normalize,
+    raster_filter,
+)
 from hydrotools.raster import (
     Raster,
-    raster_where,
     from_raster,
+    raster_where,
     to_raster,
     vectorize,
     warp_like,
@@ -31,20 +37,13 @@ from hydrotools.utils import (
     GrassRunner,
     TempRasterFile,
     TempRasterFiles,
-    kernel_from_distance,
     compare_projections,
+    kernel_from_distance,
 )
 from hydrotools.watershed import (
+    FlowAccumulation,
     extract_streams,
     flow_direction_accumulation,
-    FlowAccumulation,
-)
-from hydrotools.elevation import slope
-from hydrotools.interpolate import (
-    PointInterpolator,
-    raster_filter,
-    distance_transform,
-    normalize,
 )
 
 
@@ -154,9 +153,7 @@ def _upstream_compute(
     return gradient_arr
 
 
-def sinuosity(
-    stream_vector: str, sinuosity_vector: str, sampling: Union[float, str] = 100
-):
+def sinuosity(stream_vector: str, sinuosity_vector: str, sampling: float | str = 100):
     """Calculate sinuosity over a moving window using a line vector file
 
     Args:
@@ -252,7 +249,7 @@ def stream_slope(
     slope_dst: str,
     units: str = "degrees",
     scale: float = 1,
-    focal_mean_dist: Union[None, float] = None,
+    focal_mean_dist: None | float = None,
 ):
     """Calculate slope along extracted streams.
 
@@ -335,13 +332,13 @@ def upstream_stats(
     max_window = int(np.ceil(distance / min(csx, csy))) + 2
 
     streams_dask = from_raster(streams)
-    values_arr = np.squeeze(
-        da.ma.filled(from_raster(values), np.nan).compute()
-    ).astype(np.float64)
+    values_arr = np.squeeze(da.ma.filled(from_raster(values), np.nan).compute()).astype(
+        np.float64
+    )
     streams_mask = np.squeeze(~da.ma.getmaskarray(streams_dask).compute())
-    fd_arr = np.squeeze(
-        da.ma.filled(from_raster(flow_direction), 0).compute()
-    ).astype(np.int32)
+    fd_arr = np.squeeze(da.ma.filled(from_raster(flow_direction), 0).compute()).astype(
+        np.int32
+    )
 
     n_rows, n_cols = values_arr.shape
     gradient_arr = np.full((n_rows, n_cols), np.nan, dtype=np.float32)
@@ -577,7 +574,7 @@ def bankfull_width_geometric(
 
 def fit_morphology_equation(
     csv_data: str, obs_field: str, **kwargs
-) -> Tuple[float, float, float]:
+) -> tuple[float, float, float]:
     """
     Optimize the coeff, a_exp, and p_exp parameters in the stream morphology equation:
 
@@ -755,7 +752,13 @@ def bankfull_width(
     # Calculate contributing area and mean annual precip
     with TempRasterFiles(3) as (ca, mean_precip, precip_aligned):
         if not Raster(precip).matches(flow_direction):
-            warp_like(precip, precip_aligned, flow_direction, resample_method="bilinear", as_cog=False)
+            warp_like(
+                precip,
+                precip_aligned,
+                flow_direction,
+                resample_method="bilinear",
+                as_cog=False,
+            )
             precip = precip_aligned
 
         fd = FlowAccumulation(flow_direction)
@@ -1087,7 +1090,7 @@ class RiparianConnectivity:
         # Components of the analysis
         (
             self.slope,
-            self.flow_accumulation,
+            self.flow_direction,
             self.streams,
             self.twi,
             self.region,
@@ -1142,7 +1145,7 @@ class RiparianConnectivity:
         self,
         min_ws_area: float = 1e6,
         min_stream_length: float = 0,
-        memory: Union[int, None] = 4096,
+        memory: int | None = 4096,
     ):
         """Create a streams attribute.
 
@@ -1155,20 +1158,20 @@ class RiparianConnectivity:
             management of `r.watershed` operations. Defaults to None.
         """
         streams = self.raster_path("streams")
-        if self.flow_accumulation is None:
-            fa = self.raster_path("flow_accumulation")
+        if self.flow_direction is None:
+            fd2 = self.raster_path("flow_direction")
         else:
-            fa = self.flow_accumulation
+            fd2 = self.flow_direction
 
-        with TempRasterFiles(2) as (fd1, fd2):
-            if self.flow_accumulation is None:
+        with TempRasterFiles(2) as (fd, fa):
+            if self.flow_direction is None:
                 flow_direction_accumulation(
-                    self.dem, fd1, fa, False, False, memory=memory
+                    self.dem, fd, fa, False, False, memory=memory
                 )
 
             extract_streams(
                 self.dem,
-                fa,
+                fd,
                 streams,
                 fd2,
                 min_ws_area,
@@ -1177,7 +1180,7 @@ class RiparianConnectivity:
             )
 
         self.streams = streams
-        self.flow_accumulation = fa
+        self.flow_direction = fd2
 
     def calc_twi(self, memory: int = 4096):
         """Calculate a Topographic Wetness Attribute, which is also used to constrain the
@@ -1271,7 +1274,7 @@ class RiparianConnectivity:
             cutoff (float, optional): A maximum Bankfull Width threshold to use for the
                 normalized value. Defaults to 10.0m.
         """
-        if self.streams is None or self.flow_accumulation is None:
+        if self.streams is None or self.flow_direction is None:
             raise AttributeError(
                 "Streams must be extracted using `RiparianConnectivity.extract_streams`"
                 " prior to calculating Bankfull Width."
@@ -1288,7 +1291,7 @@ class RiparianConnectivity:
         bankfull_width_dst = self.raster_path("bankfull_width")
         with TempRasterFiles(2) as (bankfull_dst, bankfull_norm_dst):
             bankfull_width(
-                self.streams, self.flow_accumulation, annual_precip_src, bankfull_dst
+                self.streams, self.flow_direction, annual_precip_src, bankfull_dst
             )
             normalize(bankfull_dst, bankfull_norm_dst, (0, cutoff))
             self.interpolate_into_region(bankfull_norm_dst, bankfull_width_dst)
