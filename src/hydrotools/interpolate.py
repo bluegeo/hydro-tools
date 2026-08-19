@@ -1,13 +1,13 @@
-from multiprocessing.dummy import Pool as DummyPool
+from collections.abc import Callable
 from multiprocessing import cpu_count
-from typing import Union, Callable
+from multiprocessing.dummy import Pool as DummyPool
 
-import numpy as np
 import dask.array as da
+import numpy as np
 from dask_image.ndmorph import binary_erosion
 from numba import njit
-from numba.typed import List, Dict
-from sklearn.neighbors import KNeighborsRegressor, BallTree
+from numba.typed import Dict, List
+from sklearn.neighbors import BallTree, KNeighborsRegressor
 
 from hydrotools.raster import Raster, from_raster, to_raster
 from hydrotools.utils import GrassRunner
@@ -15,10 +15,11 @@ from hydrotools.utils import GrassRunner
 
 def custom_raster_filter(
     raster_source: str,
-    kernel: Union[np.ndarray, tuple],
+    kernel: np.ndarray | tuple,
     func: Callable,
     filter_dst: str,
     *args,
+    out_dtype: str = None,
 ):
     """Filter a raster using a defined kernel and custom numba.njit function
 
@@ -30,6 +31,9 @@ def custom_raster_filter(
         window.
         func (Callable): Custom function that reduces the kernel to a single scalar
         filter_dst (str): Path to the output filtered raster
+        out_dtype (str, optional): Data type of the output raster. Defaults to the
+        filter result dtype (float32). Note that forcing the source dtype can overflow
+        or truncate results for reducers such as `sum`, `std` or `variance`.
 
     args:
         Any custom arguments to be added to the input `func`
@@ -78,7 +82,7 @@ def custom_raster_filter(
 
     i_start = int(np.ceil((kernel.shape[0] - 1) / 2.0))
     i_end = kernel.shape[0] - 1 - i_start
-    j_start = int(np.ceil(kernel.shape[1] - 1) / 2.0)
+    j_start = int(np.ceil((kernel.shape[1] - 1) / 2.0))
     j_end = kernel.shape[1] - 1 - j_start
 
     depth = {
@@ -102,21 +106,21 @@ def custom_raster_filter(
         args=args,
     )
 
-    to_raster(
-        da.ma.masked_where(da.isnan(filter_result), filter_result).astype(
-            Raster(raster_source).dtype
-        ),
-        raster_source,
-        filter_dst,
-    )
+    filter_result = da.ma.masked_where(da.isnan(filter_result), filter_result)
+
+    if out_dtype is not None:
+        filter_result = filter_result.astype(out_dtype)
+
+    to_raster(filter_result, raster_source, filter_dst)
 
 
 def raster_filter(
     raster_source: str,
-    kernel: Union[np.ndarray, tuple],
+    kernel: np.ndarray | tuple,
     method: str,
     filter_dst: str,
     *args,
+    out_dtype: str = None,
 ):
     """Filter a raster using a defined kernel and method
 
@@ -142,6 +146,9 @@ def raster_filter(
             ]
             When choosing percentil or quantile, the `q` kwarg should be specified.
         filter_dst (str): Path to the output filtered raster
+        out_dtype (str, optional): Data type of the output raster. Defaults to the
+        filter result dtype (float32). Avoid forcing an integer source dtype for `sum`,
+        `std` or `variance`, as the result can overflow or be truncated.
 
     args:
         q: Percentile or quantile to use if `method` is percentile or quantile
@@ -235,7 +242,9 @@ def raster_filter(
         def func(sample):
             return np.nanquantile(sample)
 
-    custom_raster_filter(raster_source, kernel, func, filter_dst, *args)
+    custom_raster_filter(
+        raster_source, kernel, func, filter_dst, *args, out_dtype=out_dtype
+    )
 
 
 def distance_transform(raster_source: str, distance_dst: str):
@@ -704,8 +713,7 @@ class PointInterpolator:
         Yields:
             Generator[np.ndarray]: Chunk of predicted points (with obs and obs_z if required)
         """
-        if n_chunks < 1:
-            n_chunks = 1
+        n_chunks = max(n_chunks, 1)
         chunkRange = list(range(0, self.pred.shape[0] + n_chunks, n_chunks))
         for fr, to in zip(chunkRange[:-1], chunkRange[1:-1] + [self.pred.shape[0]]):
             if return_obs:
