@@ -17,7 +17,7 @@ from shapely.geometry import LineString, Point
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.neighbors import BallTree
 
-from hydrotools.config import CHUNKS
+from hydrotools.config import CHUNKS, TMP_DIR
 from hydrotools.elevation import slope
 from hydrotools.interpolate import (
     PointInterpolator,
@@ -1085,7 +1085,7 @@ class RiparianConnectivity:
         self.__dict__.update(Raster.raster_specs(dem))
 
         # Create a directory
-        self.tmp_dir = TemporaryDirectory()
+        self.tmp_dir = TemporaryDirectory(dir=TMP_DIR)
 
         # Components of the analysis
         (
@@ -1165,13 +1165,11 @@ class RiparianConnectivity:
 
         with TempRasterFiles(2) as (fd, fa):
             if self.flow_direction is None:
-                flow_direction_accumulation(
-                    self.dem, fd, fa, False, False, memory=memory
-                )
+                flow_direction_accumulation(self.dem, fd, fa, memory=memory)
 
             extract_streams(
                 self.dem,
-                fd,
+                fa,
                 streams,
                 fd2,
                 min_ws_area,
