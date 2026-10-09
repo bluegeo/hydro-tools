@@ -30,6 +30,9 @@ Hydrological and terrain utilities for preparing data and performing simulations
 1. **GDAL** with Python bindings (conda is recommended)
 2. **GRASS GIS** — [download here](https://grass.osgeo.org/download/)
 
+Python dependencies are installed automatically, including Dask's array extra
+(`dask[array]>=2022.1.0`).
+
 ### Install from source
 
 ```bash

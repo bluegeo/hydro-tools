@@ -1443,7 +1443,7 @@ class RiparianConnectivity:
 
         if quantize:
             percentile_sample = sensitivity[~da.ma.getmaskarray(sensitivity)]
-            qs = [da.percentile(percentile_sample, q)[0] for q in percentiles]
+            qs = [da.percentile(percentile_sample, [q])[0] for q in percentiles]
 
             sensitivity = da.ma.masked_where(
                 da.ma.getmaskarray(from_raster(self.region)),
