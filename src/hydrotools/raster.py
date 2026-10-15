@@ -867,7 +867,7 @@ def raster_where(
         if_true_mask = cond & if_true_mask
     else:
         # A scalar - do not mask any locations
-        if_true_mask = da.zeros(a.shape, "bool", chunks=a.chunksize)
+        if_true_mask = da.zeros(a.shape, dtype="bool", chunks=a.chunksize)
 
     if_false_mask = da.ma.getmaskarray(if_false)
     if if_false_mask.shape:

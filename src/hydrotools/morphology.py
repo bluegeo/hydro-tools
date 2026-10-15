@@ -1,3 +1,4 @@
+import math
 import os
 from collections import OrderedDict
 from logging import warning
@@ -17,12 +18,10 @@ from shapely.geometry import LineString, Point
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.neighbors import BallTree
 
-from hydrotools.config import CHUNKS, TMP_DIR
+from hydrotools.config import TMP_DIR
 from hydrotools.elevation import slope
 from hydrotools.interpolate import (
-    PointInterpolator,
     distance_transform,
-    normalize,
     raster_filter,
 )
 from hydrotools.raster import (
@@ -45,6 +44,9 @@ from hydrotools.watershed import (
     extract_streams,
     flow_direction_accumulation,
 )
+
+DEFAULT_COST_FLOOR = math.tan(math.radians(0.5))
+"""Minimum friction (m/m) applied to the rise cost surface on flat terrain."""
 
 
 @njit
@@ -527,49 +529,80 @@ def bankfull_width_geometric(
                 bankfull_dst,
             )
         elif method == "balltree":
-            # Accumulate the distance to edges along streams
-            edge_points = np.array(da.where(edges[0])).T.astype("float32")
-            edge_points[:, 0] *= raster_specs["csy"]
-            edge_points[:, 1] *= raster_specs["csx"]
+            region_width(region, streams, bankfull_dst)
 
-            stream_mask = ~da.ma.getmaskarray(from_raster(streams))
 
-            stream_inds = np.array(da.where(stream_mask[0])).T
-            stream_points = stream_inds.astype("float32")
-            stream_points[:, 0] *= raster_specs["csy"]
-            stream_points[:, 1] *= raster_specs["csx"]
+def region_width(
+    region: str | da.Array,
+    streams: str,
+    width_dst: str,
+):
+    """Measure the width of a region surrounding streams, attributed to stream cells.
 
-            bt = BallTree(stream_points)
-            distances, indices = map(lambda x: x.ravel(), bt.query(edge_points, 1))
+    Region edge cells are assigned to their nearest stream cell and the mean distance
+    from each stream cell to its edge cells is doubled to represent the full width
+    across the stream. Stream cells without edge cells are interpolated from their
+    neighbours.
 
-            bins = np.bincount(indices, distances)
-            indices, counts = np.unique(indices, return_counts=True)
-            # Distance is the average of distance to surrounding banks * 2 to account for
-            # the entire valley width.
-            distances = (bins[indices] / counts) * 2
+    Args:
+        region (str | da.Array): Boolean region raster (nodata or 0 outside), or a
+            boolean dask array in raster shape.
+        streams (str): Stream raster derived from `watershed.extract_streams`.
+        width_dst (str): Output width raster (m) on stream cells.
+    """
+    raster_specs = Raster.raster_specs(streams)
+    avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
 
-            bfw = np.full(stream_mask.shape[1:], -1, np.float32)
-            bfw[(stream_inds[indices][:, 0], stream_inds[indices][:, 1])] = distances
-            avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2
-            bfw[bfw == 0] = avg_cs
+    if isinstance(region, str):
+        region_a = from_raster(region)
+        region = ~da.ma.getmaskarray(region_a) & (da.ma.filled(region_a, 0) != 0)
 
-            # Interpolate where streams are missing values
-            valid_bfw = bfw != -1
-            points = np.array(np.where(valid_bfw)).T
-            values = bfw[valid_bfw]
-            xi = np.array(np.where(~valid_bfw & stream_mask.compute()[0])).T
+    eroded = binary_erosion(region, np.ones((1, 3, 3), bool))
+    edges = region & ~eroded
 
-            bfw[(xi[:, 0], xi[:, 1])] = griddata(points, values, xi, fill_value=avg_cs)
+    # Accumulate the distance to edges along streams
+    edge_points = np.array(da.where(edges[0])).T.astype("float32")
+    edge_points[:, 0] *= raster_specs["csy"]
+    edge_points[:, 1] *= raster_specs["csx"]
 
-            out_dask = da.from_array(bfw.reshape(stream_mask.shape)).rechunk(
-                stream_mask.chunks
-            )
+    stream_mask = ~da.ma.getmaskarray(from_raster(streams))
 
-            to_raster(
-                da.ma.masked_where(out_dask == -1, out_dask),
-                lcp_path,
-                bankfull_dst,
-            )
+    stream_inds = np.array(da.where(stream_mask[0])).T
+    stream_points = stream_inds.astype("float32")
+    stream_points[:, 0] *= raster_specs["csy"]
+    stream_points[:, 1] *= raster_specs["csx"]
+
+    bt = BallTree(stream_points)
+    distances, indices = map(lambda x: x.ravel(), bt.query(edge_points, 1))
+
+    bins = np.bincount(indices, distances)
+    indices, counts = np.unique(indices, return_counts=True)
+    # Distance is the average of distance to surrounding banks * 2 to account for
+    # the entire valley width.
+    distances = (bins[indices] / counts) * 2
+
+    width = np.full(stream_mask.shape[1:], -1, np.float32)
+    width[(stream_inds[indices][:, 0], stream_inds[indices][:, 1])] = distances
+    width[width == 0] = avg_cs
+
+    # Interpolate where streams are missing values
+    valid = width != -1
+    points = np.array(np.where(valid)).T
+    values = width[valid]
+    xi = np.array(np.where(~valid & stream_mask.compute()[0])).T
+
+    if len(xi) > 0:
+        width[(xi[:, 0], xi[:, 1])] = griddata(points, values, xi, fill_value=avg_cs)
+
+    out_dask = da.from_array(width.reshape(stream_mask.shape)).rechunk(
+        stream_mask.chunks
+    )
+
+    to_raster(
+        da.ma.masked_where(out_dask == -1, out_dask),
+        streams,
+        width_dst,
+    )
 
 
 def fit_morphology_equation(
@@ -1037,48 +1070,357 @@ def topographic_wetness(
         to_raster(cs_inverted, slope_src, topographic_wetness_dst)
 
 
+def slope_modifier(
+    stream_slope: da.Array,
+    slope_breaks: tuple[float, float] = (0.015, 0.04),
+    g_range: tuple[float, float] = (0.5, 1.25),
+) -> da.Array:
+    """Map channel gradient to a floodplain-width modifier.
+
+    Low-gradient (pool-riffle) reaches build floodplains and receive `g_max`;
+    steep (step-pool/cascade) reaches receive `g_min`; the modifier varies linearly
+    between the two gradient breaks. Breaks follow the process-domain thresholds of
+    Montgomery & Buffington (1997).
+
+    Args:
+        stream_slope (da.Array): Channel gradient as a fraction (m/m).
+        slope_breaks (tuple[float, float], optional): Gradients (m/m) at which the
+            modifier reaches `g_max` and `g_min` respectively.
+            Defaults to (0.015, 0.04).
+        g_range (tuple[float, float], optional): (`g_min`, `g_max`) bounds of the
+            modifier. Defaults to (0.5, 1.25).
+
+    Returns:
+        da.Array: Modifier in the range [`g_min`, `g_max`].
+    """
+    s_low, s_high = float(slope_breaks[0]), float(slope_breaks[1])
+    g_min, g_max = float(g_range[0]), float(g_range[1])
+
+    if s_high <= s_low:
+        raise ValueError("slope_breaks must be increasing.")
+    if g_min <= 0 or g_max < g_min:
+        raise ValueError("g_range must be positive and ordered (g_min, g_max).")
+
+    frac = da.clip((stream_slope - s_low) / (s_high - s_low), 0.0, 1.0)
+
+    return g_max - frac * (g_max - g_min)
+
+
+def rise_cost_surface(
+    slope_src: str,
+    start_cost_src: str,
+    cost_dst: str,
+    nearest_dst: str,
+    cost_floor: float = DEFAULT_COST_FLOOR,
+    max_cost: float | None = None,
+    weight_src: str | None = None,
+    knights_move: bool = True,
+    memory: int | None = 4096,
+):
+    """Accumulate topographic rise away from streams using a least cost path.
+
+    The friction surface is `cell size * (tan(slope) + cost_floor)`, so the
+    cumulative cost approximates the metres of climb along the least-climb path from
+    the stream (a path-based height above nearest drainage), plus a small distance
+    term that bounds the lateral extent across flat terrain.
+
+    Each stream cell is seeded with the value in `start_cost_src` (GRASS `r.cost -r`),
+    which allows a per-stream budget: seeding with `T_max - T_i` and thresholding the
+    output at `T_max` is equivalent to allowing stream `i` to spend `T_i` metres of
+    rise. Channel cells carry the same friction as any other cell, so the budget of a
+    larger stream extends up a tributary only until the channel has climbed the
+    difference in budgets (a backwater limit), beyond which the tributary's own seed
+    prevails. The `nearest_dst` output holds the seed value of the stream that reached
+    each cell at least cost.
+
+    Args:
+        slope_src (str): Topographic slope in degrees.
+        start_cost_src (str): Raster with seed costs on stream cells and nodata
+            elsewhere.
+        cost_dst (str): Output cumulative cost raster.
+        nearest_dst (str): Output raster with the seed value of the nearest stream.
+        cost_floor (float, optional): Minimum friction expressed as a gradient (m/m).
+            Defaults to tan(0.5 degrees).
+        max_cost (float | None, optional): Stop accumulating beyond this cumulative
+            cost; cells beyond it are nodata. Defaults to None (unbounded).
+        weight_src (str | None, optional): Raster of multiplicative friction weights,
+            for example from `convergence_weight`. Nodata weights are treated as 1.
+            Defaults to None.
+        knights_move (bool, optional): Use the knight's move in `r.cost`.
+            Defaults to True.
+        memory (int | None, optional): Memory (MB) for `r.cost`. Defaults to 4096.
+    """
+    if cost_floor <= 0:
+        raise ValueError("cost_floor must be positive to bound extent on flat terrain.")
+
+    raster_specs = Raster.raster_specs(slope_src)
+    avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
+
+    slope_deg = da.clip(from_raster(slope_src).astype(np.float64), 0.0, 89.0)
+    cost = (da.tan(da.radians(slope_deg)) + cost_floor) * avg_cs
+
+    if weight_src is not None:
+        weight = da.ma.filled(from_raster(weight_src).astype(np.float64), 1.0)
+        cost = cost * weight
+
+    with TempRasterFile() as cost_path:
+        to_raster(cost, slope_src, cost_path, as_cog=False)
+
+        kwargs = {
+            "input": "cost",
+            "output": "cum_cost",
+            "start_raster": "start_cost",
+            "nearest": "nearest",
+            "flags": "kr" if knights_move else "r",
+        }
+
+        if memory is not None:
+            kwargs["memory"] = memory
+
+        # r.cost accepts an integer maximum; 0 disables the limit
+        if max_cost is not None and max_cost > 0:
+            kwargs["max_cost"] = int(math.ceil(max_cost)) + 1
+
+        with GrassRunner(cost_path) as gr:
+            gr.run_command(
+                "r.cost",
+                (cost_path, "cost", "raster"),
+                (start_cost_src, "start_cost", "raster"),
+                **kwargs,
+            )
+            gr.save_raster("cum_cost", cost_dst)
+            gr.save_raster("nearest", nearest_dst)
+
+
+def riparian_zones(
+    cost_src: str,
+    nearest_src: str,
+    t_max: float,
+    f1: float,
+    f2: float,
+    h3: float,
+    zones_dst: str,
+    score_dst: str | None = None,
+    streams: str | None = None,
+):
+    """Classify a seeded rise-cost surface into three nested riparian zones.
+
+    With seeds of `T_max - T3_i`, the budget of the stream that reached a cell is
+    recovered as `T3 = t_max - nearest`, the rise actually spent as
+    `rise = cost - nearest`, and the inner budgets as `T2 = T3 - h3` and
+    `T1 = T2 * f1 / f2`.
+
+    Args:
+        cost_src (str): Cumulative cost from `rise_cost_surface`.
+        nearest_src (str): Nearest-seed raster from `rise_cost_surface`.
+        t_max (float): Maximum zone 3 budget used to construct the seeds.
+        f1 (float): Bankfull depth multiple defining zone 1.
+        f2 (float): Bankfull depth multiple defining zone 2.
+        h3 (float): Rise (m) above the zone 2 limit defining zone 3.
+        zones_dst (str): Output zone raster (1, 2, 3; 0 is nodata).
+        score_dst (str | None, optional): Output raster with the fraction of the
+            total budget remaining at each cell (1 at streams, 0 at the outer edge).
+            Defaults to None.
+        streams (str | None, optional): Stream raster. Channel cells are always
+            zone 1 with a score of 1, even where a neighbouring stream's seed reached
+            them more cheaply than their own. Defaults to None.
+    """
+    cost = from_raster(cost_src).astype(np.float64)
+    c0 = from_raster(nearest_src).astype(np.float64)
+
+    rise = cost - c0
+    t3 = float(t_max) - c0
+    t2 = t3 - float(h3)
+    t1 = t2 * (float(f1) / float(f2))
+
+    zones = da.where(rise < t1, 1, da.where(rise < t2, 2, da.where(rise < t3, 3, 0)))
+    score = da.clip((t3 - rise) / t3, 0.0, 1.0)
+
+    mask = da.ma.getmaskarray(cost) | da.ma.getmaskarray(c0) | (zones == 0)
+
+    if streams is not None:
+        stream_mask = ~da.ma.getmaskarray(from_raster(streams))
+        zones = da.where(stream_mask, 1, zones)
+        score = da.where(stream_mask, 1.0, score)
+        mask = mask & ~stream_mask
+
+    to_raster(
+        da.ma.masked_where(mask, zones.astype(np.uint8)),
+        cost_src,
+        zones_dst,
+        nodata_value=0,
+    )
+
+    if score_dst is not None:
+        to_raster(da.ma.masked_where(mask, score.astype(np.float32)), cost_src, score_dst)
+
+
+def convergence_weight(
+    flow_accumulation: da.Array,
+    cell_area: float,
+    a_hill: float,
+    gamma: float = 0.5,
+    w_min: float = 0.25,
+) -> da.Array:
+    """Friction weight that lowers resistance in convergent terrain.
+
+    Hillslope groundwater discharges into hollows and toe slopes in proportion to the
+    area draining to them, so convergent cells remain connected to the riparian water
+    table at greater rise than planar or divergent cells. The weight is
+
+        w = clip((a_hill / a) ** gamma, w_min, 1)
+
+    where `a` is contributing area. Cells draining less than `a_hill` are unaffected.
+
+    Args:
+        flow_accumulation (da.Array): Contributing cell count from
+            `watershed.flow_direction_accumulation`.
+        cell_area (float): Area of a cell (m2) used to convert counts to area.
+        a_hill (float): Contributing area (m2) above which terrain is considered
+            convergent.
+        gamma (float, optional): Rate at which friction decreases with area.
+            Defaults to 0.5.
+        w_min (float, optional): Minimum weight. Defaults to 0.25.
+
+    Returns:
+        da.Array: Weights in the range [`w_min`, 1].
+    """
+    if a_hill <= 0 or gamma <= 0 or not 0 < w_min <= 1:
+        raise ValueError("a_hill and gamma must be positive and 0 < w_min <= 1.")
+
+    area = da.maximum(flow_accumulation.astype(np.float64), 1.0) * float(cell_area)
+
+    return da.clip((float(a_hill) / area) ** float(gamma), float(w_min), 1.0)
+
+
+def extend_fringe(
+    fringe_cost_src: str,
+    fringe_nearest_src: str,
+    t_max: float,
+    h3: float,
+    zones_src: str,
+    score_src: str,
+    zones_dst: str,
+    score_dst: str,
+):
+    """Union a second-pass fringe with existing zones.
+
+    The second pass is seeded from zone 1 and 2 cells with their first-pass seed
+    values, so `t_max - nearest` recovers the stream budget and `cost - nearest` the
+    friction spent from the floodplain edge. Cells within `h3` of the edge that are not
+    already in zones 1 or 2 become zone 3.
+
+    Args:
+        fringe_cost_src (str): Cumulative cost from the second `rise_cost_surface` pass.
+        fringe_nearest_src (str): Nearest-seed raster from the second pass.
+        t_max (float): Maximum zone 3 budget used to construct the first-pass seeds.
+        h3 (float): Fringe budget.
+        zones_src (str): First-pass zones from `riparian_zones`.
+        score_src (str): First-pass score from `riparian_zones`.
+        zones_dst (str): Output zones.
+        score_dst (str): Output score.
+    """
+    zones = from_raster(zones_src)
+    score = from_raster(score_src).astype(np.float64)
+
+    cost = from_raster(fringe_cost_src).astype(np.float64)
+    c0 = from_raster(fringe_nearest_src).astype(np.float64)
+    spent = cost - c0
+    t3 = float(t_max) - c0
+
+    floodplain = ~da.ma.getmaskarray(zones) & (zones <= 2)
+    reached = ~da.ma.getmaskarray(cost) & (spent < float(h3)) & ~floodplain
+
+    fringe_score = da.clip((float(h3) - spent) / t3, 0.0, 1.0)
+
+    zones_f = da.ma.filled(zones, 0)
+    out_zones = da.where(reached & (zones_f == 0), 3, zones_f)
+    out_score = da.where(
+        reached, da.maximum(da.ma.filled(score, 0.0), fringe_score), da.ma.filled(score, 0.0)
+    )
+
+    mask = out_zones == 0
+
+    to_raster(
+        da.ma.masked_where(mask, out_zones.astype(np.uint8)),
+        zones_src,
+        zones_dst,
+        nodata_value=0,
+    )
+    to_raster(da.ma.masked_where(mask, out_score.astype(np.float32)), zones_src, score_dst)
+
+
 class RiparianConnectivity:
-    """Riparian analysis workflow
+    """Riparian zone delineation workflow
+
+    Three nested zones are delineated around a stream network by accumulating
+    topographic rise (a path-based height above the stream) away from each stream cell
+    and comparing it with per-stream budgets:
+
+    * Zone 1 - channel and active floodplain: rise < `f1 * D_bf * g`
+    * Zone 2 - flood-prone area: rise < `f2 * D_bf * g`
+    * Zone 3 - groundwater-connected fringe: rise < zone 2 limit + `h3`
+
+    where `D_bf` is bankfull depth derived from bankfull width (contributing area and
+    mean annual precipitation; Hall et al. 2007), `g` is a channel-gradient modifier
+    (low-gradient reaches build wider floodplains), and `h3` is an absolute band in
+    metres representing a water table that follows topography and remains within
+    rooting depth of the surface.
 
     The general steps are:
 
-    1. Instantiate using DEM
+    1. Instantiate using a DEM and a mean annual precipitation grid (mm)
 
-        `rc = RiparianConnectivity(dem_path)`
+        `rc = RiparianConnectivity(dem_path, precip_path)`
 
     2. Extract streams
 
         `rc.extract_streams()`
 
-    3. Calculate the Topographic Wetness Index
+    3. Calculate stream attributes (bankfull width and depth, channel gradient)
 
-        `rc.calc_twi()`
+        `rc.calc_stream_attributes()`
 
-    4. Define a riparian region
+    4. Delineate zones
 
-        `rc.define_region()`
+        `rc.calc_zones()`
 
-        Here you should visually examing the output regions and verify they align with
-        valley bottoms. If needed, recalculate using a different twi_cutoff. Ex.
-        `rc.define_region(740)`
+        Inspect the `zones` raster and adjust `f1`, `f2`, `h3` or the gradient
+        modifier as needed, then recalculate.
 
-    5. You may now calculate attributes that you wish to add. The following
-        includes all of them:
-
-        ```
-        rc.calc_bankfull_width(annual_precip_grid)
-        rc.calc_stream_slope()
-        rc.calc_stream_density()
-        ```
-
-    6. Calculate Riparian Connectivity regions using the desired attributes:
+    5. Save the result
 
         `rc.calc_connectivity(output_dataset)`
-
     """
 
-    def __init__(self, dem: str):
-        """Define a study area and begin a Riparian Connectivity Analysis"""
+    _attributes = (
+        "slope",
+        "flow_direction",
+        "flow_accumulation",
+        "streams",
+        "bankfull_width",
+        "bankfull_depth",
+        "stream_slope",
+        "start_cost",
+        "cost",
+        "nearest",
+        "fringe_cost",
+        "fringe_nearest",
+        "zones",
+        "score",
+        "region",
+        "t_max",
+        "min_ws_area",
+    )
+
+    def __init__(self, dem: str, annual_precip: str):
+        """Define a study area and begin a riparian analysis.
+
+        Args:
+            dem (str): Digital Elevation Model raster in a projected system (metres).
+            annual_precip (str): Mean annual precipitation grid in mm. The grid is
+                warped to the DEM if it does not align.
+        """
         self.dem = dem
 
         # Specifications
@@ -1087,17 +1429,24 @@ class RiparianConnectivity:
         # Create a directory
         self.tmp_dir = TemporaryDirectory(dir=TMP_DIR)
 
-        # Components of the analysis
-        (
-            self.slope,
-            self.flow_direction,
-            self.streams,
-            self.twi,
-            self.region,
-            self.bankfull_width,
-            self.stream_slope,
-            self.stream_density,
-        ) = (None for _ in range(8))
+        for attr in self._attributes:
+            setattr(self, attr, None)
+
+        self.precip = self._prepare_precip(annual_precip)
+
+    def _prepare_precip(self, annual_precip: str) -> str:
+        if Raster(annual_precip).matches(self.dem):
+            return annual_precip
+
+        precip_dst = self.raster_path("precip")
+        warp_like(
+            annual_precip,
+            precip_dst,
+            self.dem,
+            resample_method="bilinear",
+            as_cog=False,
+        )
+        return precip_dst
 
     def raster_path(self, name: str) -> str:
         """Generate a raster path using the current temporary directory.
@@ -1129,330 +1478,344 @@ class RiparianConnectivity:
         ]):
             raise ValueError(f"Input raster {src} does not align with the study area.")
 
-    # TODO: copy tmp_dir to a specified dir
-    # def save(self, dst_dir: str):
-    #     """_summary_
-
-    #     Args:
-    #         dst_dir (str): _description_
-    #     """
-
-    # @classmethod
-    # def load_from_data(cls):
-    # TODO: Load from all required parameters
-
     def extract_streams(
         self,
         min_ws_area: float = 1e6,
         min_stream_length: float = 0,
         memory: int | None = 4096,
     ):
-        """Create a streams attribute.
+        """Create the streams, flow direction and flow accumulation attributes.
 
         Args:
             min_ws_area (float, optional): Minimum contributing area (m2) used to
             classify streams. Defaults to 1e6 (1 km squared).
-            min_stream_lenth (float, optional): Minimum length of stream segments.
+            min_stream_length (float, optional): Minimum length of stream segments.
             Defaults to 0.
             memory (Union[int, None], optional): Memory size to pass to GRASS for memory
-            management of `r.watershed` operations. Defaults to None.
+            management of `r.watershed` operations. Defaults to 4096.
         """
         streams = self.raster_path("streams")
-        if self.flow_direction is None:
-            fd2 = self.raster_path("flow_direction")
-        else:
-            fd2 = self.flow_direction
+        fd = self.raster_path("flow_direction")
+        fa = self.raster_path("flow_accumulation")
 
-        with TempRasterFiles(2) as (fd, fa):
-            if self.flow_direction is None:
-                flow_direction_accumulation(self.dem, fd, fa, memory=memory)
+        flow_direction_accumulation(self.dem, fd, fa, memory=memory)
 
-            extract_streams(
-                self.dem,
-                fa,
-                streams,
-                fd2,
-                min_ws_area,
-                min_stream_length,
-                memory=memory,
-            )
+        extract_streams(
+            self.dem,
+            fa,
+            streams,
+            fd,
+            min_ws_area,
+            min_stream_length,
+            memory=memory,
+        )
 
         self.streams = streams
-        self.flow_direction = fd2
+        self.flow_direction = fd
+        self.flow_accumulation = fa
+        self.min_ws_area = min_ws_area
 
-    def calc_twi(self, memory: int = 4096):
-        """Calculate a Topographic Wetness Attribute, which is also used to constrain the
-        riparian extent.
+    def calc_stream_attributes(self, focal_mean_dist: float | None = 200.0):
+        """Calculate bankfull width, bankfull depth and channel gradient on stream
+        cells.
+
+        Args:
+            focal_mean_dist (float | None, optional): Distance (m) over which channel
+                gradient is averaged so it represents reaches rather than cells.
+                Defaults to 200.
         """
+        if self.streams is None or self.flow_direction is None:
+            raise AttributeError(
+                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
+                " prior to calculating stream attributes."
+            )
+
+        bankfull_width_dst = self.raster_path("bankfull_width")
+        bankfull_depth_dst = self.raster_path("bankfull_depth")
+        stream_slope_dst = self.raster_path("stream_slope")
+
+        bankfull_width(
+            self.streams, self.flow_direction, self.precip, bankfull_width_dst
+        )
+        bankfull_depth(bankfull_width_dst, bankfull_depth_dst)
+
+        stream_slope(
+            self.dem,
+            self.streams,
+            stream_slope_dst,
+            units="percent",
+            focal_mean_dist=focal_mean_dist,
+        )
+
+        self.bankfull_width = bankfull_width_dst
+        self.bankfull_depth = bankfull_depth_dst
+        self.stream_slope = stream_slope_dst
+
+    def calc_zones(
+        self,
+        f1: float = 1.0,
+        f2: float = 3.0,
+        h3: float = 3.0,
+        slope_breaks: tuple[float, float] = (0.015, 0.04),
+        g_range: tuple[float, float] = (0.5, 1.25),
+        t_min: float | None = None,
+        cost_floor: float = DEFAULT_COST_FLOOR,
+        fringe_mode: str = "rise",
+        a_hill: float | None = None,
+        gamma: float = 0.5,
+        w_min: float = 0.25,
+        memory: int | None = 4096,
+    ):
+        """Delineate the three riparian zones.
+
+        Budgets (metres of rise) are assigned to each stream cell:
+
+            g  = slope_modifier(channel gradient)
+            T2 = max(f2 * D_bf * g, t_min * f2 / f1)
+            T1 = T2 * f1 / f2
+            T3 = T2 + h3
+
+        and consumed along the least-climb path away from the stream. A cell belongs to
+        the innermost zone whose budget exceeds the rise required to reach it.
+
+        With `fringe_mode="convergence"` a second pass is seeded from the floodplain
+        (zones 1 and 2) with friction reduced in convergent terrain
+        (see `convergence_weight`), and the result is unioned with zone 3. This
+        extends the fringe into hollows and toe slopes that receive hillslope
+        groundwater.
+
+        Args:
+            f1 (float, optional): Bankfull depth multiple defining the channel and
+                active floodplain (zone 1). Defaults to 1.0 (bankfull stage).
+            f2 (float, optional): Bankfull depth multiple defining the flood-prone area
+                (zone 2). Defaults to 3.0 (roughly Rosgen's flood-prone stage of twice
+                the maximum bankfull depth).
+            h3 (float, optional): Rise (m) above the zone 2 limit within which the
+                water table is assumed to remain within rooting depth of the surface
+                (zone 3). Equivalent to rooting depth / (1 - water table ratio); reduce
+                in arid settings or where the water table is decoupled from topography.
+                Defaults to 3.0.
+            slope_breaks (tuple[float, float], optional): Channel gradients (m/m)
+                bounding the gradient modifier. Defaults to (0.015, 0.04).
+            g_range (tuple[float, float], optional): (min, max) of the gradient
+                modifier. Defaults to (0.5, 1.25).
+            t_min (float | None, optional): Minimum zone 1 budget (m). Defaults to
+                twice the friction of a flat cell, which guarantees at least one cell
+                beyond the channel.
+            cost_floor (float, optional): Minimum friction as a gradient (m/m). Bounds
+                the lateral extent on flat terrain to `budget / cost_floor`.
+                Defaults to tan(0.5 degrees).
+            fringe_mode (str, optional): `"rise"` derives zone 3 from the rise budget
+                alone; `"convergence"` adds the convergence-weighted second pass.
+                Defaults to "rise".
+            a_hill (float | None, optional): Contributing area (m2) above which
+                terrain is considered convergent. Defaults to a tenth of the stream
+                initiation area used in `extract_streams`.
+            gamma (float, optional): Rate at which fringe friction decreases with
+                contributing area. Defaults to 0.5.
+            w_min (float, optional): Minimum fringe friction weight. Defaults to 0.25.
+            memory (int | None, optional): Memory (MB) for `r.cost`. Defaults to 4096.
+        """
+        if fringe_mode not in ("rise", "convergence"):
+            raise ValueError('fringe_mode must be one of "rise" or "convergence".')
+        if fringe_mode == "convergence" and self.flow_accumulation is None:
+            raise AttributeError(
+                "Flow accumulation is required for the convergence fringe; extract "
+                "streams using `RiparianConnectivity.extract_streams`."
+            )
         if self.streams is None:
             raise AttributeError(
-                "Streams must be delineated first using "
-                "`RiparianConnectivity.extract_streams`."
+                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
+                " prior to calculating zones."
             )
+        if self.bankfull_depth is None or self.stream_slope is None:
+            raise AttributeError(
+                "Stream attributes must be calculated using "
+                "`RiparianConnectivity.calc_stream_attributes` prior to calculating "
+                "zones."
+            )
+        if not 0 < f1 < f2:
+            raise ValueError("f1 and f2 must satisfy 0 < f1 < f2.")
+        if h3 <= 0:
+            raise ValueError("h3 must be positive.")
+
         if self.slope is None:
             slope_dst = self.raster_path("slope")
             slope(self.dem, slope_dst)
             self.slope = slope_dst
 
-        twi_dst = self.raster_path("twi")
-        topographic_wetness(self.streams, self.slope, twi_dst, memory=memory)
-        self.twi = twi_dst
+        avg_cs = (self.csx + self.csy) / 2.0
+        if t_min is None:
+            t_min = 2.0 * cost_floor * avg_cs
 
-    def define_region(self, twi_cutoff: float = 745.0):
-        """Constrain the Topographic Wetness Index (TWI) to a threshold that is used
-        to define the extent of the riparian.
+        stream_mask = ~da.ma.getmaskarray(from_raster(self.streams))
+        d_bf = from_raster(self.bankfull_depth).astype(np.float64)
 
-        This method may be called iteratively after calculating the TWI, defining the
-        region using a threshold, and inspecting the result (the path to which can be
-        accessed using the `region` attribute) to determine whether the extent
-        accurately represents the extent of riparian regions.
+        # Channel gradient from percent to m/m; reaches without a value receive g = 1
+        gradient = from_raster(self.stream_slope).astype(np.float64) / 100.0
+        g = da.ma.filled(slope_modifier(gradient, slope_breaks, g_range), 1.0)
 
-        Args:
-            twi_cutoff (float): Topographic wetness cutoff value. Defaults to 830.
-        """
-        if self.twi is None:
-            raise AttributeError(
-                "The Topographic Wetness Index must be calculated "
-                "first using `RiparianConnectivity.calc_twi`."
+        # Streams without a depth receive the minimum budget so they remain seeds
+        t2 = da.maximum(
+            da.ma.filled(f2 * d_bf * g, 0.0), t_min * (float(f2) / float(f1))
+        )
+        t3 = da.ma.masked_where(~stream_mask, t2 + float(h3))
+
+        t_max = float(t3.max().compute())
+
+        start_cost_dst = self.raster_path("start_cost")
+        to_raster(
+            (t_max - t3).astype(np.float32),
+            self.streams,
+            start_cost_dst,
+            as_cog=False,
+        )
+
+        cost_dst = self.raster_path("cost")
+        nearest_dst = self.raster_path("nearest")
+        rise_cost_surface(
+            self.slope,
+            start_cost_dst,
+            cost_dst,
+            nearest_dst,
+            cost_floor=cost_floor,
+            max_cost=t_max,
+            memory=memory,
+        )
+
+        zones_dst = self.raster_path("zones")
+        score_dst = self.raster_path("score")
+        fringe_cost_dst = fringe_nearest_dst = None
+
+        if fringe_mode == "rise":
+            riparian_zones(
+                cost_dst,
+                nearest_dst,
+                t_max,
+                f1,
+                f2,
+                h3,
+                zones_dst,
+                score_dst,
+                streams=self.streams,
+            )
+        else:
+            if a_hill is None:
+                if self.min_ws_area is None:
+                    raise ValueError(
+                        "a_hill must be provided when streams were not extracted with "
+                        "`RiparianConnectivity.extract_streams`."
+                    )
+                a_hill = 0.1 * self.min_ws_area
+
+            rise_zones_dst = self.raster_path("zones_rise")
+            rise_score_dst = self.raster_path("score_rise")
+            riparian_zones(
+                cost_dst,
+                nearest_dst,
+                t_max,
+                f1,
+                f2,
+                h3,
+                rise_zones_dst,
+                rise_score_dst,
+                streams=self.streams,
             )
 
-        twi = from_raster(self.twi)
-        twi = da.ma.masked_where(twi < float(twi_cutoff), twi)
+            # Seed the fringe pass from the floodplain, carrying the stream budgets
+            rise_zones = from_raster(rise_zones_dst)
+            floodplain = ~da.ma.getmaskarray(rise_zones) & (rise_zones <= 2)
+            fringe_start_dst = self.raster_path("fringe_start_cost")
+            to_raster(
+                da.ma.masked_where(
+                    ~floodplain, from_raster(nearest_dst).astype(np.float32)
+                ),
+                nearest_dst,
+                fringe_start_dst,
+                as_cog=False,
+            )
 
-        twi_max = twi.max()
-        twi_norm = (twi - twi_cutoff) / (twi_max - twi_cutoff)
+            weight_dst = self.raster_path("fringe_weight")
+            to_raster(
+                convergence_weight(
+                    from_raster(self.flow_accumulation),
+                    self.csx * self.csy,
+                    a_hill,
+                    gamma,
+                    w_min,
+                ).astype(np.float32),
+                self.flow_accumulation,
+                weight_dst,
+                as_cog=False,
+            )
+
+            fringe_cost_dst = self.raster_path("fringe_cost")
+            fringe_nearest_dst = self.raster_path("fringe_nearest")
+            rise_cost_surface(
+                self.slope,
+                fringe_start_dst,
+                fringe_cost_dst,
+                fringe_nearest_dst,
+                cost_floor=cost_floor,
+                max_cost=t_max,
+                weight_src=weight_dst,
+                memory=memory,
+            )
+
+            extend_fringe(
+                fringe_cost_dst,
+                fringe_nearest_dst,
+                t_max,
+                h3,
+                rise_zones_dst,
+                rise_score_dst,
+                zones_dst,
+                score_dst,
+            )
 
         region_dst = self.raster_path("region")
-        to_raster(twi_norm, self.twi, region_dst)
+        to_raster(
+            ~da.ma.getmaskarray(from_raster(zones_dst)), zones_dst, region_dst
+        )
 
+        self.t_max = t_max
+        self.start_cost = start_cost_dst
+        self.cost = cost_dst
+        self.nearest = nearest_dst
+        self.fringe_cost = fringe_cost_dst
+        self.fringe_nearest = fringe_nearest_dst
+        self.zones = zones_dst
+        self.score = score_dst
         self.region = region_dst
-
-    def interpolate_into_region(self, src, dst):
-        obs_raster = Raster(src)
-        obs, obs_points = Raster(src).data_and_index()
-
-        obs_points = np.asarray(obs_points, dtype="float32")
-
-        region_values, pred_points = Raster(self.region).data_and_index()
-
-        del region_values
-
-        pred_points = np.asarray(pred_points, dtype="float32")
-
-        pred_z = PointInterpolator(
-            obs_points,
-            obs,
-            pred_points,
-        ).idw(int(round(200 / ((self.csx + self.csy) / 2.0))))
-
-        nodata = np.finfo("float32").min
-        output = np.full(obs_raster.shape[1:], nodata, "float32")
-
-        pred_points = pred_points.astype("int64")
-        output[(pred_points[:, 0], pred_points[:, 1])] = pred_z
-
-        del pred_points, pred_z
-
-        obs_points = obs_points.astype("int64")
-
-        output[(obs_points[:, 0], obs_points[:, 1])] = obs
-
-        del obs, obs_points
-
-        output_dask = da.from_array(output.reshape(obs_raster.shape)).rechunk(CHUNKS)
-
-        to_raster(da.ma.masked_where(output_dask == nodata, output_dask), src, dst)
-
-    def calc_bankfull_width(self, annual_precip_src: str, cutoff: float = 10.0):
-        """Calculate a Bankfull Width attribute, which is normalized and  expanded to
-        the riparian region.
-
-        Args:
-            annual_precip_src (str): Mean annual precipitation grid in mm.
-            cutoff (float, optional): A maximum Bankfull Width threshold to use for the
-                normalized value. Defaults to 10.0m.
-        """
-        if self.streams is None or self.flow_direction is None:
-            raise AttributeError(
-                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
-                " prior to calculating Bankfull Width."
-            )
-        if self.region is None:
-            raise AttributeError(
-                "Riparian regions must be delineated using "
-                "`RiparianConnectivity.define_region` prior to calculating Bankfull "
-                "Width."
-            )
-
-        self.verify_source(annual_precip_src)
-
-        bankfull_width_dst = self.raster_path("bankfull_width")
-        with TempRasterFiles(2) as (bankfull_dst, bankfull_norm_dst):
-            bankfull_width(
-                self.streams, self.flow_direction, annual_precip_src, bankfull_dst
-            )
-            normalize(bankfull_dst, bankfull_norm_dst, (0, cutoff))
-            self.interpolate_into_region(bankfull_norm_dst, bankfull_width_dst)
-
-        self.bankfull_width = bankfull_width_dst
-
-    def calc_stream_slope(self, cutoff: float = 15.0):
-        """Calculate and add a Stream Slope attribute.
-
-        Args:
-            cutoff (float, optional): A maximum Stream Slope threshold to use for the
-                normalized value. Defaults to 15.0 degrees.
-        """
-        if self.streams is None:
-            raise AttributeError(
-                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
-                " prior to calculating Stream Slope."
-            )
-        if self.region is None:
-            raise AttributeError(
-                "Riparian regions must be delineated using "
-                "`RiparianConnectivity.define_region` prior to calculating Stream "
-                "Slope."
-            )
-
-        stream_slope_dst = self.raster_path("stream_slope")
-
-        with TempRasterFiles(2) as (strslo_dst, strslo_norm_dst):
-            stream_slope(self.dem, self.streams, strslo_dst)
-            normalize(
-                strslo_dst,
-                strslo_norm_dst,
-                (0, cutoff),
-                invert=True,
-            )
-            self.interpolate_into_region(strslo_norm_dst, stream_slope_dst)
-
-        self.stream_slope = stream_slope_dst
-
-    def calc_stream_density(self, sample_distance: float = 500, cutoff: float = 2e5):
-        """Calculate and add a Stream Density attribute.
-
-        Args:
-            sample_distance (float, optional): Distance to sample stream cells for the
-                stream density transform. Defaults to 500m.
-            cutoff (float, optional): A maximum Stream Slope threshold to use for the
-                normalized value. This value should assume a cell size of 1m, be
-                adjusted with the `sample_distance` argument, and be adjusted for
-                the actual input raster cell size. Defaults to 2e5 cells per the
-                `radius` parameter.
-        """
-        if self.streams is None:
-            raise AttributeError(
-                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
-                " prior to calculating Stream Density."
-            )
-        if self.region is None:
-            raise AttributeError(
-                "Riparian regions must be delineated using "
-                "`RiparianConnectivity.define_region` prior to calculating Stream "
-                "Density."
-            )
-        # Would check for slope, but it will be implicitly included if
-        # RiparianConnectivity.define_region has been called.
-
-        stream_density_dst = self.raster_path("stream_density")
-        with TempRasterFiles(4) as (
-            stream_mask_dst,
-            stream_filter_dst,
-            strdens_dst,
-            strdens_norm_dst,
-        ):
-            to_raster(
-                ~da.ma.getmaskarray(from_raster(self.streams)),
-                self.streams,
-                stream_mask_dst,
-                as_cog=False,
-            )
-            kernel = kernel_from_distance(sample_distance, self.csx, self.csy)
-            raster_filter(stream_mask_dst, kernel, "sum", stream_filter_dst)
-
-            stream_density = from_raster(stream_filter_dst) / kernel.sum()
-
-            to_raster(
-                stream_density.astype(np.float32),
-                stream_filter_dst,
-                strdens_dst,
-                as_cog=False,
-            )
-
-            # Adjust stream_density_cutoff for cell size
-            avg_cs = (self.csx + self.csy) / 2.0
-            cutoff /= avg_cs**2
-            normalize(strdens_dst, strdens_norm_dst, (0, cutoff))
-
-            self.interpolate_into_region(strdens_norm_dst, stream_density_dst)
-
-        self.stream_density = stream_density_dst
 
     def calc_connectivity(
         self,
         connectivity_dst: str,
-        attributes: list = ["twi", "bankfull_width", "stream_slope", "stream_density"],
-        quantize: bool = True,
-        percentiles: list = [(1.0 / 3.0) * 100.0, (2.0 / 3.0) * 100.0],
+        score_dst: str | None = None,
         vector: bool = True,
     ):
-        """Calculate a riparian connectivity dataset.
+        """Save the riparian zones.
 
         Args:
-            connectivity_dst (str): Output path for Riparian Connectivity. This will be
-                a raster if `vector` is `False`.
-            attributes (list, optional): Attributes to include in the riparian
-                connectivity calculation. Defaults to
-                ["bankfull_width", "stream_slope", "stream_density"].
-            quantize (bool, optional): Split the result into zones of sensitivity using.
-                percentiles. Defaults to True.
-            percentiles (list, optional): Percentiles to use to define zones of
-                connectivity. Defaults to [(1.0 / 3.0) * 100.0, (2.0 / 3.0) * 100.0].
-            vector (bool, optional): Save the output as a vector file.
+            connectivity_dst (str): Output path for the zones. A polygon vector
+                dataset with a zone attribute if `vector` is `True`, otherwise a raster
+                with values 1 (channel and active floodplain), 2 (flood-prone area) and
+                3 (groundwater-connected fringe).
+            score_dst (str | None, optional): Output raster with the fraction of the
+                rise budget remaining at each cell, which grades connectivity within
+                zones. Defaults to None.
+            vector (bool, optional): Save the zones as a vector file. Defaults to True.
         """
-        if len(attributes) == 0:
-            raise ValueError("At least one attribute must be included")
-
-        if quantize and (
-            len(percentiles) == 0
-            or any([q2 < q1 for q1, q2 in zip(percentiles[0:-1], percentiles[1:])])
-            or any([q > 100 for q in percentiles])
-        ):
-            raise ValueError(
-                "Percentiles must have at least one value, be monotonically increasing, "
-                "and not exceed 100."
-            )
-
-        if vector and not quantize:
-            raise ValueError("A vector should only be specified if `quantize` is used.")
-
-        prepared_attrs = []
-        for attr in attributes:
-            if attr == "twi":
-                attr = "region"
-
-            attr_value = getattr(self, attr)
-            if attr_value is None:
-                raise AttributeError(f"The attribute '{attr}' has not been calculated.")
-            prepared_attrs.append(attr_value)
-
-        sensitivity = from_raster(prepared_attrs[0])
-        for attr in prepared_attrs[1:]:
-            sensitivity += from_raster(attr)
-
-        if quantize:
-            percentile_sample = sensitivity[~da.ma.getmaskarray(sensitivity)]
-            qs = [da.percentile(percentile_sample, [q])[0] for q in percentiles]
-
-            sensitivity = da.ma.masked_where(
-                da.ma.getmaskarray(from_raster(self.region)),
-                da.digitize(sensitivity, qs).astype(np.uint8),
+        if self.zones is None:
+            raise AttributeError(
+                "Zones must be calculated using `RiparianConnectivity.calc_zones` "
+                "prior to saving connectivity."
             )
 
         if vector:
-            with TempRasterFile() as tmp_rast:
-                to_raster(sensitivity, self.dem, tmp_rast, as_cog=False)
-                vectorize(tmp_rast, connectivity_dst, smooth_corners=True)
+            vectorize(self.zones, connectivity_dst, smooth_corners=True)
         else:
-            to_raster(sensitivity, self.dem, connectivity_dst)
+            to_raster(from_raster(self.zones), self.zones, connectivity_dst)
+
+        if score_dst is not None:
+            to_raster(from_raster(self.score), self.score, score_dst)
