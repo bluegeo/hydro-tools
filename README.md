@@ -7,7 +7,7 @@ Hydrological and terrain utilities for preparing data and performing simulations
 - **Watershed Analysis** — Flow direction & accumulation, stream extraction, basin delineation, and stream ordering (Strahler/Horton) via GRASS GIS
 - **Terrain Derivatives** — Slope, aspect, solar radiation, Terrain Ruggedness Index (TRI), and DEM conditioning
 - **Stream Network Characterization** — Topology tracing, reach vectorization, sinuosity, bankfull width/depth estimation, valley confinement, and multi-attribute annotation
-- **Riparian Connectivity** — End-to-end workflow for riparian zone delineation using Topographic Wetness Index, bankfull dimensions, stream density, and multi-criteria aggregation (Simple Additive Weighting)
+- **Riparian Connectivity** — End-to-end workflow for riparian zone delineation using a least-cost expansion from streams, seeded with a riparian reach derived from bankfull width and stream slope
 - **Spatial Interpolation** — Inverse Distance Weighting (IDW), cubic splines, moving-window statistical filters, distance transforms, and nodata filling
 - **Raster I/O & Math** — Lazy dask-backed masked arrays with chunked reading/writing, automatic nodata propagation, warping, clipping, alignment, and vectorization
 - **Cloud-Optimized Output** — All raster outputs default to Cloud-Optimized GeoTIFF (COG); all vector outputs default to GeoPackage
@@ -129,11 +129,9 @@ from hydrotools.morphology import RiparianConnectivity
 
 rc = RiparianConnectivity("/data/dem.tif")
 rc.extract_streams(min_ws_area=1E6)
-rc.calc_twi()
-rc.define_region(twi_cutoff=745.0)
 rc.calc_bankfull_width("/data/annual_precip.tif")
 rc.calc_stream_slope()
-rc.calc_stream_density(sample_distance=500)
+rc.define_region(width_factor=3.0, vertical_weight=20.0)
 rc.calc_connectivity("/data/connectivity.tif")
 ```
 
