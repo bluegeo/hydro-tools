@@ -147,6 +147,9 @@ def main():
     parser.add_argument("--f2", type=float, default=3.0)
     parser.add_argument("--h3", type=float, default=3.0)
     parser.add_argument("--fringe-mode", choices=["rise", "convergence"], default="rise")
+    parser.add_argument("--engine", choices=["walk", "cost"], default="walk")
+    parser.add_argument("--smooth-dist", type=float, help="Focal-median DEM smoothing distance (m)")
+    parser.add_argument("--cost-floor", type=float, help="Distance term as a gradient (m/m); default tan(0.1 deg)")
     parser.add_argument("--memory", type=int, default=4096)
     parser.add_argument("--floodplain-ref", help="Reference floodplain mask raster")
     parser.add_argument("--fringe-ref", help="Reference wetland / riparian vegetation mask raster")
@@ -160,7 +163,15 @@ def main():
     rc.extract_streams(min_ws_area=args.min_ws_area, memory=args.memory)
     rc.calc_stream_attributes()
 
-    zone_kwargs = {"f1": args.f1, "fringe_mode": args.fringe_mode, "memory": args.memory}
+    zone_kwargs = {
+        "f1": args.f1,
+        "fringe_mode": args.fringe_mode,
+        "engine": args.engine,
+        "smooth_dist": args.smooth_dist,
+        "memory": args.memory,
+    }
+    if args.cost_floor is not None:
+        zone_kwargs["cost_floor"] = args.cost_floor
     rc.calc_zones(f2=args.f2, h3=args.h3, **zone_kwargs)
 
     rc.calc_connectivity(os.path.join(args.out_dir, "zones.tif"), score_dst=os.path.join(args.out_dir, "score.tif"), vector=False)

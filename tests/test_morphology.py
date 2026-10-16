@@ -48,19 +48,19 @@ def load(path):
 def valley_dem(rows=200, cols=400, lateral=0.01, longitudinal=0.005, hollow=None):
     """A planar V-shaped valley draining east along the centre row.
 
-    `hollow=(col, half_width)` carves a gentler tributary hollow into the north side
-    whose axis climbs at `longitudinal` from the valley floor.
+    `hollow=(col, half_width, gradient)` carves a tributary hollow into the north side
+    whose axis climbs at `gradient` (gentler than `lateral`) from the valley floor.
     """
     i, j = np.indices((rows, cols), dtype="float64")
     axis = rows // 2
     z = 100.0 - longitudinal * j * CELL_SIZE + lateral * np.abs(i - axis) * CELL_SIZE
 
     if hollow is not None:
-        col, half_width = hollow
+        col, half_width, gradient = hollow
         z_floor = 100.0 - longitudinal * col * CELL_SIZE
         z_hollow = (
             z_floor
-            + longitudinal * (axis - i) * CELL_SIZE
+            + gradient * (axis - i) * CELL_SIZE
             + lateral * np.abs(j - col) * CELL_SIZE
         )
         north = (i < axis) & (np.abs(j - col) <= half_width)
@@ -128,15 +128,15 @@ class RiparianZonesTest(unittest.TestCase):
 class RiseCostSurfaceTest(unittest.TestCase):
     def test_flat_extent_bounded_by_cost_floor(self):
         rows, cols, stream_col = 60, 200, 100
-        budget = 1.0
+        budget = 0.5
         nodata = np.finfo("float32").min
 
-        slope = np.zeros((rows, cols), "float32")
+        dem = np.zeros((rows, cols), "float32")
         start_cost = np.full((rows, cols), nodata, "float32")
         start_cost[:, stream_col] = 0
 
         with TemporaryDirectory() as tmp_dir:
-            slope_src = write_raster(os.path.join(tmp_dir, "slope.tif"), slope, nodata)
+            dem_src = write_raster(os.path.join(tmp_dir, "dem.tif"), dem, nodata)
             start_src = write_raster(
                 os.path.join(tmp_dir, "start.tif"), start_cost, nodata
             )
@@ -144,7 +144,7 @@ class RiseCostSurfaceTest(unittest.TestCase):
             nearest_dst = os.path.join(tmp_dir, "nearest.tif")
             zones_dst = os.path.join(tmp_dir, "zones.tif")
 
-            rise_cost_surface(slope_src, start_src, cost_dst, nearest_dst, memory=512)
+            rise_cost_surface(dem_src, start_src, cost_dst, nearest_dst, memory=512)
             riparian_zones(cost_dst, nearest_dst, budget, 1.0, 3.0, 0.4, zones_dst)
 
             cost = load(cost_dst)
@@ -243,7 +243,6 @@ class RiparianConnectivityTest(unittest.TestCase):
         rc.bankfull_width = self.rc.bankfull_width
         rc.bankfull_depth = self.rc.bankfull_depth
         rc.stream_slope = self.rc.stream_slope
-        rc.slope = self.rc.slope
 
         rc.calc_zones(g_range=(0.5, 0.5), memory=1024)
         narrow = np.ma.filled(load(rc.zones), 0)
@@ -291,6 +290,8 @@ class RiparianConnectivityTest(unittest.TestCase):
 class ConvergenceFringeTest(unittest.TestCase):
     hollow_col = 300
     hollow_half_width = 10
+    hollow_gradient = 0.015
+    lateral = 0.03
 
     @classmethod
     def setUpClass(cls):
@@ -300,7 +301,12 @@ class ConvergenceFringeTest(unittest.TestCase):
 
         dem = write_raster(
             os.path.join(cls.tmp_dir.name, "dem.tif"),
-            valley_dem(rows, cols, hollow=(cls.hollow_col, cls.hollow_half_width)),
+            valley_dem(
+                rows,
+                cols,
+                lateral=cls.lateral,
+                hollow=(cls.hollow_col, cls.hollow_half_width, cls.hollow_gradient),
+            ),
             nodata,
         )
         precip = write_raster(
@@ -318,7 +324,7 @@ class ConvergenceFringeTest(unittest.TestCase):
         cls.rise_zones = np.ma.filled(load(cls.rc.zones), 0)
         cls.rise_score = np.ma.filled(load(cls.rc.score), 0)
 
-        cls.rc.calc_zones(fringe_mode="convergence", memory=1024)
+        cls.rc.calc_zones(fringe_mode="convergence", a_hill=5e3, memory=1024)
         cls.conv_zones = np.ma.filled(load(cls.rc.zones), 0)
         cls.conv_score = np.ma.filled(load(cls.rc.score), 0)
 
@@ -364,8 +370,16 @@ class ConvergenceFringeTest(unittest.TestCase):
         self.assertLess(conv_reach, rise_reach)
 
     def test_fringe_outputs_recorded(self):
-        self.assertIsNotNone(self.rc.fringe_cost)
-        self.assertIsNotNone(self.rc.fringe_nearest)
+        self.assertIsNotNone(self.rc.fringe_scale)
+        scale = load(self.rc.fringe_scale)
+        self.assertGreaterEqual(float(scale.min()), 1.0)
+        self.assertLessEqual(float(scale.max()), 4.0 + 1e-6)
+
+    def test_fringe_is_connected_to_floodplain(self):
+        region = self.conv_zones > 0
+        labels, n = ndimage.label(region, np.ones((3, 3)))
+        anchored = np.unique(labels[(self.conv_zones > 0) & (self.conv_zones < 3)])
+        self.assertEqual(set(np.unique(labels[region])), set(anchored))
 
     def test_invalid_mode(self):
         with self.assertRaises(ValueError):
@@ -386,6 +400,56 @@ class ConvergenceWeightTest(unittest.TestCase):
             convergence_weight(fa, 25.0, 0.0)
         with self.assertRaises(ValueError):
             convergence_weight(fa, 25.0, 100.0, w_min=0.0)
+
+
+class EngineComparisonTest(unittest.TestCase):
+    """A levee parallel to the stream costs its height once with `walk` and twice
+    with `cost`, so the walk engine reaches further beyond it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp_dir = TemporaryDirectory()
+        nodata = -9999.0
+        rows, cols = 200, 400
+        axis = rows // 2
+
+        dem = valley_dem(rows, cols)
+        for offset in (-22, 22):
+            dem[axis + offset - 2 : axis + offset + 3, :] += 0.8
+
+        cls.dem = write_raster(os.path.join(cls.tmp_dir.name, "dem.tif"), dem, nodata)
+        cls.precip = write_raster(
+            os.path.join(cls.tmp_dir.name, "precip.tif"),
+            np.full((rows, cols), 3000.0, "float32"),
+            nodata,
+        )
+
+        cls.rc = RiparianConnectivity(cls.dem, cls.precip)
+        cls.rc.extract_streams(min_ws_area=1e5, memory=1024)
+        cls.rc.calc_stream_attributes()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp_dir.cleanup()
+
+    def extent(self, **kwargs):
+        self.rc.calc_zones(memory=1024, **kwargs)
+        region = ~np.ma.getmaskarray(load(self.rc.zones))
+        return region[:, 200:350].sum(axis=0).mean()
+
+    def test_walk_reaches_further_than_cost(self):
+        walk = self.extent(engine="walk")
+        cost = self.extent(engine="cost")
+        self.assertGreater(walk, cost * 1.1)
+
+    def test_smoothing_runs(self):
+        smoothed = self.extent(engine="walk", smooth_dist=15.0)
+        self.assertGreater(smoothed, 0)
+        self.assertIsNotNone(self.rc.cost_dem)
+
+    def test_invalid_engine(self):
+        with self.assertRaises(ValueError):
+            self.rc.calc_zones(engine="hike")
 
 
 class RiparianConnectivityDataTest(unittest.TestCase):

@@ -71,30 +71,41 @@ observations are available.
 
 ### Rise Cost Surface
 
-A friction surface is constructed from topographic slope:
+The cost of moving from one cell to a neighbour is
 
 $$
-C_{ij} = \bar{s} \left( \tan\beta_{ij} + \varepsilon \right)
+c = \max(0, \Delta z) + \varepsilon \, \Delta s
 $$
 
-where $\beta_{ij}$ is slope at cell $(i,j)$, $\bar{s}$ is the mean cell size and
-$\varepsilon$ is a small gradient floor (default $\tan 0.5°$). GRASS `r.cost` (Dijkstra
-with the knight's move) accumulates this friction outward from the stream network.
-Because $\bar{s}\tan\beta$ is the elevation gained in crossing a cell, the cumulative
-cost approximates the **metres of climb along the least-climb path from the stream** —
-a path-based analogue of Height Above Nearest Drainage (Rennó et al., 2008; Nardi
-et al., 2006) and the inverse of the downslope index of Hjerdt et al. (2004), which is
-the standard DEM proxy for hydraulic gradient.
+the elevation gained when moving uphill plus a small distance term, with descents
+free. GRASS `r.walk` (Dijkstra with the knight's move; walking coefficients
+$(0, 1, 0, 0)$ and the distance term supplied as friction) accumulates this outward
+from the stream network, so the cumulative cost is the **metres of climb along the
+least-climb path from the stream** — a monotone-path analogue of Height Above Nearest
+Drainage (Rennó et al., 2008; Nardi et al., 2006) and the inverse of the downslope
+index of Hjerdt et al. (2004), the standard DEM proxy for hydraulic gradient.
 
-The floor $\varepsilon$ prevents unbounded spread across perfectly flat terrain
-(filled sinks, reservoirs, terraces) and represents the decay of stream influence with
-distance: on flat ground a budget of $T$ metres extends at most $T / \varepsilon$
-metres laterally.
+Charging uphill movement only is what makes the surface usable on floodplains:
+bars, swales and levees are paid for once, at their height, rather than on the way up
+*and* down, and DEM micro-relief does not accumulate with distance. The previous
+symmetric formulation (`r.cost` on $\bar{s}(\tan\beta + \varepsilon)$) is retained
+as `engine="cost"` for comparison; on a braided floodplain it confines zones 1 and 2
+to a thin band around the wetted channel.
 
-Channel cells carry the same friction as any other cell. This matters because stream
-cells are seeded with different budgets (below): a larger stream's budget propagates
-up a tributary only until the tributary channel has climbed the difference between the
-two budgets — a backwater limit — after which the tributary's own budget prevails.
+The distance term $\varepsilon$ (default $\tan 0.1°$, about 1 m per 570 m) prevents
+unbounded spread across perfectly flat terrain (filled sinks, reservoirs) and
+represents the decay of stream influence with distance: on flat ground a budget of $T$
+metres extends at most $T / \varepsilon$ metres laterally. Set it from the widest
+floodplain expected — at $\tan 0.5°$ a 1 km floodplain would consume 8.7 m of budget
+on distance alone.
+
+An optional focal-median smoothing of the DEM (`smooth_dist`) suppresses LiDAR noise
+and vegetation artefacts before accumulation.
+
+Channel cells are not exempt from cost. This matters because stream cells are seeded
+with different budgets (below): a larger stream's budget propagates up a tributary
+only until the tributary channel has climbed the difference between the two budgets —
+a backwater limit — after which the tributary's own budget prevails.
 
 ### Per-Stream Budgets
 
@@ -109,12 +120,12 @@ T_{3,i} &= T_{2,i} + h_3
 \end{aligned}
 $$
 
-A single `r.cost` run with the `-r` flag seeds each stream cell with an initial cost
+A single `r.walk` run with the `-r` flag seeds each stream cell with an initial cost
 $c_{0,i} = T_{max} - T_{3,i}$ where $T_{max} = \max_i T_{3,i}$. Cells with cumulative
 cost below $T_{max}$ are within reach of *some* stream's budget, and Dijkstra
 guarantees that the stream reaching a cell at least cost wins — so a small tributary
 entering a large river's floodplain does not carve a notch out of it. The `nearest`
-output of `r.cost` carries the winning seed value, from which the rise actually spent
+output of `r.walk` carries the winning seed value, from which the rise actually spent
 and the winner's budgets are recovered per cell:
 
 $$
@@ -183,7 +194,7 @@ $$
 
 Three properties follow:
 
-- $h_3$ is a rise threshold, so zone 3 is produced by the same `r.cost` run as zones 1
+- $h_3$ is a rise threshold, so zone 3 is produced by the same `r.walk` run as zones 1
   and 2.
 - $h_3$ is **absolute** (metres), not scaled by stream size: rooting depth and the
   water-table ratio $k$ do not depend on channel dimensions. It is applied as a band
@@ -202,22 +213,21 @@ The rise threshold captures the *stream-stage* control on the water table. It mi
 the *hillslope-supply* control: convergent hollows and toe slopes receive groundwater
 in proportion to the area draining to them and remain connected at greater rise than
 planar or divergent terrain — the mechanism behind the classical $\ln(a / \tan\beta)$
-index (Beven & Kirkby, 1979). With `fringe_mode="convergence"` a second `r.cost -r`
-pass is seeded from the floodplain (zones 1 and 2), carrying each cell's stream budget,
-with friction multiplied by
+index (Beven & Kirkby, 1979). With `fringe_mode="convergence"` the zone 3 budget is
+scaled per cell:
 
 $$
+h_3(a) = \frac{h_3}{w(a)}, \qquad
 w(a) = \operatorname{clip}\left( \left( \frac{a_{hill}}{a} \right)^{\gamma},\; w_{min},\; 1 \right)
 $$
 
 where $a$ is contributing area, $a_{hill}$ (default one tenth of the stream
 initiation area) is the area above which terrain is treated as convergent,
-$\gamma = 0.5$ and $w_{min} = 0.25$. Cells reached within $h_3$ of weighted friction
-from the floodplain edge are unioned into zone 3. Because $w \le 1$, zones 1 and 2 are
-unchanged, the fringe is never smaller than in `"rise"` mode, and planar hillslopes
-are unaffected. Contiguity with the floodplain is guaranteed by the seeding, which is
-what allows upslope area to be used here without the artefacts that made it
-unsuitable as a primary extent criterion.
+$\gamma = 0.5$ and $w_{min} = 0.25$ (so the fringe budget is at most $4 h_3$). Zones 1
+and 2 are unchanged, the fringe is never smaller than in `"rise"` mode, planar
+hillslopes are unaffected, and fringe cells are kept only where connected to the
+floodplain, which is what allows upslope area to be used here without the artefacts
+that made it unsuitable as a primary extent criterion.
 
 ### Assumptions and Limitations
 
@@ -232,9 +242,13 @@ unsuitable as a primary extent criterion.
   than by terrain.
 - **Empirical hydraulic geometry.** Errors in $W_{bf}$ propagate to the floodplain
   budgets. Refit the coefficients regionally where possible.
-- **Cost accumulation is direction-agnostic.** Descents are counted as climbs, so a
-  levee or terrace riser blocks propagation in either direction. This is appropriate
-  for inundation but means the surface should not be read as a hydraulic model.
+- **Cumulative climb is not a flat-water fill.** Successive rises along a path are
+  summed (climb 1 m, descend, climb 1 m costs 2 m) whereas a flood stage of 1 m would
+  reach the same cell. The surface is therefore conservative behind repeated ridges
+  and should not be read as a hydraulic model.
+- **Free descents.** Terrain below the stream that is reachable without climbing
+  (e.g. an adjacent lower terrace separated by no riser) is included at the cost of
+  distance alone.
 
 ---
 
@@ -251,11 +265,11 @@ DEM + annual precipitation
  │       ├── bankfull depth
  │       └── channel gradient (reach-averaged)
  │
- ├─► calc_zones(f1, f2, h3, slope_breaks, g_range, t_min, cost_floor, fringe_mode)
- │       ├── slope raster (derived internally)
+ ├─► calc_zones(f1, f2, h3, slope_breaks, g_range, t_min, cost_floor, fringe_mode, engine, smooth_dist)
+ │       ├── [smooth_dist] focal-median DEM
  │       ├── per-stream budgets → seed raster (T_max − T3)
- │       ├── r.cost -r  → cumulative rise, nearest seed
- │       ├── [convergence] r.cost -r from the floodplain, area-weighted friction
+ │       ├── r.walk -r  → cumulative uphill rise, nearest seed
+ │       ├── [convergence] per-cell zone 3 budget h3 / w(a), floodplain-connected
  │       └── zones (1, 2, 3), score, region
  │
  └─► calc_connectivity(output_path, score_dst)
@@ -307,7 +321,7 @@ stream cells. Requires `extract_streams()`.
 
 ### Step 3: Zone Delineation
 
-#### `calc_zones(f1=1.0, f2=3.0, h3=3.0, slope_breaks=(0.015, 0.04), g_range=(0.5, 1.25), t_min=None, cost_floor=tan(0.5°), fringe_mode="rise", a_hill=None, gamma=0.5, w_min=0.25, memory=4096)`
+#### `calc_zones(f1=1.0, f2=3.0, h3=3.0, slope_breaks=(0.015, 0.04), g_range=(0.5, 1.25), t_min=None, cost_floor=tan(0.1°), fringe_mode="rise", a_hill=None, gamma=0.5, w_min=0.25, engine="walk", smooth_dist=None, memory=4096)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -317,19 +331,21 @@ stream cells. Requires `extract_streams()`.
 | `slope_breaks` | `(float, float)` | `(0.015, 0.04)` | Channel gradients (m/m) at which the modifier reaches `g_max` and `g_min`. |
 | `g_range` | `(float, float)` | `(0.5, 1.25)` | `(g_min, g_max)` bounds of the gradient modifier. |
 | `t_min` | `float \| None` | `2 ε s̄` | Minimum zone 1 budget (m). Default is twice the friction of a flat cell. |
-| `cost_floor` | `float` | `tan(0.5°)` | Gradient floor $\varepsilon$ (m/m). Lateral extent on flats is bounded by budget / `cost_floor`. |
-| `fringe_mode` | `str` | `"rise"` | `"rise"` or `"convergence"` (adds the area-weighted second pass to zone 3). |
+| `cost_floor` | `float` | `tan(0.1°)` | Distance term $\varepsilon$ (m/m). Lateral extent on flats is bounded by budget / `cost_floor`. |
+| `fringe_mode` | `str` | `"rise"` | `"rise"` or `"convergence"` (scales the zone 3 budget by $1/w(a)$). |
 | `a_hill` | `float \| None` | `0.1 · min_ws_area` | Contributing area (m²) above which terrain is convergent (`"convergence"` only). |
-| `gamma` | `float` | `0.5` | Rate of friction decrease with contributing area (`"convergence"` only). |
-| `w_min` | `float` | `0.25` | Minimum friction weight (`"convergence"` only). |
-| `memory` | `int \| None` | `4096` | Memory (MB) for GRASS `r.cost`. |
+| `gamma` | `float` | `0.5` | Rate of budget growth with contributing area (`"convergence"` only). |
+| `w_min` | `float` | `0.25` | Minimum weight; fringe budget at most `h3 / w_min` (`"convergence"` only). |
+| `engine` | `str` | `"walk"` | `"walk"` (uphill rise, `r.walk`) or `"cost"` (symmetric slope friction, `r.cost`). |
+| `smooth_dist` | `float \| None` | `None` | Focal-median distance (m) applied to the DEM before accumulation. |
+| `memory` | `int \| None` | `4096` | Memory (MB) for GRASS. |
 
-Sets `slope` (if not present), `start_cost`, `cost`, `nearest`, `zones`, `score`,
-`region` and `t_max`; in `"convergence"` mode also `fringe_cost` and
-`fringe_nearest`. Requires `calc_stream_attributes()`.
+Sets `cost_dem`, `start_cost`, `cost`, `nearest`, `zones`, `score`, `region` and
+`t_max`; in `"convergence"` mode also `fringe_scale`. Requires
+`calc_stream_attributes()`.
 
-`r.cost` is run with `max_cost` set to `t_max`, so cells that cannot fall within any
-zone are not visited.
+The least-cost run is bounded by `max_cost = t_max` (plus `h3 (1/w_min − 1)` in
+convergence mode), so cells that cannot fall within any zone are not visited.
 
 ### Step 4: Output
 
@@ -350,25 +366,23 @@ independently:
 
 Maps channel gradient (m/m) to the floodplain-width modifier $g$.
 
-#### `rise_cost_surface(slope_src, start_cost_src, cost_dst, nearest_dst, cost_floor=tan(0.5°), max_cost=None, weight_src=None, knights_move=True, memory=4096)`
+#### `rise_cost_surface(dem, start_cost_src, cost_dst, nearest_dst, cost_floor=tan(0.1°), max_cost=None, engine="walk", smooth_dist=None, knights_move=True, memory=4096)`
 
-Builds the rise friction surface from a slope raster (degrees), optionally multiplied
-by a weight raster, and runs `r.cost -r` seeded with `start_cost_src` (seed values on
-stream cells, nodata elsewhere). Writes the cumulative cost and the nearest-seed
+Accumulates uphill rise plus `cost_floor · distance` from a DEM (`engine="walk"`), or
+symmetric slope friction (`engine="cost"`), seeded with `start_cost_src` (seed values
+on stream cells, nodata elsewhere). Writes the cumulative cost and the nearest-seed
 rasters.
 
-#### `riparian_zones(cost_src, nearest_src, t_max, f1, f2, h3, zones_dst, score_dst=None, streams=None)`
+#### `riparian_zones(cost_src, nearest_src, t_max, f1, f2, h3, zones_dst, score_dst=None, streams=None, h3_scale_src=None)`
 
 Classifies the outputs of `rise_cost_surface` into zones 1–3 and, optionally, the
 continuous score. When `streams` is supplied, channel cells are forced to zone 1.
+When `h3_scale_src` is supplied the zone 3 budget is multiplied per cell and fringe
+cells are restricted to those connected to the floodplain.
 
 #### `convergence_weight(flow_accumulation, cell_area, a_hill, gamma=0.5, w_min=0.25) -> dask.array`
 
-Friction weights $w(a)$ from a contributing cell count.
-
-#### `extend_fringe(fringe_cost_src, fringe_nearest_src, t_max, h3, zones_src, score_src, zones_dst, score_dst)`
-
-Unions the convergence pass with first-pass zones and scores.
+Weights $w(a)$ from a contributing cell count; `1 / w` is the zone 3 budget scale.
 
 #### `region_width(region, streams, width_dst)`
 
@@ -425,6 +439,12 @@ rc.calc_zones(slope_breaks=(0.01, 0.03), g_range=(0.25, 1.5))
 
 ```python
 rc.calc_zones(fringe_mode="convergence", a_hill=5e4, gamma=0.5, w_min=0.25)
+```
+
+### Noisy LiDAR on a wide floodplain
+
+```python
+rc.calc_zones(smooth_dist=15.0, cost_floor=math.tan(math.radians(0.05)))
 ```
 
 ### Raster output
@@ -511,7 +531,7 @@ The module-level functions `topographic_wetness`, `bankfull_width`, `bankfull_de
 
 | Dependency | Purpose |
 |------------|---------|
-| GRASS GIS  | `r.watershed`, `r.stream.extract`, `r.cost` |
+| GRASS GIS  | `r.watershed`, `r.stream.extract`, `r.walk`, `r.cost` |
 | GDAL       | `gdaldem slope`, raster I/O and warping |
 | dask       | Lazy chunked array computation |
 | rasterio   | Raster access |

@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 import dask.array as da
 import fiona
 import numpy as np
+from dask_image.ndmeasure import label as ndmeasure_label
 from dask_image.ndmorph import binary_erosion
 from numba import njit
 from numba.typed import List
@@ -45,8 +46,8 @@ from hydrotools.watershed import (
     flow_direction_accumulation,
 )
 
-DEFAULT_COST_FLOOR = math.tan(math.radians(0.5))
-"""Minimum friction (m/m) applied to the rise cost surface on flat terrain."""
+DEFAULT_COST_FLOOR = math.tan(math.radians(0.1))
+"""Distance term (m/m) applied to the rise cost surface; bounds extent on flat terrain."""
 
 
 @njit
@@ -1107,89 +1108,134 @@ def slope_modifier(
 
 
 def rise_cost_surface(
-    slope_src: str,
+    dem: str,
     start_cost_src: str,
     cost_dst: str,
     nearest_dst: str,
     cost_floor: float = DEFAULT_COST_FLOOR,
     max_cost: float | None = None,
-    weight_src: str | None = None,
+    engine: str = "walk",
+    smooth_dist: float | None = None,
     knights_move: bool = True,
     memory: int | None = 4096,
 ):
     """Accumulate topographic rise away from streams using a least cost path.
 
-    The friction surface is `cell size * (tan(slope) + cost_floor)`, so the
-    cumulative cost approximates the metres of climb along the least-climb path from
-    the stream (a path-based height above nearest drainage), plus a small distance
-    term that bounds the lateral extent across flat terrain.
+    With `engine="walk"` (GRASS `r.walk`) the cost of a move is the elevation gained
+    when moving uphill plus `cost_floor * distance`; descents are free. The cumulative
+    cost is therefore the metres of climb along the least-climb path from the stream -
+    a monotone-path height above nearest drainage - and crossing bars, swales or
+    levees on a floodplain is paid for once rather than twice. The distance term
+    bounds the lateral extent across flat terrain to `budget / cost_floor`.
 
-    Each stream cell is seeded with the value in `start_cost_src` (GRASS `r.cost -r`),
-    which allows a per-stream budget: seeding with `T_max - T_i` and thresholding the
-    output at `T_max` is equivalent to allowing stream `i` to spend `T_i` metres of
-    rise. Channel cells carry the same friction as any other cell, so the budget of a
-    larger stream extends up a tributary only until the channel has climbed the
-    difference in budgets (a backwater limit), beyond which the tributary's own seed
-    prevails. The `nearest_dst` output holds the seed value of the stream that reached
-    each cell at least cost.
+    With `engine="cost"` (GRASS `r.cost`) the friction is
+    `cell size * (tan(slope) + cost_floor)`, which charges descents as climbs and is
+    retained for comparison.
+
+    Each stream cell is seeded with the value in `start_cost_src` (`-r` flag), which
+    allows a per-stream budget: seeding with `T_max - T_i` and thresholding the output
+    at `T_max` is equivalent to allowing stream `i` to spend `T_i` metres of rise.
+    Channel cells are not exempt from cost, so the budget of a larger stream extends
+    up a tributary only until the channel has climbed the difference in budgets (a
+    backwater limit), beyond which the tributary's own seed prevails. The
+    `nearest_dst` output holds the seed value of the stream that reached each cell at
+    least cost.
 
     Args:
-        slope_src (str): Topographic slope in degrees.
+        dem (str): Digital Elevation Model raster (metres).
         start_cost_src (str): Raster with seed costs on stream cells and nodata
             elsewhere.
         cost_dst (str): Output cumulative cost raster.
         nearest_dst (str): Output raster with the seed value of the nearest stream.
-        cost_floor (float, optional): Minimum friction expressed as a gradient (m/m).
-            Defaults to tan(0.5 degrees).
+        cost_floor (float, optional): Distance term expressed as a gradient (m/m).
+            Defaults to tan(0.1 degrees).
         max_cost (float | None, optional): Stop accumulating beyond this cumulative
             cost; cells beyond it are nodata. Defaults to None (unbounded).
-        weight_src (str | None, optional): Raster of multiplicative friction weights,
-            for example from `convergence_weight`. Nodata weights are treated as 1.
+        engine (str, optional): `"walk"` or `"cost"`. Defaults to "walk".
+        smooth_dist (float | None, optional): Focal median distance (m) applied to the
+            DEM before computing cost, to suppress micro-relief and noise.
             Defaults to None.
-        knights_move (bool, optional): Use the knight's move in `r.cost`.
-            Defaults to True.
-        memory (int | None, optional): Memory (MB) for `r.cost`. Defaults to 4096.
+        knights_move (bool, optional): Use the knight's move. Defaults to True.
+        memory (int | None, optional): Memory (MB) for GRASS. Defaults to 4096.
     """
     if cost_floor <= 0:
         raise ValueError("cost_floor must be positive to bound extent on flat terrain.")
+    if engine not in ("walk", "cost"):
+        raise ValueError('engine must be one of "walk" or "cost".')
 
-    raster_specs = Raster.raster_specs(slope_src)
+    raster_specs = Raster.raster_specs(dem)
     avg_cs = (raster_specs["csx"] + raster_specs["csy"]) / 2.0
 
-    slope_deg = da.clip(from_raster(slope_src).astype(np.float64), 0.0, 89.0)
-    cost = (da.tan(da.radians(slope_deg)) + cost_floor) * avg_cs
+    kwargs = {
+        "output": "cum_cost",
+        "start_raster": "start_cost",
+        "nearest": "nearest",
+        "flags": "kr" if knights_move else "r",
+    }
 
-    if weight_src is not None:
-        weight = da.ma.filled(from_raster(weight_src).astype(np.float64), 1.0)
-        cost = cost * weight
+    if memory is not None:
+        kwargs["memory"] = memory
 
-    with TempRasterFile() as cost_path:
-        to_raster(cost, slope_src, cost_path, as_cog=False)
+    # GRASS accepts an integer maximum; 0 disables the limit
+    if max_cost is not None and max_cost > 0:
+        kwargs["max_cost"] = int(math.ceil(max_cost)) + 1
 
-        kwargs = {
-            "input": "cost",
-            "output": "cum_cost",
-            "start_raster": "start_cost",
-            "nearest": "nearest",
-            "flags": "kr" if knights_move else "r",
-        }
-
-        if memory is not None:
-            kwargs["memory"] = memory
-
-        # r.cost accepts an integer maximum; 0 disables the limit
-        if max_cost is not None and max_cost > 0:
-            kwargs["max_cost"] = int(math.ceil(max_cost)) + 1
-
-        with GrassRunner(cost_path) as gr:
-            gr.run_command(
-                "r.cost",
-                (cost_path, "cost", "raster"),
-                (start_cost_src, "start_cost", "raster"),
-                **kwargs,
+    with TempRasterFiles(3) as (smooth_dst, surface_path, friction_path):
+        if smooth_dist is not None:
+            raster_filter(
+                dem,
+                kernel_from_distance(
+                    float(smooth_dist), raster_specs["csx"], raster_specs["csy"]
+                ),
+                "median",
+                smooth_dst,
             )
-            gr.save_raster("cum_cost", cost_dst)
-            gr.save_raster("nearest", nearest_dst)
+            dem = smooth_dst
+
+        if engine == "walk":
+            elevation = from_raster(dem).astype(np.float64)
+            to_raster(elevation, dem, surface_path, as_cog=False)
+
+            friction = da.ma.masked_where(
+                da.ma.getmaskarray(elevation), elevation * 0.0 + cost_floor
+            )
+            to_raster(friction, dem, friction_path, as_cog=False)
+
+            kwargs.update({
+                "elevation": "elevation",
+                "friction": "friction",
+                # uphill rise counts in full, descents are free, distance via friction
+                "walk_coeff": "0,1,0,0",
+                "lambda_": 1.0,
+            })
+
+            with GrassRunner(surface_path) as gr:
+                gr.run_command(
+                    "r.walk",
+                    (surface_path, "elevation", "raster"),
+                    (friction_path, "friction", "raster"),
+                    (start_cost_src, "start_cost", "raster"),
+                    **kwargs,
+                )
+                gr.save_raster("cum_cost", cost_dst)
+                gr.save_raster("nearest", nearest_dst)
+        else:
+            slope(dem, surface_path)
+            slope_deg = da.clip(from_raster(surface_path).astype(np.float64), 0.0, 89.0)
+            cost = (da.tan(da.radians(slope_deg)) + cost_floor) * avg_cs
+            to_raster(cost, dem, friction_path, as_cog=False)
+
+            kwargs["input"] = "cost"
+
+            with GrassRunner(friction_path) as gr:
+                gr.run_command(
+                    "r.cost",
+                    (friction_path, "cost", "raster"),
+                    (start_cost_src, "start_cost", "raster"),
+                    **kwargs,
+                )
+                gr.save_raster("cum_cost", cost_dst)
+                gr.save_raster("nearest", nearest_dst)
 
 
 def riparian_zones(
@@ -1202,6 +1248,7 @@ def riparian_zones(
     zones_dst: str,
     score_dst: str | None = None,
     streams: str | None = None,
+    h3_scale_src: str | None = None,
 ):
     """Classify a seeded rise-cost surface into three nested riparian zones.
 
@@ -1224,14 +1271,24 @@ def riparian_zones(
         streams (str | None, optional): Stream raster. Channel cells are always
             zone 1 with a score of 1, even where a neighbouring stream's seed reached
             them more cheaply than their own. Defaults to None.
+        h3_scale_src (str | None, optional): Raster of per-cell multipliers (>= 1)
+            applied to `h3`, for example `1 / convergence_weight(...)`, which allows
+            zone 3 to extend further into convergent terrain. Zone 3 is then
+            restricted to cells connected to the floodplain. Nodata is treated as 1.
+            Defaults to None.
     """
     cost = from_raster(cost_src).astype(np.float64)
     c0 = from_raster(nearest_src).astype(np.float64)
 
     rise = cost - c0
-    t3 = float(t_max) - c0
-    t2 = t3 - float(h3)
+    t2 = float(t_max) - c0 - float(h3)
     t1 = t2 * (float(f1) / float(f2))
+
+    h3_cell = float(h3)
+    if h3_scale_src is not None:
+        scale = da.ma.filled(from_raster(h3_scale_src).astype(np.float64), 1.0)
+        h3_cell = float(h3) * da.maximum(scale, 1.0)
+    t3 = t2 + h3_cell
 
     zones = da.where(rise < t1, 1, da.where(rise < t2, 2, da.where(rise < t3, 3, 0)))
     score = da.clip((t3 - rise) / t3, 0.0, 1.0)
@@ -1243,6 +1300,15 @@ def riparian_zones(
         zones = da.where(stream_mask, 1, zones)
         score = da.where(stream_mask, 1.0, score)
         mask = mask & ~stream_mask
+
+    if h3_scale_src is not None:
+        # Per-cell thresholds can isolate fringe cells; keep only fringe connected to
+        # the floodplain
+        region = ~mask
+        labels, _ = ndmeasure_label(region[0], structure=np.ones((3, 3), bool))
+        anchors = da.unique(labels[(region & (zones <= 2))[0]])
+        connected = da.isin(labels, anchors)[np.newaxis, ...]
+        mask = mask | ~connected
 
     to_raster(
         da.ma.masked_where(mask, zones.astype(np.uint8)),
@@ -1262,7 +1328,8 @@ def convergence_weight(
     gamma: float = 0.5,
     w_min: float = 0.25,
 ) -> da.Array:
-    """Friction weight that lowers resistance in convergent terrain.
+    """Weight expressing how much closer to the surface the water table sits in
+    convergent terrain.
 
     Hillslope groundwater discharges into hollows and toe slopes in proportion to the
     area draining to them, so convergent cells remain connected to the riparian water
@@ -1270,7 +1337,8 @@ def convergence_weight(
 
         w = clip((a_hill / a) ** gamma, w_min, 1)
 
-    where `a` is contributing area. Cells draining less than `a_hill` are unaffected.
+    where `a` is contributing area; the fringe rise budget is scaled by `1 / w`. Cells
+    draining less than `a_hill` are unaffected.
 
     Args:
         flow_accumulation (da.Array): Contributing cell count from
@@ -1278,7 +1346,7 @@ def convergence_weight(
         cell_area (float): Area of a cell (m2) used to convert counts to area.
         a_hill (float): Contributing area (m2) above which terrain is considered
             convergent.
-        gamma (float, optional): Rate at which friction decreases with area.
+        gamma (float, optional): Rate at which the weight decreases with area.
             Defaults to 0.5.
         w_min (float, optional): Minimum weight. Defaults to 0.25.
 
@@ -1293,69 +1361,12 @@ def convergence_weight(
     return da.clip((float(a_hill) / area) ** float(gamma), float(w_min), 1.0)
 
 
-def extend_fringe(
-    fringe_cost_src: str,
-    fringe_nearest_src: str,
-    t_max: float,
-    h3: float,
-    zones_src: str,
-    score_src: str,
-    zones_dst: str,
-    score_dst: str,
-):
-    """Union a second-pass fringe with existing zones.
-
-    The second pass is seeded from zone 1 and 2 cells with their first-pass seed
-    values, so `t_max - nearest` recovers the stream budget and `cost - nearest` the
-    friction spent from the floodplain edge. Cells within `h3` of the edge that are not
-    already in zones 1 or 2 become zone 3.
-
-    Args:
-        fringe_cost_src (str): Cumulative cost from the second `rise_cost_surface` pass.
-        fringe_nearest_src (str): Nearest-seed raster from the second pass.
-        t_max (float): Maximum zone 3 budget used to construct the first-pass seeds.
-        h3 (float): Fringe budget.
-        zones_src (str): First-pass zones from `riparian_zones`.
-        score_src (str): First-pass score from `riparian_zones`.
-        zones_dst (str): Output zones.
-        score_dst (str): Output score.
-    """
-    zones = from_raster(zones_src)
-    score = from_raster(score_src).astype(np.float64)
-
-    cost = from_raster(fringe_cost_src).astype(np.float64)
-    c0 = from_raster(fringe_nearest_src).astype(np.float64)
-    spent = cost - c0
-    t3 = float(t_max) - c0
-
-    floodplain = ~da.ma.getmaskarray(zones) & (zones <= 2)
-    reached = ~da.ma.getmaskarray(cost) & (spent < float(h3)) & ~floodplain
-
-    fringe_score = da.clip((float(h3) - spent) / t3, 0.0, 1.0)
-
-    zones_f = da.ma.filled(zones, 0)
-    out_zones = da.where(reached & (zones_f == 0), 3, zones_f)
-    out_score = da.where(
-        reached, da.maximum(da.ma.filled(score, 0.0), fringe_score), da.ma.filled(score, 0.0)
-    )
-
-    mask = out_zones == 0
-
-    to_raster(
-        da.ma.masked_where(mask, out_zones.astype(np.uint8)),
-        zones_src,
-        zones_dst,
-        nodata_value=0,
-    )
-    to_raster(da.ma.masked_where(mask, out_score.astype(np.float32)), zones_src, score_dst)
-
-
 class RiparianConnectivity:
     """Riparian zone delineation workflow
 
     Three nested zones are delineated around a stream network by accumulating
-    topographic rise (a path-based height above the stream) away from each stream cell
-    and comparing it with per-stream budgets:
+    uphill topographic rise (a monotone-path height above the stream; descents are
+    free) away from each stream cell and comparing it with per-stream budgets:
 
     * Zone 1 - channel and active floodplain: rise < `f1 * D_bf * g`
     * Zone 2 - flood-prone area: rise < `f2 * D_bf * g`
@@ -1394,7 +1405,7 @@ class RiparianConnectivity:
     """
 
     _attributes = (
-        "slope",
+        "cost_dem",
         "flow_direction",
         "flow_accumulation",
         "streams",
@@ -1404,8 +1415,7 @@ class RiparianConnectivity:
         "start_cost",
         "cost",
         "nearest",
-        "fringe_cost",
-        "fringe_nearest",
+        "fringe_scale",
         "zones",
         "score",
         "region",
@@ -1564,6 +1574,8 @@ class RiparianConnectivity:
         a_hill: float | None = None,
         gamma: float = 0.5,
         w_min: float = 0.25,
+        engine: str = "walk",
+        smooth_dist: float | None = None,
         memory: int | None = 4096,
     ):
         """Delineate the three riparian zones.
@@ -1578,11 +1590,10 @@ class RiparianConnectivity:
         and consumed along the least-climb path away from the stream. A cell belongs to
         the innermost zone whose budget exceeds the rise required to reach it.
 
-        With `fringe_mode="convergence"` a second pass is seeded from the floodplain
-        (zones 1 and 2) with friction reduced in convergent terrain
-        (see `convergence_weight`), and the result is unioned with zone 3. This
-        extends the fringe into hollows and toe slopes that receive hillslope
-        groundwater.
+        With `fringe_mode="convergence"` the zone 3 budget is scaled per cell by
+        `1 / convergence_weight(...)`, so the fringe extends further into hollows and
+        toe slopes that receive hillslope groundwater. Fringe cells are kept only
+        where connected to the floodplain.
 
         Args:
             f1 (float, optional): Bankfull depth multiple defining the channel and
@@ -1602,19 +1613,27 @@ class RiparianConnectivity:
             t_min (float | None, optional): Minimum zone 1 budget (m). Defaults to
                 twice the friction of a flat cell, which guarantees at least one cell
                 beyond the channel.
-            cost_floor (float, optional): Minimum friction as a gradient (m/m). Bounds
-                the lateral extent on flat terrain to `budget / cost_floor`.
-                Defaults to tan(0.5 degrees).
+            cost_floor (float, optional): Distance term as a gradient (m/m). Bounds
+                the lateral extent on flat terrain to `budget / cost_floor`; set from
+                the widest floodplain expected. Defaults to tan(0.1 degrees), about
+                1 m of budget per 570 m.
             fringe_mode (str, optional): `"rise"` derives zone 3 from the rise budget
                 alone; `"convergence"` adds the convergence-weighted second pass.
                 Defaults to "rise".
             a_hill (float | None, optional): Contributing area (m2) above which
                 terrain is considered convergent. Defaults to a tenth of the stream
                 initiation area used in `extract_streams`.
-            gamma (float, optional): Rate at which fringe friction decreases with
+            gamma (float, optional): Rate at which the fringe budget grows with
                 contributing area. Defaults to 0.5.
-            w_min (float, optional): Minimum fringe friction weight. Defaults to 0.25.
-            memory (int | None, optional): Memory (MB) for `r.cost`. Defaults to 4096.
+            w_min (float, optional): Minimum convergence weight; the fringe budget is
+                at most `h3 / w_min`. Defaults to 0.25.
+            engine (str, optional): `"walk"` accumulates uphill rise only (descents
+                are free); `"cost"` uses symmetric slope friction and is retained for
+                comparison. See `rise_cost_surface`. Defaults to "walk".
+            smooth_dist (float | None, optional): Focal median distance (m) applied to
+                the DEM before computing cost, to suppress LiDAR noise and floodplain
+                micro-relief. Defaults to None.
+            memory (int | None, optional): Memory (MB) for GRASS. Defaults to 4096.
         """
         if fringe_mode not in ("rise", "convergence"):
             raise ValueError('fringe_mode must be one of "rise" or "convergence".')
@@ -1639,10 +1658,17 @@ class RiparianConnectivity:
         if h3 <= 0:
             raise ValueError("h3 must be positive.")
 
-        if self.slope is None:
-            slope_dst = self.raster_path("slope")
-            slope(self.dem, slope_dst)
-            self.slope = slope_dst
+        # Smooth once so both passes share the same surface
+        cost_dem = self.dem
+        if smooth_dist is not None:
+            cost_dem = self.raster_path("cost_dem")
+            raster_filter(
+                self.dem,
+                kernel_from_distance(float(smooth_dist), self.csx, self.csy),
+                "median",
+                cost_dem,
+            )
+        self.cost_dem = cost_dem
 
         avg_cs = (self.csx + self.csy) / 2.0
         if t_min is None:
@@ -1671,35 +1697,10 @@ class RiparianConnectivity:
             as_cog=False,
         )
 
-        cost_dst = self.raster_path("cost")
-        nearest_dst = self.raster_path("nearest")
-        rise_cost_surface(
-            self.slope,
-            start_cost_dst,
-            cost_dst,
-            nearest_dst,
-            cost_floor=cost_floor,
-            max_cost=t_max,
-            memory=memory,
-        )
-
-        zones_dst = self.raster_path("zones")
-        score_dst = self.raster_path("score")
-        fringe_cost_dst = fringe_nearest_dst = None
-
-        if fringe_mode == "rise":
-            riparian_zones(
-                cost_dst,
-                nearest_dst,
-                t_max,
-                f1,
-                f2,
-                h3,
-                zones_dst,
-                score_dst,
-                streams=self.streams,
-            )
-        else:
+        # Convergent terrain may spend up to h3 / w_min on the fringe
+        h3_scale_dst = None
+        max_cost = t_max
+        if fringe_mode == "convergence":
             if a_hill is None:
                 if self.min_ws_area is None:
                     raise ValueError(
@@ -1708,70 +1709,49 @@ class RiparianConnectivity:
                     )
                 a_hill = 0.1 * self.min_ws_area
 
-            rise_zones_dst = self.raster_path("zones_rise")
-            rise_score_dst = self.raster_path("score_rise")
-            riparian_zones(
-                cost_dst,
-                nearest_dst,
-                t_max,
-                f1,
-                f2,
-                h3,
-                rise_zones_dst,
-                rise_score_dst,
-                streams=self.streams,
+            weight = convergence_weight(
+                from_raster(self.flow_accumulation),
+                self.csx * self.csy,
+                a_hill,
+                gamma,
+                w_min,
             )
-
-            # Seed the fringe pass from the floodplain, carrying the stream budgets
-            rise_zones = from_raster(rise_zones_dst)
-            floodplain = ~da.ma.getmaskarray(rise_zones) & (rise_zones <= 2)
-            fringe_start_dst = self.raster_path("fringe_start_cost")
+            h3_scale_dst = self.raster_path("fringe_scale")
             to_raster(
-                da.ma.masked_where(
-                    ~floodplain, from_raster(nearest_dst).astype(np.float32)
-                ),
-                nearest_dst,
-                fringe_start_dst,
-                as_cog=False,
-            )
-
-            weight_dst = self.raster_path("fringe_weight")
-            to_raster(
-                convergence_weight(
-                    from_raster(self.flow_accumulation),
-                    self.csx * self.csy,
-                    a_hill,
-                    gamma,
-                    w_min,
-                ).astype(np.float32),
+                (1.0 / weight).astype(np.float32),
                 self.flow_accumulation,
-                weight_dst,
+                h3_scale_dst,
                 as_cog=False,
             )
+            max_cost = t_max + float(h3) * (1.0 / w_min - 1.0)
 
-            fringe_cost_dst = self.raster_path("fringe_cost")
-            fringe_nearest_dst = self.raster_path("fringe_nearest")
-            rise_cost_surface(
-                self.slope,
-                fringe_start_dst,
-                fringe_cost_dst,
-                fringe_nearest_dst,
-                cost_floor=cost_floor,
-                max_cost=t_max,
-                weight_src=weight_dst,
-                memory=memory,
-            )
+        cost_dst = self.raster_path("cost")
+        nearest_dst = self.raster_path("nearest")
+        rise_cost_surface(
+            cost_dem,
+            start_cost_dst,
+            cost_dst,
+            nearest_dst,
+            cost_floor=cost_floor,
+            max_cost=max_cost,
+            engine=engine,
+            memory=memory,
+        )
 
-            extend_fringe(
-                fringe_cost_dst,
-                fringe_nearest_dst,
-                t_max,
-                h3,
-                rise_zones_dst,
-                rise_score_dst,
-                zones_dst,
-                score_dst,
-            )
+        zones_dst = self.raster_path("zones")
+        score_dst = self.raster_path("score")
+        riparian_zones(
+            cost_dst,
+            nearest_dst,
+            t_max,
+            f1,
+            f2,
+            h3,
+            zones_dst,
+            score_dst,
+            streams=self.streams,
+            h3_scale_src=h3_scale_dst,
+        )
 
         region_dst = self.raster_path("region")
         to_raster(
@@ -1782,8 +1762,7 @@ class RiparianConnectivity:
         self.start_cost = start_cost_dst
         self.cost = cost_dst
         self.nearest = nearest_dst
-        self.fringe_cost = fringe_cost_dst
-        self.fringe_nearest = fringe_nearest_dst
+        self.fringe_scale = h3_scale_dst
         self.zones = zones_dst
         self.score = score_dst
         self.region = region_dst
