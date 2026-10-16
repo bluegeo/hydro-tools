@@ -17,7 +17,7 @@ from shapely.geometry import LineString, Point
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.neighbors import BallTree
 
-from hydrotools.config import CHUNKS, TMP_DIR
+from hydrotools.config import TMP_DIR
 from hydrotools.elevation import slope
 from hydrotools.interpolate import distance_transform, raster_filter
 from hydrotools.raster import (
@@ -1032,8 +1032,6 @@ def topographic_wetness(
         to_raster(cs_inverted, slope_src, topographic_wetness_dst)
 
 
-
-
 class RiparianConnectivity:
     """Riparian analysis workflow
 
@@ -1319,8 +1317,7 @@ class RiparianConnectivity:
 
         # Effective distance (m) cost surface
         cost = (
-            1.0
-            + vertical_weight * da.tan(da.deg2rad(da.clip(terrain_slope, 0, 89.0)))
+            1.0 + vertical_weight * da.tan(da.deg2rad(da.clip(terrain_slope, 0, 89.0)))
         ) * avg_cs
         cost = da.ma.masked_where(terrain_mask, cost)
 
