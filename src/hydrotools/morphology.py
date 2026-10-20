@@ -1129,7 +1129,7 @@ class RiparianConnectivity:
         self,
         min_ws_area: float = 1e6,
         min_stream_length: float = 0,
-        memory: int | None = 4096,
+        memory: int | None = None,
     ):
         """Create a streams attribute.
 
@@ -1167,10 +1167,10 @@ class RiparianConnectivity:
     def calc_cost_surface(
         self,
         max_slope: float = 15.0,
-        max_bfw: float = 70.0,
-        max_cost: float = 350.0,
+        max_bfw: float = 10.0,
+        max_cost: float = 300.0,
         knights_move: bool = True,
-        memory: int = 4096,
+        memory: int | None = None,
     ):
         """Calculate a cost surface, which is also used to constrain the
         riparian extent.
