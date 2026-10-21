@@ -1091,7 +1091,8 @@ class RiparianConnectivity:
             self.bankfull_width,
             self.stream_slope,
             self.stream_density,
-        ) = (None for _ in range(8))
+            self.cost,
+        ) = (None for _ in range(9))
 
         self.verify_source(self.precip)
 
@@ -1168,7 +1169,7 @@ class RiparianConnectivity:
         self,
         max_slope: float = 15.0,
         max_bfw: float = 10.0,
-        max_cost: float = 300.0,
+        max_cost: float = 29.0,
         knights_move: bool = True,
         memory: int | None = None,
     ):
@@ -1182,6 +1183,9 @@ class RiparianConnectivity:
             knights_move (bool, optional): Whether to allow diagonal movement in the least cost analysis. Defaults to True.
             memory (int, optional): Memory size to pass to GRASS for memory management of `r.cost` operations. Defaults to 4096.
         """
+        if max_cost <= 0:
+            raise ValueError("max_cost must be greater than 0")
+
         if self.bankfull_width is None:
             print("Calculating bankfull width")
             self.calc_bankfull_width()
@@ -1242,10 +1246,12 @@ class RiparianConnectivity:
 
             cs = from_raster(cost_surface).astype("float32")
 
-            # Invert
-            cs_inverted = max_cost - da.ma.masked_where(cs > max_cost, cs)
+            # Normalize and invert
+            cs = da.ma.masked_where(cs > max_cost, cs)
 
-            to_raster(cs_inverted, self.slope, cost_dst)
+            cs = 1 - (cs / max_cost)
+
+            to_raster(cs, self.slope, cost_dst)
 
         self.cost = cost_dst
 
@@ -1360,7 +1366,7 @@ class RiparianConnectivity:
         if self.cost is None:
             raise AttributeError(
                 "Riparian regions must be delineated using "
-                "`RiparianConnectivity.calc_least_cost` prior to calculating Stream "
+                "`RiparianConnectivity.calc_cost_surface` prior to calculating Stream "
                 "Density."
             )
         # Would check for slope, but it will be implicitly included if
@@ -1440,9 +1446,6 @@ class RiparianConnectivity:
 
         prepared_attrs = []
         for attr in attributes:
-            if attr == "twi":
-                attr = "region"
-
             attr_value = getattr(self, attr)
             if attr_value is None:
                 raise AttributeError(f"The attribute '{attr}' has not been calculated.")
