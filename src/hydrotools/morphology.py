@@ -1091,6 +1091,8 @@ class RiparianConnectivity:
 
         self.verify_source(self.precip)
 
+        self.dry_run = False
+
     def raster_path(self, name: str) -> str:
         """Generate a raster path using the current temporary directory.
 
@@ -1266,7 +1268,12 @@ class RiparianConnectivity:
                     # We want to see the cost surface to constrain parameters
                     gr.save_raster("lcp", cost_dst)
                     self.cost = cost_dst
+
+                    self.dry_run = True
+
                     return
+                else:
+                    self.dry_run = False
 
                 gr.save_raster("lcp", cost_surface)
 
@@ -1354,7 +1361,7 @@ class RiparianConnectivity:
 
         stream_slope_dst = self.raster_path("stream_slope")
 
-        stream_slope(self.dem, self.streams, stream_slope_dst)
+        stream_slope(self.dem, self.streams, stream_slope_dst, 100, scale=2)
 
         self.stream_slope = stream_slope_dst
 
@@ -1371,6 +1378,9 @@ class RiparianConnectivity:
             breakpoints (tuple, optional): Breakpoints to use to define zones of
                 connectivity. Defaults to (1./3., 2./3.).
         """
+        if self.dry_run:
+            raise RuntimeError("Dry run mode enabled, cannot calculate connectivity.")
+
         sensitivity = from_raster(self.cost)
 
         with TempRasterFile() as vector_src_path:
