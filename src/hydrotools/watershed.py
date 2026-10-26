@@ -7,7 +7,6 @@ import pickle
 import gzip
 from tempfile import TemporaryDirectory
 from typing import Union
-from urllib.request import urlretrieve
 
 import dask.array as da
 import numpy as np
@@ -19,12 +18,12 @@ from rasterio.windows import Window
 from numba import njit
 import fiona
 from fiona.crs import from_string
-from pyproj import CRS, Transformer
+from pyproj import CRS
 import shapely
-from shapely.geometry import box, shape, mapping, Point
+from shapely.geometry import mapping, Point
 from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt
 
-from hydrotools.config import TMP_DIR, CACHE_DIR
+from hydrotools.config import TMP_DIR
 from hydrotools.utils import (
     GrassRunner,
     infer_nodata,
@@ -41,6 +40,15 @@ from hydrotools.raster import (
     vectorize,
     warp,
     warp_like,
+)
+from hydrotools.data import (
+    MRDEM_DTM,
+    REMOTE_WARP_ARGS,
+    collect_elevation,
+    native_cell_size,
+    transform_geom,
+    upstream_basins,
+    valid_footprint,
 )
 
 
@@ -1052,12 +1060,13 @@ class WatershedIndex:
         )
 
 
-
-
 # Row/col offsets indexed by GRASS flow direction (1-8 counterclockwise from NE, 0
 # is unused)
 FD_OFF_I = np.array([0, -1, -1, -1, 0, 1, 1, 1, 0], dtype=np.int64)
 FD_OFF_J = np.array([0, 1, 0, -1, -1, -1, 0, 1, 1], dtype=np.int64)
+
+# Maximum number of cells used to screen the area draining into a DEM
+SCREENING_CELLS = 4_000_000
 
 
 @njit
@@ -1164,15 +1173,6 @@ def _accumulate(fd, valid, weights, off_i, off_j):
     return acc
 
 
-
-
-
-
-
-
-
-
-
 def _grid_bounds(bounds: tuple, cs: float) -> tuple:
     """Snap bounds outwards to a multiple of a cell size"""
     left, bottom, right, top = bounds
@@ -1183,14 +1183,6 @@ def _grid_bounds(bounds: tuple, cs: float) -> tuple:
         math.ceil(right / cs) * cs,
         math.ceil(top / cs) * cs,
     )
-
-
-def _native_cell_size(src: str) -> float:
-    """Cell size of a raster in metres (approximate for geographic rasters)"""
-    r = Raster(src)
-    cs = min(r.csx, r.csy)
-
-    return cs * 111_320.0 if CRS.from_wkt(r.wkt).is_geographic else cs
 
 
 def _regional_flow(
@@ -1219,18 +1211,7 @@ def _regional_flow(
     target_path = os.path.join(wkdir, f"{name}_target.tif")
     fd_path = os.path.join(wkdir, f"{name}_fd.tif")
 
-    warp(
-        sources,
-        regional_dem,
-        bounds,
-        cs,
-        cs,
-        crs,
-        "Float32",
-        "average" if cs > _native_cell_size(sources[0]) else "bilinear",
-        additional_args=REMOTE_WARP_ARGS,
-        as_cog=False,
-    )
+    collect_elevation(regional_dem, bounds, cs, crs, sources=sources, as_cog=False)
 
     with rasterio.open(regional_dem) as ds:
         a = ds.read(1)
@@ -1389,7 +1370,7 @@ def _snap_inflows(
 
             seed = seeds.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
             seed[0] += inflow["area"]
-            seed[1] += inflow["area"] * inflow["precip"]
+            seed[1] += inflow["area"] * inflow.get("precip", 0.0)
             if inflow["area"] >= seed[4]:
                 x, y = dem_ds.xy(*key)
                 seed[2], seed[3] = x, y
@@ -1418,34 +1399,43 @@ def _add_seeds(block, rows, cols, values, block_info=None):
 
 
 def _seeded_weights(
-    dem: str, precip: str, template: str, seeds: dict, area_dst: str, precip_dst: str
+    dem: str,
+    template: str,
+    seeds: dict,
+    area_dst: str,
+    precip: Union[str, None] = None,
+    precip_dst: Union[str, None] = None,
 ):
-    """Create cell area and precip * cell area weights with added inflow seeds"""
+    """Create cell area and (optionally) precip * cell area weights with added inflow
+    seeds"""
     r = Raster(dem)
     cell_area = r.csx * r.csy
 
     dem_a = from_raster(dem)
     valid = ~da.ma.getmaskarray(dem_a)
 
-    precip_a = from_raster(precip)
-    missing = int((valid & da.ma.getmaskarray(precip_a)).sum().compute())
-    if missing > 0:
-        raise ValueError(
-            f"The precipitation raster does not cover {missing} cells of the DEM"
-        )
-
     keys = list(seeds.keys())
     rows = np.array([k[0] for k in keys], dtype=np.int64)
     cols = np.array([k[1] for k in keys], dtype=np.int64)
     areas = np.array([seeds[k][0] for k in keys], dtype=np.float64)
-    precips = np.array([seeds[k][1] for k in keys], dtype=np.float64)
 
-    area_w = da.where(valid, cell_area, np.nan).astype(np.float64)
-    precip_w = da.where(
-        valid, da.ma.filled(precip_a, 0).astype(np.float64) * cell_area, np.nan
-    )
+    weights = [(da.where(valid, cell_area, np.nan).astype(np.float64), areas, area_dst)]
 
-    for w, values, dst in [(area_w, areas, area_dst), (precip_w, precips, precip_dst)]:
+    if precip is not None:
+        precip_a = from_raster(precip)
+        missing = int((valid & da.ma.getmaskarray(precip_a)).sum().compute())
+        if missing > 0:
+            raise ValueError(
+                f"The precipitation raster does not cover {missing} cells of the DEM"
+            )
+
+        precips = np.array([seeds[k][1] for k in keys], dtype=np.float64)
+        precip_w = da.where(
+            valid, da.ma.filled(precip_a, 0).astype(np.float64) * cell_area, np.nan
+        )
+        weights.append((precip_w, precips, precip_dst))
+
+    for w, values, dst in weights:
         w = w.map_blocks(_add_seeds, rows, cols, values, dtype=np.float64)
         to_raster(da.ma.masked_invalid(w), template, dst, as_cog=False)
 
@@ -1457,6 +1447,7 @@ def _r_stream_extract(
     threshold: int,
     min_length: float,
     accumulation: Union[str, None] = None,
+    mexp: Union[float, None] = None,
     memory: Union[int, None] = 4096,
     as_cog: bool = True,
 ):
@@ -1474,6 +1465,9 @@ def _r_stream_extract(
         args.append((accumulation, "accum", "raster"))
         kwargs["accumulation"] = "accum"
 
+    if mexp is not None:
+        kwargs["mexp"] = mexp
+
     if memory is not None:
         kwargs["memory"] = memory
 
@@ -1485,20 +1479,21 @@ def _r_stream_extract(
 
 def extract_streams_with_inflows(
     dem: str,
-    precip: str,
     inflows: list,
     stream_dst: str,
     direction_dst: str,
     contributing_area_dst: str,
-    mean_precip_dst: str,
+    precip: Union[str, None] = None,
+    mean_precip_dst: Union[str, None] = None,
     min_area: float = 1e6,
     min_length: float = 0,
+    mexp: Union[float, None] = None,
     snap_distance: float = 250.0,
     inflow_dst: Union[str, None] = None,
     memory: Union[int, None] = 4096,
 ):
     """Extract streams from a DEM that does not cover the full contributing area of
-    its streams, by adding the area and precipitation of known inflows.
+    its streams, by adding the area (and optionally precipitation) of known inflows.
 
     Inflows are snapped to the DEM (see `snap_distance`), and are used to seed flow
     accumulation of cell area and precipitation. Streams are then extracted using
@@ -1510,19 +1505,22 @@ def extract_streams_with_inflows(
     Args:
         dem (str): Digital Elevation Model raster in a projected (preferably
         equal-area) spatial reference with units of metres.
-        precip (str): Mean annual precipitation raster covering the DEM. It is
-        warped to the DEM grid when it does not align.
         inflows (list): Inflows in the form `{"x": float, "y": float, "area": float,
         "precip": float}`, where `x` and `y` are in the DEM spatial reference,
-        `area` is the external contributing area (m2), and `precip` is the mean
-        precipitation over the external contributing area.
+        `area` is the external contributing area (m2), and `precip` (only required
+        with `precip`) is the mean precipitation over the external contributing area.
         stream_dst (str): Output streams raster.
         direction_dst (str): Output flow direction raster.
         contributing_area_dst (str): Output contributing area raster (km2).
-        mean_precip_dst (str): Output mean upstream precipitation raster.
+        precip (Union[str, None], optional): Mean annual precipitation raster covering
+        the DEM. It is warped to the DEM grid when it does not align. Defaults to None.
+        mean_precip_dst (Union[str, None], optional): Output mean upstream
+        precipitation raster. Required with `precip`. Defaults to None.
         min_area (float, optional): Minimum contributing area (m2) for streams.
         Defaults to 1e6.
         min_length (float, optional): Minimum stream length. Defaults to 0.
+        mexp (Union[float, None], optional): Montgomery exponent for r.stream.extract.
+        Defaults to None.
         snap_distance (float, optional): Distance (m) to search for a receiving
         cell for each inflow. Defaults to 250.
         inflow_dst (Union[str, None], optional): Output GeoPackage of snapped inflow
@@ -1530,6 +1528,9 @@ def extract_streams_with_inflows(
         memory (Union[int, None], optional): Memory (MB) for r.stream.extract.
         Defaults to 4096 MB.
     """
+    if (precip is None) != (mean_precip_dst is None):
+        raise ValueError("precip and mean_precip_dst must be specified together")
+
     r = Raster(dem)
     cell_area = r.csx * r.csy
     min_area_cells = area_to_cells(dem, min_area)
@@ -1544,11 +1545,12 @@ def extract_streams_with_inflows(
             p("direction_local"),
             min_area_cells,
             min_length,
+            mexp=mexp,
             memory=memory,
             as_cog=False,
         )
 
-        if not Raster(precip).matches(p("direction_local")):
+        if precip is not None and not Raster(precip).matches(p("direction_local")):
             warp_like(
                 precip,
                 p("precip"),
@@ -1564,11 +1566,11 @@ def extract_streams_with_inflows(
 
         _seeded_weights(
             dem,
-            precip,
             p("direction_local"),
             seeds,
             p("area_weight"),
-            p("precip_weight"),
+            precip=precip,
+            precip_dst=p("precip_weight"),
         )
 
         # Corrected accumulation (in cells) for stream extraction
@@ -1589,13 +1591,13 @@ def extract_streams_with_inflows(
             min_area_cells,
             min_length,
             accumulation=p("accumulation"),
+            mexp=mexp,
             memory=memory,
         )
 
         # Accumulate on the final flow direction so outputs are consistent with streams
         fa = FlowAccumulation(direction_dst)
         fa.calculate(p("area_weight"), p("area_sum"))
-        fa.calculate(p("precip_weight"), p("precip_sum"))
 
         area_sum = from_raster(p("area_sum"))
         area_sum = da.ma.masked_where(area_sum <= 0, area_sum)
@@ -1603,29 +1605,37 @@ def extract_streams_with_inflows(
         to_raster(
             (area_sum / 1e6).astype(np.float32), direction_dst, contributing_area_dst
         )
-        to_raster(
-            (from_raster(p("precip_sum")) / area_sum).astype(np.float32),
-            direction_dst,
-            mean_precip_dst,
-        )
+
+        if precip is not None:
+            fa.calculate(p("precip_weight"), p("precip_sum"))
+            to_raster(
+                (from_raster(p("precip_sum")) / area_sum).astype(np.float32),
+                direction_dst,
+                mean_precip_dst,
+            )
 
     if inflow_dst is not None:
+        properties = {"area_km2": "float"}
+        if precip is not None:
+            properties["precip"] = "float"
+
         with fiona.open(
             inflow_dst,
             "w",
             driver="GPKG",
             crs=r.wkt,
-            schema={
-                "geometry": "Point",
-                "properties": {"area_km2": "float", "precip": "float"},
-            },
+            schema={"geometry": "Point", "properties": properties},
         ) as dst:
             dst.writerecords(
                 {
                     "geometry": mapping(Point(seed[2], seed[3])),
                     "properties": {
                         "area_km2": seed[0] / 1e6,
-                        "precip": seed[1] / seed[0] if seed[0] > 0 else None,
+                        **(
+                            {"precip": seed[1] / seed[0] if seed[0] > 0 else None}
+                            if precip is not None
+                            else {}
+                        ),
                     },
                 }
                 for seed in seeds.values()
@@ -1634,13 +1644,14 @@ def extract_streams_with_inflows(
 
 def extract_streams_expanded(
     dem: str,
-    precip: str,
     stream_dst: str,
     direction_dst: str,
     contributing_area_dst: str,
-    mean_precip_dst: str,
+    precip: Union[str, None] = None,
+    mean_precip_dst: Union[str, None] = None,
     min_area: float = 1e6,
     min_length: float = 0,
+    mexp: Union[float, None] = None,
     regional_dem: Union[str, list] = MRDEM_DTM,
     regional_cell_size: Union[float, None] = None,
     max_regional_cells: int = 25_000_000,
@@ -1649,27 +1660,23 @@ def extract_streams_expanded(
     inflow_dst: Union[str, None] = None,
     memory: Union[int, None] = 4096,
 ):
-    """Extract streams, contributing area, and mean upstream precipitation from a DEM
-    that does not extend to the edges of its watershed(s).
+    """Extract streams and contributing area (and optionally mean upstream
+    precipitation) from a DEM that does not extend to the edges of its watershed(s).
+    This extends `extract_streams` by accounting for area that drains into the DEM.
 
     The area draining into the DEM is calculated using a regional DEM (Canada's
     MRDEM by default) and is used to seed flow accumulation on the DEM:
 
-    1. HydroBASINS level 12 basins that intersect the DEM, and all basins upstream of
-    them, define the search area. HydroBASINS is downloaded once and cached in
-    `hydrotools.config.CACHE_DIR` (set with the `HYDROTOOLS_CACHE_DIR` environment
-    variable).
+    1. HydroBASINS level 12 basins that intersect valid data in the DEM, and all
+    basins upstream of them, define the search area (see
+    `hydrotools.data.upstream_basins`).
     2. The search area is screened at a coarse resolution to find cells that drain
     into the DEM.
     3. Flow is accumulated on the screened area at `regional_cell_size`, and the area
-    and precipitation flowing into the DEM is collected where flow crosses into it.
-    4. Inflows are snapped to the DEM and used to extract streams (see
+    (and precipitation) flowing into the DEM is collected where flow crosses into it.
+    4. Inflows are snapped to the DEM channels and used to seed a weighted flow
+    accumulation, which is used to extract streams (see
     `extract_streams_with_inflows`).
-
-    HydroBASINS:
-        Lehner, B., Grill G. (2013). Global river hydrography and network routing:
-        baseline data and new approaches to study the world's large river systems.
-        Hydrological Processes, 27(15): 2171-2186.
 
     Note, MRDEM extends only a short distance south of the Canada/US border. Include
     additional DEM sources through `regional_dem` for watersheds that drain from
@@ -1678,15 +1685,19 @@ def extract_streams_expanded(
     Args:
         dem (str): Digital Elevation Model raster in a projected (preferably
         equal-area) spatial reference with units of metres.
-        precip (str): Mean annual precipitation raster that covers the DEM and the
-        area draining into it. Gaps are filled with the nearest value.
         stream_dst (str): Output streams raster.
         direction_dst (str): Output flow direction raster.
         contributing_area_dst (str): Output contributing area raster (km2).
-        mean_precip_dst (str): Output mean upstream precipitation raster.
+        precip (Union[str, None], optional): Mean annual precipitation raster that
+        covers the DEM and the area draining into it. Gaps are filled with the nearest
+        value. Defaults to None.
+        mean_precip_dst (Union[str, None], optional): Output mean upstream
+        precipitation raster. Required with `precip`. Defaults to None.
         min_area (float, optional): Minimum contributing area (m2) for streams.
         Defaults to 1e6.
         min_length (float, optional): Minimum stream length. Defaults to 0.
+        mexp (Union[float, None], optional): Montgomery exponent for r.stream.extract.
+        Defaults to None.
         regional_dem (Union[str, list], optional): Regional DEM source(s) readable by
         GDAL. Where sources overlap, later sources take priority. Defaults to MRDEM.
         regional_cell_size (Union[float, None], optional): Cell size (m) used to
@@ -1703,23 +1714,18 @@ def extract_streams_expanded(
         memory (Union[int, None], optional): Memory (MB) for r.stream.extract.
         Defaults to 4096 MB.
     """
+    if (precip is None) != (mean_precip_dst is None):
+        raise ValueError("precip and mean_precip_dst must be specified together")
+
     if isinstance(regional_dem, str):
         regional_dem = [regional_dem]
-    regional_dem = [
-        f"/vsicurl/{src}" if src.startswith(("http://", "https://")) else src
-        for src in regional_dem
-    ]
 
     r = Raster(dem)
     dem_crs = CRS.from_wkt(r.wkt)
     if dem_crs.is_geographic:
         raise ValueError("The DEM must use a projected spatial reference")
 
-    footprint = _transform_geom(
-        shapely.segmentize(box(*r.bbox), max(r.right - r.left, r.top - r.bottom) / 20),
-        dem_crs,
-        "EPSG:4326",
-    )
+    footprint = valid_footprint(dem)
 
     # An equal-area grid centred on the DEM is used for all regional analysis
     lon, lat = footprint.centroid.x, footprint.centroid.y
@@ -1730,11 +1736,15 @@ def extract_streams_expanded(
 
     print("Collecting HydroBASINS upstream of the DEM")
     geoms = [
-        _transform_geom(g, "EPSG:4326", laea)
-        for g in _hydrobasins_upstream(footprint) + [footprint]
+        transform_geom(g, "EPSG:4326", laea)
+        for g in upstream_basins(footprint, dissolve=False) + [footprint]
     ]
 
-    native_cs = _native_cell_size(regional_dem[0])
+    native_cs = native_cell_size(
+        f"/vsicurl/{regional_dem[0]}"
+        if regional_dem[0].startswith(("http://", "https://"))
+        else regional_dem[0]
+    )
 
     with TemporaryDirectory(dir=TMP_DIR) as wkdir:
         # Screen the area draining into the DEM at a coarse resolution
@@ -1786,7 +1796,7 @@ def extract_streams_expanded(
 
         screen_mask = binary_dilation(drains, iterations=buffer_cells)
 
-        # Accumulate area and precipitation at the regional resolution
+        # Accumulate area (and precipitation) at the regional resolution
         rows, cols = np.nonzero(screen_mask)
         left = bounds[0] + cols.min() * cs
         right = bounds[0] + (cols.max() + 1) * cs
@@ -1824,48 +1834,51 @@ def extract_streams_expanded(
         )
         valid = regional["valid"]
 
-        regional_precip = os.path.join(wkdir, "regional_precip.tif")
-        warp(
-            precip,
-            regional_precip,
-            bounds,
-            cs,
-            cs,
-            laea,
-            "Float32",
-            "bilinear",
-            additional_args=REMOTE_WARP_ARGS,
-            as_cog=False,
-        )
-        with rasterio.open(regional_precip) as ds:
-            p = ds.read(1).astype(np.float64)
-            profile = ds.profile.copy()
-            missing = ~(ds.read_masks(1) > 0) | ~np.isfinite(p)
-
-        if missing.all():
-            raise ValueError("The precipitation raster does not cover the DEM")
-
-        if (missing & valid).any():
-            warning(
-                f"The precipitation raster does not cover "
-                f"{(missing & valid).sum() * cs**2 / 1e6:.1f} km2 of the area "
-                "draining into the DEM, which was filled using the nearest values"
-            )
-            idx = distance_transform_edt(
-                missing, return_distances=False, return_indices=True
-            )
-            p = p[tuple(idx)]
-            del idx
-
-            profile.update(dtype="float32")
-            with rasterio.open(regional_precip, "w", **profile) as ds:
-                ds.write(p.astype(np.float32), 1)
-
         cell_area = cs**2
-        weights = np.zeros((2,) + shape_, np.float64)
+        weights = np.zeros((1 if precip is None else 2,) + shape_, np.float64)
         weights[0][valid] = cell_area
-        weights[1][valid] = p[valid] * cell_area
-        del p
+
+        regional_precip = None
+        if precip is not None:
+            regional_precip = os.path.join(wkdir, "regional_precip.tif")
+            warp(
+                precip,
+                regional_precip,
+                bounds,
+                cs,
+                cs,
+                laea,
+                "Float32",
+                "bilinear",
+                additional_args=REMOTE_WARP_ARGS,
+                as_cog=False,
+            )
+            with rasterio.open(regional_precip) as ds:
+                pr = ds.read(1).astype(np.float64)
+                profile = ds.profile.copy()
+                missing = ~(ds.read_masks(1) > 0) | ~np.isfinite(pr)
+
+            if missing.all():
+                raise ValueError("The precipitation raster does not cover the DEM")
+
+            if (missing & valid).any():
+                warning(
+                    f"The precipitation raster does not cover "
+                    f"{(missing & valid).sum() * cs**2 / 1e6:.1f} km2 of the area "
+                    "draining into the DEM, which was filled using the nearest values"
+                )
+                idx = distance_transform_edt(
+                    missing, return_distances=False, return_indices=True
+                )
+                pr = pr[tuple(idx)]
+                del idx
+
+                profile.update(dtype="float32")
+                with rasterio.open(regional_precip, "w", **profile) as ds:
+                    ds.write(pr.astype(np.float32), 1)
+
+            weights[1][valid] = pr[valid] * cell_area
+            del pr
 
         acc = _accumulate(regional["fd"], valid, weights, FD_OFF_I, FD_OFF_J)
         del weights
@@ -1901,8 +1914,12 @@ def extract_streams_expanded(
         receiving, inverse = np.unique(
             to_rows * shape_[1] + to_cols, return_inverse=True
         )
-        area = np.bincount(inverse, acc[0, rows, cols])
-        precip_area = np.bincount(inverse, acc[1, rows, cols])
+        area = np.bincount(inverse, acc[0, rows, cols], minlength=receiving.size)
+        precip_area = (
+            np.bincount(inverse, acc[1, rows, cols], minlength=receiving.size)
+            if precip is not None
+            else np.zeros_like(area)
+        )
         del acc
 
         x = bounds[0] + (receiving % shape_[1] + 0.5) * cs
@@ -1922,14 +1939,15 @@ def extract_streams_expanded(
 
         extract_streams_with_inflows(
             dem,
-            regional_precip,
             inflows,
             stream_dst,
             direction_dst,
             contributing_area_dst,
-            mean_precip_dst,
+            precip=regional_precip,
+            mean_precip_dst=mean_precip_dst,
             min_area=min_area,
             min_length=min_length,
+            mexp=mexp,
             snap_distance=snap_distance,
             inflow_dst=inflow_dst,
             memory=memory,
