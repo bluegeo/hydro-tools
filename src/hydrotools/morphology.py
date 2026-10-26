@@ -22,7 +22,6 @@ from hydrotools.elevation import slope
 from hydrotools.interpolate import (
     PointInterpolator,
     distance_transform,
-    normalize,
     raster_filter,
 )
 from hydrotools.raster import (
@@ -40,11 +39,7 @@ from hydrotools.utils import (
     compare_projections,
     kernel_from_distance,
 )
-from hydrotools.watershed import (
-    FlowAccumulation,
-    extract_streams,
-    flow_direction_accumulation,
-)
+from hydrotools.watershed import FlowAccumulation, area_to_cells
 
 
 @njit
@@ -1044,42 +1039,36 @@ class RiparianConnectivity:
 
     1. Instantiate using DEM
 
-        `rc = RiparianConnectivity(dem_path)`
+        `rc = RiparianConnectivity(dem_path, precip_path)`
 
     2. Extract streams
 
         `rc.extract_streams()`
 
-    3. Calculate the Topographic Wetness Index
+    3. Create a cost surface from streams
 
-        `rc.calc_twi()`
+        `rc.calc_cost_surface()`
 
-    4. Define a riparian region
+        Here you should visually examine the output extent and verify they align with
+        valley bottoms. If needed, this can be calibrated using max_slope, max_bfw, and
+        max_cost.
 
-        `rc.define_region()`
-
-        Here you should visually examing the output regions and verify they align with
-        valley bottoms. If needed, recalculate using a different twi_cutoff. Ex.
-        `rc.define_region(740)`
-
-    5. You may now calculate attributes that you wish to add. The following
-        includes all of them:
+    4. You may now calculate attributes that you wish to add. Ex:
 
         ```
-        rc.calc_bankfull_width(annual_precip_grid)
         rc.calc_stream_slope()
-        rc.calc_stream_density()
         ```
 
-    6. Calculate Riparian Connectivity regions using the desired attributes:
+    5. Calculate Riparian Connectivity regions using the desired attributes:
 
         `rc.calc_connectivity(output_dataset)`
 
     """
 
-    def __init__(self, dem: str):
+    def __init__(self, dem: str, precip: str):
         """Define a study area and begin a Riparian Connectivity Analysis"""
         self.dem = dem
+        self.precip = precip
 
         # Specifications
         self.__dict__.update(Raster.raster_specs(dem))
@@ -1097,7 +1086,12 @@ class RiparianConnectivity:
             self.bankfull_width,
             self.stream_slope,
             self.stream_density,
-        ) = (None for _ in range(8))
+            self.cost,
+        ) = (None for _ in range(9))
+
+        self.verify_source(self.precip)
+
+        self.dry_run = False
 
     def raster_path(self, name: str) -> str:
         """Generate a raster path using the current temporary directory.
@@ -1129,18 +1123,6 @@ class RiparianConnectivity:
         ]):
             raise ValueError(f"Input raster {src} does not align with the study area.")
 
-    # TODO: copy tmp_dir to a specified dir
-    # def save(self, dst_dir: str):
-    #     """_summary_
-
-    #     Args:
-    #         dst_dir (str): _description_
-    #     """
-
-    # @classmethod
-    # def load_from_data(cls):
-    # TODO: Load from all required parameters
-
     def extract_streams(
         self,
         min_ws_area: float = 1e6,
@@ -1155,77 +1137,156 @@ class RiparianConnectivity:
             min_stream_lenth (float, optional): Minimum length of stream segments.
             Defaults to 0.
             memory (Union[int, None], optional): Memory size to pass to GRASS for memory
-            management of `r.watershed` operations. Defaults to None.
+            management of `r.watershed` operations. Defaults to 4GB.
         """
         streams = self.raster_path("streams")
-        if self.flow_direction is None:
-            fd2 = self.raster_path("flow_direction")
-        else:
-            fd2 = self.flow_direction
+        fd = self.raster_path("flow_direction")
 
-        with TempRasterFiles(2) as (fd, fa):
-            if self.flow_direction is None:
-                flow_direction_accumulation(self.dem, fd, fa, memory=memory)
+        min_area_cells = area_to_cells(self.dem, min_ws_area)
 
-            extract_streams(
-                self.dem,
-                fa,
-                streams,
-                fd2,
-                min_ws_area,
-                min_stream_length,
-                memory=memory,
+        kwargs = {
+            "elevation": "dem",
+            "stream_length": float(min_stream_length),
+            "threshold": min_area_cells,
+            "stream_raster": "streams",
+            "direction": "direction",
+        }
+
+        if memory is not None:
+            kwargs["memory"] = memory
+
+        with GrassRunner(self.dem) as gr:
+            gr.run_command(
+                "r.stream.extract",
+                (self.dem, "dem", "raster"),
+                **kwargs,
             )
+            gr.save_raster("streams", streams)
+            gr.save_raster("direction", fd)
 
         self.streams = streams
-        self.flow_direction = fd2
+        self.flow_direction = fd
 
-    def calc_twi(self, memory: int = 4096):
-        """Calculate a Topographic Wetness Attribute, which is also used to constrain the
+    def calc_cost_surface(
+        self,
+        max_slope: float = 15.0,
+        max_bfw: float = 15.0,
+        max_cost: float = 31.0,
+        max_stream_slope: float = 8.0,
+        knights_move: bool = True,
+        memory: int | None = 4096,
+        dry_run: bool = False,
+    ):
+        """Calculate a cost surface, which is also used to constrain the
         riparian extent.
+
+        Args:
+            max_slope (float, optional): Maximum slope (degrees) used to calculate the cost surface. Defaults to 15.0.
+            max_bfw (float, optional): Maximum bankfull width (m) used to calculate the cost surface. Defaults to 15.0.
+            max_cost (float, optional): Maximum cost value for the least cost analysis. Defaults to 50.0.
+            max_stream_slope (float, optional): Maximum stream slope (degrees) used to calculate the cost surface. Defaults to 8.0.
+            knights_move (bool, optional): Whether to allow diagonal movement in the least cost analysis. Defaults to True.
+            memory (int, optional): Memory size to pass to GRASS for memory management of `r.cost` operations. Defaults to 4096.
         """
-        if self.streams is None:
-            raise AttributeError(
-                "Streams must be delineated first using "
-                "`RiparianConnectivity.extract_streams`."
-            )
+        if max_cost <= 0:
+            raise ValueError("max_cost must be greater than 0")
+
+        if self.bankfull_width is None:
+            print("Calculating bankfull width")
+            self.calc_bankfull_width()
+
         if self.slope is None:
+            print("Calculating slope")
             slope_dst = self.raster_path("slope")
             slope(self.dem, slope_dst)
             self.slope = slope_dst
 
-        twi_dst = self.raster_path("twi")
-        topographic_wetness(self.streams, self.slope, twi_dst, memory=memory)
-        self.twi = twi_dst
+        if self.stream_slope is None:
+            print("Calculating stream slope")
+            self.calc_stream_slope()
 
-    def define_region(self, twi_cutoff: float = 745.0):
-        """Constrain the Topographic Wetness Index (TWI) to a threshold that is used
-        to define the extent of the riparian.
+        cost_dst = self.raster_path("cost")
 
-        This method may be called iteratively after calculating the TWI, defining the
-        region using a threshold, and inspecting the result (the path to which can be
-        accessed using the `region` attribute) to determine whether the extent
-        accurately represents the extent of riparian regions.
+        avg_cs = (
+            (self.csx * 2) + (self.csy * 2) + (np.sqrt(self.csx**2 + self.csy**2) * 4)
+        ) / 8.0
 
-        Args:
-            twi_cutoff (float): Topographic wetness cutoff value. Defaults to 830.
-        """
-        if self.twi is None:
-            raise AttributeError(
-                "The Topographic Wetness Index must be calculated "
-                "first using `RiparianConnectivity.calc_twi`."
+        # Create costs, which are proportional to the inverse of slope, capped at
+        # the provided maximum slope. Costs are converted to metres using the average
+        # cell size.
+        cost = (
+            da.clip(from_raster(self.slope).astype(np.float64), 0.0, max_slope)
+            / max_slope
+        ) * avg_cs
+
+        # Create the start raster, which is the inverted bankfull width, capped at the
+        # provided maximum bankfull width.
+        bfw = da.clip(from_raster(self.bankfull_width).astype(np.float64), 0.0, max_bfw)
+
+        # Scale the bankfull width using stream slope, roughly mirroring the
+        # Montgomery–Buffington response vs. transport ranges. The highest value (2)
+        # will double the starting cost where streams are steep, thus constraining the
+        # connectivity of the region.
+        slope_factor = 1 + (
+            da.clip(
+                from_raster(self.stream_slope).astype(np.float64), 0.0, max_stream_slope
             )
+            / max_stream_slope
+        )
 
-        twi = from_raster(self.twi)
-        twi = da.ma.masked_where(twi < float(twi_cutoff), twi)
+        start_raster = (max_bfw - bfw) * slope_factor
 
-        twi_max = twi.max()
-        twi_norm = (twi - twi_cutoff) / (twi_max - twi_cutoff)
+        # Generate least cost surface
+        with TempRasterFiles(3) as (start_raster_path, cost_path, cost_surface):
+            to_raster(cost, self.slope, cost_path, as_cog=False)
+            to_raster(start_raster, self.slope, start_raster_path, as_cog=False)
 
-        region_dst = self.raster_path("region")
-        to_raster(twi_norm, self.twi, region_dst)
+            kwargs = {
+                "input": "cost",
+                "output": "lcp",
+                "start_raster": "start_raster",
+                "max_cost": max_cost,
+                "flags": "r",
+            }
 
-        self.region = region_dst
+            if knights_move:
+                kwargs["flags"] += "k"
+
+            if memory is not None:
+                kwargs["memory"] = memory
+
+            with GrassRunner(cost_path) as gr:
+                print("Running least cost analysis")
+                gr.run_command(
+                    "r.cost",
+                    (cost_path, "cost", "raster"),
+                    (start_raster_path, "start_raster", "raster"),
+                    **kwargs,
+                )
+
+                if dry_run:
+                    # We want to see the cost surface to constrain parameters
+                    gr.save_raster("lcp", cost_dst)
+                    self.cost = cost_dst
+
+                    self.dry_run = True
+
+                    return
+                else:
+                    self.dry_run = False
+
+                gr.save_raster("lcp", cost_surface)
+
+            cs = from_raster(cost_surface).astype("float32")
+
+            # Normalize and invert
+            cs = da.ma.masked_where(cs > max_cost, cs)
+
+            cs = 1 - (cs / max_cost)
+
+            to_raster(cs, self.slope, cost_dst)
+
+        self.cost = cost_dst
 
     def interpolate_into_region(self, src, dst):
         obs_raster = Raster(src)
@@ -1233,7 +1294,7 @@ class RiparianConnectivity:
 
         obs_points = np.asarray(obs_points, dtype="float32")
 
-        region_values, pred_points = Raster(self.region).data_and_index()
+        region_values, pred_points = Raster(self.cost).data_and_index()
 
         del region_values
 
@@ -1263,196 +1324,70 @@ class RiparianConnectivity:
 
         to_raster(da.ma.masked_where(output_dask == nodata, output_dask), src, dst)
 
-    def calc_bankfull_width(self, annual_precip_src: str, cutoff: float = 10.0):
+    def calc_bankfull_width(self):
         """Calculate a Bankfull Width attribute, which is normalized and  expanded to
         the riparian region.
 
         Args:
-            annual_precip_src (str): Mean annual precipitation grid in mm.
             cutoff (float, optional): A maximum Bankfull Width threshold to use for the
-                normalized value. Defaults to 10.0m.
+                normalized value. Defaults to 70.0m.
         """
         if self.streams is None or self.flow_direction is None:
             raise AttributeError(
                 "Streams must be extracted using `RiparianConnectivity.extract_streams`"
                 " prior to calculating Bankfull Width."
             )
-        if self.region is None:
-            raise AttributeError(
-                "Riparian regions must be delineated using "
-                "`RiparianConnectivity.define_region` prior to calculating Bankfull "
-                "Width."
-            )
-
-        self.verify_source(annual_precip_src)
 
         bankfull_width_dst = self.raster_path("bankfull_width")
-        with TempRasterFiles(2) as (bankfull_dst, bankfull_norm_dst):
-            bankfull_width(
-                self.streams, self.flow_direction, annual_precip_src, bankfull_dst
-            )
-            normalize(bankfull_dst, bankfull_norm_dst, (0, cutoff))
-            self.interpolate_into_region(bankfull_norm_dst, bankfull_width_dst)
+
+        bankfull_width(
+            self.streams, self.flow_direction, self.precip, bankfull_width_dst
+        )
 
         self.bankfull_width = bankfull_width_dst
 
-    def calc_stream_slope(self, cutoff: float = 15.0):
+    def calc_stream_slope(self):
         """Calculate and add a Stream Slope attribute.
 
         Args:
             cutoff (float, optional): A maximum Stream Slope threshold to use for the
-                normalized value. Defaults to 15.0 degrees.
+                normalized value. Defaults to 8.0 degrees.
         """
         if self.streams is None:
             raise AttributeError(
                 "Streams must be extracted using `RiparianConnectivity.extract_streams`"
                 " prior to calculating Stream Slope."
             )
-        if self.region is None:
-            raise AttributeError(
-                "Riparian regions must be delineated using "
-                "`RiparianConnectivity.define_region` prior to calculating Stream "
-                "Slope."
-            )
 
         stream_slope_dst = self.raster_path("stream_slope")
 
-        with TempRasterFiles(2) as (strslo_dst, strslo_norm_dst):
-            stream_slope(self.dem, self.streams, strslo_dst)
-            normalize(
-                strslo_dst,
-                strslo_norm_dst,
-                (0, cutoff),
-                invert=True,
-            )
-            self.interpolate_into_region(strslo_norm_dst, stream_slope_dst)
+        stream_slope(self.dem, self.streams, stream_slope_dst, 100, scale=2)
 
         self.stream_slope = stream_slope_dst
-
-    def calc_stream_density(self, sample_distance: float = 500, cutoff: float = 2e5):
-        """Calculate and add a Stream Density attribute.
-
-        Args:
-            sample_distance (float, optional): Distance to sample stream cells for the
-                stream density transform. Defaults to 500m.
-            cutoff (float, optional): A maximum Stream Slope threshold to use for the
-                normalized value. This value should assume a cell size of 1m, be
-                adjusted with the `sample_distance` argument, and be adjusted for
-                the actual input raster cell size. Defaults to 2e5 cells per the
-                `radius` parameter.
-        """
-        if self.streams is None:
-            raise AttributeError(
-                "Streams must be extracted using `RiparianConnectivity.extract_streams`"
-                " prior to calculating Stream Density."
-            )
-        if self.region is None:
-            raise AttributeError(
-                "Riparian regions must be delineated using "
-                "`RiparianConnectivity.define_region` prior to calculating Stream "
-                "Density."
-            )
-        # Would check for slope, but it will be implicitly included if
-        # RiparianConnectivity.define_region has been called.
-
-        stream_density_dst = self.raster_path("stream_density")
-        with TempRasterFiles(4) as (
-            stream_mask_dst,
-            stream_filter_dst,
-            strdens_dst,
-            strdens_norm_dst,
-        ):
-            to_raster(
-                ~da.ma.getmaskarray(from_raster(self.streams)),
-                self.streams,
-                stream_mask_dst,
-                as_cog=False,
-            )
-            kernel = kernel_from_distance(sample_distance, self.csx, self.csy)
-            raster_filter(stream_mask_dst, kernel, "sum", stream_filter_dst)
-
-            stream_density = from_raster(stream_filter_dst) / kernel.sum()
-
-            to_raster(
-                stream_density.astype(np.float32),
-                stream_filter_dst,
-                strdens_dst,
-                as_cog=False,
-            )
-
-            # Adjust stream_density_cutoff for cell size
-            avg_cs = (self.csx + self.csy) / 2.0
-            cutoff /= avg_cs**2
-            normalize(strdens_dst, strdens_norm_dst, (0, cutoff))
-
-            self.interpolate_into_region(strdens_norm_dst, stream_density_dst)
-
-        self.stream_density = stream_density_dst
 
     def calc_connectivity(
         self,
         connectivity_dst: str,
-        attributes: list = ["twi", "bankfull_width", "stream_slope", "stream_density"],
-        quantize: bool = True,
-        percentiles: list = [(1.0 / 3.0) * 100.0, (2.0 / 3.0) * 100.0],
-        vector: bool = True,
+        breakpoints=(1.0 / 3.0, 2.0 / 3.0),
     ):
         """Calculate a riparian connectivity dataset.
 
         Args:
             connectivity_dst (str): Output path for Riparian Connectivity. This will be
                 a raster if `vector` is `False`.
-            attributes (list, optional): Attributes to include in the riparian
-                connectivity calculation. Defaults to
-                ["bankfull_width", "stream_slope", "stream_density"].
-            quantize (bool, optional): Split the result into zones of sensitivity using.
-                percentiles. Defaults to True.
-            percentiles (list, optional): Percentiles to use to define zones of
-                connectivity. Defaults to [(1.0 / 3.0) * 100.0, (2.0 / 3.0) * 100.0].
-            vector (bool, optional): Save the output as a vector file.
+            breakpoints (tuple, optional): Breakpoints to use to define zones of
+                connectivity. Defaults to (1./3., 2./3.).
         """
-        if len(attributes) == 0:
-            raise ValueError("At least one attribute must be included")
+        if self.dry_run:
+            raise RuntimeError("Dry run mode enabled, cannot calculate connectivity.")
 
-        if quantize and (
-            len(percentiles) == 0
-            or any([q2 < q1 for q1, q2 in zip(percentiles[0:-1], percentiles[1:])])
-            or any([q > 100 for q in percentiles])
-        ):
-            raise ValueError(
-                "Percentiles must have at least one value, be monotonically increasing, "
-                "and not exceed 100."
+        sensitivity = from_raster(self.cost)
+
+        with TempRasterFile() as vector_src_path:
+            zones = da.ma.masked_where(
+                da.ma.getmaskarray(sensitivity),
+                da.digitize(sensitivity, breakpoints).astype(np.uint8) + 1,
             )
 
-        if vector and not quantize:
-            raise ValueError("A vector should only be specified if `quantize` is used.")
-
-        prepared_attrs = []
-        for attr in attributes:
-            if attr == "twi":
-                attr = "region"
-
-            attr_value = getattr(self, attr)
-            if attr_value is None:
-                raise AttributeError(f"The attribute '{attr}' has not been calculated.")
-            prepared_attrs.append(attr_value)
-
-        sensitivity = from_raster(prepared_attrs[0])
-        for attr in prepared_attrs[1:]:
-            sensitivity += from_raster(attr)
-
-        if quantize:
-            percentile_sample = sensitivity[~da.ma.getmaskarray(sensitivity)]
-            qs = [da.percentile(percentile_sample, [q])[0] for q in percentiles]
-
-            sensitivity = da.ma.masked_where(
-                da.ma.getmaskarray(from_raster(self.region)),
-                da.digitize(sensitivity, qs).astype(np.uint8),
-            )
-
-        if vector:
-            with TempRasterFile() as tmp_rast:
-                to_raster(sensitivity, self.dem, tmp_rast, as_cog=False)
-                vectorize(tmp_rast, connectivity_dst, smooth_corners=True)
-        else:
-            to_raster(sensitivity, self.dem, connectivity_dst)
+            to_raster(zones, self.dem, vector_src_path, as_cog=False)
+            vectorize(vector_src_path, connectivity_dst, smooth_corners=True)

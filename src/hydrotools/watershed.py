@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from copy import deepcopy
+import math
 import os
 import pickle
 import gzip
@@ -8,12 +9,17 @@ from typing import Union
 
 import dask.array as da
 import numpy as np
+import rasterio
+from rasterio.windows import Window
 from numba import njit
 import fiona
 from fiona.crs import from_string
 
+from hydrotools.config import TMP_DIR
 from hydrotools.utils import (
     GrassRunner,
+    infer_nodata,
+    translate_to_cog,
     indices_to_coords,
     transform_points,
     proj4_string,
@@ -84,6 +90,161 @@ def area_to_cells(src: str, area: float):
     """
     r = Raster(src)
     return int(np.ceil(area / (r.csx * r.csy)))
+
+
+# Conservative estimate of WhiteboxTools memory use per DEM cell during
+# BreachDepressionsLeastCost (input, output, and working grids)
+BREACH_BYTES_PER_CELL = 40
+
+# Attempts allowed per chunk before failing
+BREACH_ATTEMPTS = 5
+
+
+def breach_depressions(
+    dem: str,
+    dst: str,
+    distance: float,
+    max_memory: int = 4096,
+    fill: bool = True,
+):
+    """Breach depressions in a DEM using the WhiteboxTools BreachDepressionsLeastCost tool
+
+    The DEM is processed in chunks when it is estimated to exceed the maximum memory.
+    Chunks are written to compressed temporary files with an overlap equal to the
+    breach distance, processed sequentially, and the chunk interiors are
+    reassembled into the output.
+
+    Note, breaching is local to the breach distance, so chunked results are nearly
+    identical to a single pass. Filling remaining depressions (`fill=True`) is not
+    local, however, so filled areas may differ from a single pass where chunking
+    applies (WhiteboxTools treats chunk edges as outlets). Use `fill=False` to
+    produce results that are independent of chunking.
+
+    This requires the optional `whitebox` package (`pip install whitebox`).
+
+    Args:
+        dem (str): Single-band Digital Elevation Model raster.
+        dst (str): Output breached DEM path (a COG).
+        distance (float): Maximum breach channel length in the DEM's spatial units.
+        Converted to cells using the smaller cell dimension, rounding up.
+        max_memory (int, optional): Maximum memory (MB) to use for processing a single
+        chunk. Defaults to 4096 MB.
+        fill (bool, optional): Fill depressions that remain after breaching.
+        Defaults to True.
+    """
+    try:
+        from whitebox import WhiteboxTools
+    except ImportError as e:
+        raise ImportError(
+            "breach_depressions requires the optional dependency whitebox: "
+            "pip install whitebox"
+        ) from e
+
+    if distance <= 0:
+        raise ValueError("The breach distance must be greater than zero")
+
+    r = Raster(dem)
+
+    if r.band_count != 1:
+        raise ValueError("The DEM must have a single band")
+
+    nodata = r.nodata if r.nodata is not None else infer_nodata(r.dtype)
+    _, height, width = r.shape
+
+    dist_cells = int(math.ceil(distance / min(abs(r.csx), abs(r.csy))))
+
+    # Determine the size of a chunk (including overlap) that fits in memory
+    max_cells = int(max_memory * 1024**2 // BREACH_BYTES_PER_CELL)
+    side = int(math.sqrt(max_cells))
+    core_side = side - 2 * dist_cells
+    if core_side < 1:
+        raise ValueError(
+            f"{max_memory} MB is too little memory to process a breach distance "
+            f"of {dist_cells} cells. Increase max_memory or reduce distance."
+        )
+    core_rows = min(core_side, height)
+    core_cols = min(core_side, width)
+
+    wbt = WhiteboxTools()
+    wbt.set_verbose_mode(False)
+    wbt.set_compress_rasters(True)
+
+    with TemporaryDirectory(dir=TMP_DIR) as tmp_dir:
+        assembled = os.path.join(tmp_dir, "assembled.tif")
+        Raster.empty_like(assembled, dem, nodata=nodata)
+
+        with rasterio.open(dem) as src, rasterio.open(assembled, "r+") as out:
+            for i, row in enumerate(range(0, height, core_rows)):
+                for j, col in enumerate(range(0, width, core_cols)):
+                    core = Window(
+                        col,
+                        row,
+                        min(core_cols, width - col),
+                        min(core_rows, height - row),
+                    )
+
+                    # Expand the core by the breach distance, clipped to the DEM
+                    r0 = max(row - dist_cells, 0)
+                    c0 = max(col - dist_cells, 0)
+                    r1 = min(row + core.height + dist_cells, height)
+                    c1 = min(col + core.width + dist_cells, width)
+                    window = Window(c0, r0, c1 - c0, r1 - r0)
+
+                    chunk_src = os.path.join(tmp_dir, f"chunk_{i}_{j}.tif")
+                    chunk_dst = os.path.join(tmp_dir, f"chunk_{i}_{j}_breached.tif")
+
+                    profile = src.profile.copy()
+                    profile.update(
+                        driver="GTiff",
+                        height=window.height,
+                        width=window.width,
+                        transform=src.window_transform(window),
+                        nodata=nodata,
+                        tiled=True,
+                        blockxsize=512,
+                        blockysize=512,
+                        compress="LZW",
+                        bigtiff="YES",
+                    )
+                    with rasterio.open(chunk_src, "w", **profile) as chunk:
+                        chunk.write(src.read(1, window=window), 1)
+
+                    # WhiteboxTools intermittently panics when finalizing its
+                    # output (a thread race), so retry before failing
+                    for _ in range(BREACH_ATTEMPTS):
+                        wbt.breach_depressions_least_cost(
+                            chunk_src, chunk_dst, dist_cells, fill=fill
+                        )
+                        if os.path.isfile(chunk_dst):
+                            break
+                    else:
+                        raise RuntimeError(
+                            f"BreachDepressionsLeastCost failed for chunk ({i}, {j})"
+                        )
+
+                    with rasterio.open(chunk_dst) as breached:
+                        data = breached.read(1)
+                        chunk_nodata = breached.nodata
+
+                    if chunk_nodata is not None and chunk_nodata != nodata:
+                        data = np.where(
+                            np.isclose(data, chunk_nodata), nodata, data
+                        )
+
+                    # Write only the core of the chunk
+                    r_off, c_off = row - r0, col - c0
+                    out.write(
+                        data[
+                            r_off : r_off + core.height, c_off : c_off + core.width
+                        ].astype(r.dtype),
+                        1,
+                        window=core,
+                    )
+
+                    os.remove(chunk_src)
+                    os.remove(chunk_dst)
+
+        translate_to_cog(assembled, dst)
 
 
 def auto_basin(
