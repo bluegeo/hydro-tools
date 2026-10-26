@@ -1039,7 +1039,7 @@ class RiparianConnectivity:
 
     1. Instantiate using DEM
 
-        `rc = RiparianConnectivity(dem_path)`
+        `rc = RiparianConnectivity(dem_path, precip_path)`
 
     2. Extract streams
 
@@ -1171,7 +1171,7 @@ class RiparianConnectivity:
         self,
         max_slope: float = 15.0,
         max_bfw: float = 15.0,
-        max_cost: float = 50.0,
+        max_cost: float = 31.0,
         max_stream_slope: float = 8.0,
         knights_move: bool = True,
         memory: int | None = 4096,

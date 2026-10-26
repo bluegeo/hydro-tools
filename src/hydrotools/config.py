@@ -18,6 +18,12 @@ GRASS_TMP: str = (
     else gettempdir()
 )
 
+CACHE_DIR: str = (
+    os.environ["HYDROTOOLS_CACHE_DIR"]
+    if os.environ.get("HYDROTOOLS_CACHE_DIR", None) is not None
+    else os.path.join(os.path.expanduser("~"), ".cache", "hydrotools")
+)
+
 GRASS_FLAGS: dict = {"quiet": True}
 
 GDALWARP_ARGS = [
