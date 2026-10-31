@@ -39,7 +39,11 @@ from hydrotools.utils import (
     compare_projections,
     kernel_from_distance,
 )
-from hydrotools.watershed import FlowAccumulation, area_to_cells
+from hydrotools.watershed import (
+    ExpandedFlowAccumulation,
+    FlowAccumulation,
+    area_to_cells,
+)
 
 
 @njit
@@ -693,6 +697,7 @@ def bankfull_width(
     bw_coeff: float = 0.042,
     a_exp: float = 0.48,
     p_exp: float = 0.74,
+    flow_accumulation: FlowAccumulation | None = None,
 ):
     """Estimate bankfull width with empirically-derived constants using:
 
@@ -743,20 +748,27 @@ def bankfull_width(
         bw_coeff (float): Bankfull width coefficient. Defaults to 0.196.
         a_exp (float): Area expenential scale. Defaults to 0.280.
         p_exp (float): Precip expenential scale. Defaults to 0.355.
+        flow_accumulation (FlowAccumulation | None): Flow accumulation used to
+        calculate contributing area and mean precip, ex. an
+        `ExpandedFlowAccumulation` for streams that extend beyond the DEM. Defaults to
+        a `FlowAccumulation` using `flow_direction`.
     """
     # Calculate contributing area and mean annual precip
     with TempRasterFiles(3) as (ca, mean_precip, precip_aligned):
-        if not Raster(precip).matches(flow_direction):
-            warp_like(
-                precip,
-                precip_aligned,
-                flow_direction,
-                resample_method="bilinear",
-                as_cog=False,
-            )
-            precip = precip_aligned
+        fd = flow_accumulation
+        if fd is None:
+            if not Raster(precip).matches(flow_direction):
+                warp_like(
+                    precip,
+                    precip_aligned,
+                    flow_direction,
+                    resample_method="bilinear",
+                    as_cog=False,
+                )
+                precip = precip_aligned
 
-        fd = FlowAccumulation(flow_direction)
+            fd = FlowAccumulation(flow_direction)
+
         fd.contributing_area(ca)
         fd.calculate(precip, mean_precip, "mean")
 
@@ -1045,6 +1057,11 @@ class RiparianConnectivity:
 
         `rc.extract_streams()`
 
+        Use `rc.extract_streams(expanded=True)` when the DEM does not extend to the
+        edges of its watersheds, to include the area flowing into the DEM (see
+        `watershed.ExpandedFlowAccumulation`). In this case, the precip raster should
+        cover the area draining into the DEM.
+
     3. Create a cost surface from streams
 
         `rc.calc_cost_surface()`
@@ -1053,13 +1070,7 @@ class RiparianConnectivity:
         valley bottoms. If needed, this can be calibrated using max_slope, max_bfw, and
         max_cost.
 
-    4. You may now calculate attributes that you wish to add. Ex:
-
-        ```
-        rc.calc_stream_slope()
-        ```
-
-    5. Calculate Riparian Connectivity regions using the desired attributes:
+    4. Calculate Riparian Connectivity regions using the desired attributes:
 
         `rc.calc_connectivity(output_dataset)`
 
@@ -1087,9 +1098,8 @@ class RiparianConnectivity:
             self.stream_slope,
             self.stream_density,
             self.cost,
-        ) = (None for _ in range(9))
-
-        self.verify_source(self.precip)
+            self.flow_accumulation,
+        ) = (None for _ in range(10))
 
         self.dry_run = False
 
@@ -1128,6 +1138,8 @@ class RiparianConnectivity:
         min_ws_area: float = 1e6,
         min_stream_length: float = 0,
         memory: int | None = 4096,
+        expanded: bool = False,
+        **kwargs,
     ):
         """Create a streams attribute.
 
@@ -1138,10 +1150,29 @@ class RiparianConnectivity:
             Defaults to 0.
             memory (Union[int, None], optional): Memory size to pass to GRASS for memory
             management of `r.watershed` operations. Defaults to 4GB.
+            expanded (bool, optional): Include the area flowing into the DEM from
+            outside of it (see `watershed.ExpandedFlowAccumulation`). Defaults to
+            False.
+
+        kwargs:
+            Arguments for `watershed.ExpandedFlowAccumulation` when `expanded` is True,
+            ex. `direction`, `snap_distance`, or `max_memory`.
         """
         streams = self.raster_path("streams")
         fd = self.raster_path("flow_direction")
 
+        if expanded:
+            self.flow_accumulation = ExpandedFlowAccumulation(
+                self.dem, memory=memory, **kwargs
+            )
+            self.flow_accumulation.extract_streams(
+                streams, fd, min_ws_area, min_stream_length
+            )
+            self.streams = streams
+            self.flow_direction = fd
+            return
+
+        self.flow_accumulation = None
         min_area_cells = area_to_cells(self.dem, min_ws_area)
 
         kwargs = {
@@ -1340,8 +1371,16 @@ class RiparianConnectivity:
 
         bankfull_width_dst = self.raster_path("bankfull_width")
 
+        # Expanded flow accumulation warps precip from beyond the DEM as needed
+        if self.flow_accumulation is None:
+            self.verify_source(self.precip)
+
         bankfull_width(
-            self.streams, self.flow_direction, self.precip, bankfull_width_dst
+            self.streams,
+            self.flow_direction,
+            self.precip,
+            bankfull_width_dst,
+            flow_accumulation=self.flow_accumulation,
         )
 
         self.bankfull_width = bankfull_width_dst
@@ -1361,7 +1400,9 @@ class RiparianConnectivity:
 
         stream_slope_dst = self.raster_path("stream_slope")
 
-        stream_slope(self.dem, self.streams, stream_slope_dst, 100, scale=2)
+        stream_slope(
+            self.dem, self.streams, stream_slope_dst, scale=2, focal_mean_dist=100
+        )
 
         self.stream_slope = stream_slope_dst
 

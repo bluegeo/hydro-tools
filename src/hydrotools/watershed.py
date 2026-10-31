@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from copy import deepcopy
+from logging import warning
 import math
 import os
 import pickle
@@ -10,12 +11,15 @@ from typing import Union
 import dask.array as da
 import numpy as np
 import rasterio
+from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
 from numba import njit
 import fiona
 from fiona.crs import from_string
 
 from hydrotools.config import TMP_DIR
+from hydrotools.data import HYDROBASINS_REGIONS, Inflows, valid_footprint
+from hydrotools.flow import TiledAccumulation, extract_streams as extract_stream_cells
 from hydrotools.utils import (
     GrassRunner,
     infer_nodata,
@@ -41,6 +45,7 @@ def flow_direction_accumulation(
     positive_only: bool = True,
     memory: Union[int, None] = None,
     beautify: Union[bool, None] = None,
+    as_cog: bool = True,
 ):
     """Generate Flow Direction and Flow Accumulation grids using GRASS r.watershed
 
@@ -54,6 +59,7 @@ def flow_direction_accumulation(
         memory (Union[int, None], optional): Manage memory during execution by assigning
         a maximum block size. Defaults to 4096 MB.
         beautify (Union[bool, None]): make streams follow nicer paths over flat regions.
+        as_cog (bool, optional): Save outputs as COGs. Defaults to True.
     """
     flags = ""
     if positive_only:
@@ -77,8 +83,8 @@ def flow_direction_accumulation(
             flags=flags,
             **kwargs,
         )
-        gr.save_raster("fd", direction_grid)
-        gr.save_raster("fa", accumulation_grid)
+        gr.save_raster("fd", direction_grid, as_cog=as_cog)
+        gr.save_raster("fa", accumulation_grid, as_cog=as_cog)
 
 
 def area_to_cells(src: str, area: float):
@@ -479,39 +485,112 @@ def basin(flow_direction: str, x: float, y: float, dst: str):
             vectorize(tmp_rast, dst, smooth_corners=True)
 
 
+def flow_direction(dem: str, dst: str, memory: Union[int, None] = 4096):
+    """Generate a single flow direction grid using GRASS r.watershed
+
+    Args:
+        dem (str): Digital Elevation Model raster
+        dst (str): Output flow direction raster
+        memory (Union[int, None], optional): Manage memory during execution by assigning
+        a maximum block size. Defaults to 4096 MB.
+    """
+    flags = "s" + ("m" if memory is not None else "")
+    kwargs = {"memory": memory} if memory is not None else {}
+
+    with GrassRunner(dem) as gr:
+        gr.run_command(
+            "r.watershed",
+            (dem, "dem", "raster"),
+            elevation="dem",
+            drainage="fd",
+            flags=flags,
+            **kwargs,
+        )
+        gr.save_raster("fd", dst, as_cog=False)
+
+
 class FlowAccumulation:
     """
-    Use the GRASS method r.flowaccumulation to summarize sums
-    and means of raster parameters.
+    Summarize sums and means of raster parameters over the area upstream of every
+    cell, using the tiled accumulation in `hydrotools.flow` (memory is bounded by
+    `tile_size`, `workers`, and `max_memory`).
 
-    NOTE: This requires the r.flowaccumulation GRASS addon
+    Rasters used in `calculate` are warped to the direction grid as needed.
     """
 
-    def __init__(self, direction: str):
+    def __init__(
+        self,
+        direction: Union[str, None],
+        tile_size: int = 2048,
+        workers: Union[int, None] = None,
+        max_memory: int = 4096,
+    ):
         """Initialize a FlowAccumulation analysis
 
         Args:
-            direction (str): Path to a flow direction raster generated using r.stream.extract
+            direction (str): Path to a flow direction raster generated using
+            r.watershed or r.stream.extract (1-8 counterclockwise from north-east).
+            tile_size (int, optional): Accumulation tile size in cells. Defaults to
+            2048.
+            workers (Union[int, None], optional): Tiles accumulated concurrently.
+            Defaults to the number of CPUs, limited by `max_memory`.
+            max_memory (int, optional): Approximate limit (MB) on the memory used by
+            accumulation tiles. Defaults to 4096.
         """
+        self.wkdir = TemporaryDirectory(dir=TMP_DIR)
+        self.engine_kwargs = {
+            "tile_size": tile_size,
+            "workers": workers,
+            "max_memory": max_memory,
+        }
+        self._modals = None
+        self._engine = None
+        self._tmp_count = 0
         self.direction = direction
 
-        self.wkdir = TemporaryDirectory()
+    @property
+    def direction(self):
+        return self._direction
 
+    @direction.setter
+    def direction(self, direction: Union[str, None]):
+        self._direction = direction
+        self._engine = None
         self._modals = None
 
     @property
-    def modals(self):
+    def engine(self) -> TiledAccumulation:
+        if self.direction is None:
+            raise ValueError("A flow direction grid is required")
+        if self._engine is None:
+            self._engine = TiledAccumulation(self.direction, **self.engine_kwargs)
+        return self._engine
+
+    def _tmp(self, name: str) -> str:
+        """A unique path in the working directory"""
+        self._tmp_count += 1
+
+        return os.path.join(self.wkdir.name, f"{name}_{self._tmp_count}.tif")
+
+    def _seeds(self, raster_source: Union[str, None] = None) -> Union[list, None]:
+        """Flow added at cells, in cell units, as (row, col, [value]). The value is a
+        number of cells when `raster_source` is None, otherwise the sum of the raster
+        over those cells. Overridden to add flow from outside of the grid."""
+        return None
+
+    @property
+    def cell_area(self) -> float:
+        r = Raster(self.direction)
+        return float(r.csx * r.csy)
+
+    @property
+    def modals(self) -> str:
+        """Raster with the number of cells upstream of (and including) each cell"""
         if self._modals is None:
-            self._modals = os.path.join(self.wkdir.name, "modals.tif")
-            with GrassRunner(self.direction) as gr:
-                gr.run_command(
-                    "r.flowaccumulation",
-                    (self.direction, "direction", "raster"),
-                    direction="direction",
-                    output="modals",
-                    type="FCELL",
-                )
-                gr.save_raster("modals", self._modals, as_cog=False)
+            self._modals = self._tmp("modals")
+            self.engine.accumulate(
+                [1.0], [self._modals], seeds=self._seeds(), dtype="float64"
+            )
 
         return self._modals
 
@@ -519,28 +598,21 @@ class FlowAccumulation:
         """Calculate flow accumulation statistics
 
         Args:
-            raster_source (str): Path to a raster dataset to calculate stats on
-            dst (str): Path to save the output geopackage
+            raster_source (str): Path to a raster dataset to calculate stats on. It is
+            warped to the direction grid as needed.
+            dst (str): Path to save the output raster
+            method (str, optional): "sum" or "mean". Defaults to "sum".
         """
-        # Ensure the raster_source aligns with the input grids
-        if not Raster(raster_source).matches(self.direction):
-            raise ValueError("Input raster does not align with direction grid")
+        if method not in ("sum", "mean"):
+            raise ValueError("method must be one of 'sum' or 'mean'")
 
-        # Accumulate
-        sum_result = (
-            dst if method == "sum" else os.path.join(self.wkdir.name, "sum_result.tif")
+        sum_result = dst if method == "sum" else self._tmp("sum_result")
+        self.engine.accumulate(
+            [raster_source],
+            [sum_result],
+            seeds=self._seeds(raster_source),
+            dtype="float64",
         )
-        with GrassRunner(self.direction) as gr:
-            gr.run_command(
-                "r.flowaccumulation",
-                (self.direction, "direction", "raster"),
-                (raster_source, "source", "raster"),
-                direction="direction",
-                weight="source",
-                output="sum_result",
-                type="DCELL",
-            )
-            gr.save_raster("sum_result", sum_result, as_cog=True)
 
         if method == "mean":
             modals = from_raster(self.modals)
@@ -556,18 +628,292 @@ class FlowAccumulation:
         Args:
             dst (str): Path to the contributing area raster
         """
-        r = Raster(self.modals)
-        ca = (from_raster(self.modals) * r.csx * r.csy) / 1e6
+        ca = (from_raster(self.modals) * self.cell_area) / 1e6
 
-        to_raster(
-            da.ma.masked_where(ca == 0, ca),
-            self.direction,
-            dst,
-        )
+        to_raster(da.ma.masked_where(ca == 0, ca), self.direction, dst)
 
     def __del__(self):
         """Clean up temporary working directory"""
         self.wkdir.cleanup()
+
+
+# Row/col offsets indexed by r.watershed flow direction (1-8 counterclockwise from NE)
+FD_OFF_I = np.array([0, -1, -1, -1, 0, 1, 1, 1, 0])
+FD_OFF_J = np.array([0, 1, 0, -1, -1, -1, 0, 1, 1])
+
+
+def _snap(accumulation: str, points: list, snap_distance: float) -> list:
+    """Snap points to the cell with the largest accumulation within a distance
+
+    Returns:
+        list: (row, col) for each point, or None where there are no valid cells
+    """
+    cells = []
+    with rasterio.open(accumulation) as ds:
+        rad_i = int(math.ceil(snap_distance / abs(ds.res[1])))
+        rad_j = int(math.ceil(snap_distance / abs(ds.res[0])))
+        ii, jj = np.mgrid[-rad_i : rad_i + 1, -rad_j : rad_j + 1]
+        outside = np.hypot(ii * ds.res[1], jj * ds.res[0]) > snap_distance
+
+        for x, y in points:
+            row, col = ds.index(x, y)
+            window = Window(col - rad_j, row - rad_i, 2 * rad_j + 1, 2 * rad_i + 1)
+            a = np.ma.masked_where(
+                outside, ds.read(1, window=window, masked=True, boundless=True)
+            )
+            if np.ma.getmaskarray(a).all():
+                cells.append(None)
+                continue
+
+            i, j = np.unravel_index(np.ma.argmax(a), a.shape)
+            cells.append((row - rad_i + int(i), col - rad_j + int(j)))
+
+    return cells
+
+
+class ExpandedFlowAccumulation(FlowAccumulation):
+    """
+    Flow accumulation (see `FlowAccumulation`) on a DEM that does not extend to the
+    edges of its watershed(s). Flow from outside of the DEM is found using HydroRIVERS
+    and HydroBASINS (see `hydrotools.data.Inflows`), snapped to the DEM, and included
+    in all results.
+
+    1. Initialize using a DEM
+
+        `efa = ExpandedFlowAccumulation(dem_path)`
+
+    2. Extract streams
+
+        `efa.extract_streams(stream_dst, direction_dst)`
+
+    3. Calculate contributing area and other statistics
+
+        `efa.contributing_area(contributing_area_dst)`
+
+        `efa.calculate(precip_path, mean_precip_dst, method="mean")`
+
+    Rasters used in `calculate` should cover the area draining into the DEM. Where
+    they do not, the value at the inflow location is used.
+    """
+
+    def __init__(
+        self,
+        dem: str,
+        direction: Union[str, None] = None,
+        snap_distance: float = 250.0,
+        regions: tuple = HYDROBASINS_REGIONS,
+        memory: Union[int, None] = 4096,
+        **kwargs,
+    ):
+        """Calculate the flow into a DEM
+
+        Args:
+            dem (str): Digital Elevation Model raster in a projected spatial reference
+            with units of metres.
+            direction (Union[str, None], optional): Flow direction raster for the DEM
+            (see `flow_direction`). Defaults to None, where it is generated using
+            r.watershed.
+            snap_distance (float, optional): Distance (m) to search for a receiving
+            cell on the DEM for each inflow. Defaults to 250.
+            regions (tuple, optional): HydroSHEDS regions to search for inflows.
+            Defaults to `hydrotools.data.HYDROBASINS_REGIONS`.
+            memory (Union[int, None], optional): Manage memory during r.watershed by
+            assigning a maximum block size. Defaults to 4096 MB.
+
+        kwargs:
+            Arguments for `FlowAccumulation` (`tile_size`, `workers`, `max_memory`).
+        """
+        super().__init__(None, **kwargs)
+
+        self.dem = dem
+        self.snap_distance = snap_distance
+        self._cells = None
+
+        if direction is None:
+            print("Calculating flow direction")
+            direction = os.path.join(self.wkdir.name, "direction.tif")
+            flow_direction(dem, direction, memory=memory)
+        self.direction = direction
+
+        print("Finding inflows using HydroRIVERS")
+        self.inflows = Inflows(valid_footprint(dem), regions)
+        print(
+            f"Found {len(self.inflows)} inflows with a total area of "
+            f"{self.inflows.area.sum() / 1e6:.1f} km2"
+        )
+
+    @property
+    def cells(self) -> list:
+        """The (row, col) receiving each inflow, or None where an inflow could not be
+        snapped to the DEM"""
+        if self._cells is None:
+            points = transform_points(
+                self.inflows.points, "EPSG:4326", Raster(self.direction).wkt
+            )
+            # Snap to the largest accumulation (without inflows) near each inflow
+            unseeded = self._tmp("unseeded")
+            self.engine.accumulate([1.0], [unseeded], dtype="float64")
+            self._cells = _snap(unseeded, points, self.snap_distance)
+
+            lost = self.inflows.area[[c is None for c in self._cells]].sum()
+            if lost > 0:
+                warning(
+                    f"{lost / 1e6:.3f} km2 of inflow could not be snapped to the DEM "
+                    "and was not included"
+                )
+
+        return self._cells
+
+    def _seeds(self, raster_source: Union[str, None] = None) -> list:
+        cells = self.cells
+        values = self.inflows.area / self.cell_area
+
+        if raster_source is not None:
+            means = self.inflows.mean(raster_source)
+            if np.isnan(means).any():
+                # Use the value on the DEM where the raster does not cover the inflow
+                with rasterio.open(self.direction) as ds:
+                    transform, crs, shape = ds.transform, ds.crs, ds.shape
+                with rasterio.open(raster_source) as src, WarpedVRT(
+                    src, crs=crs, transform=transform, width=shape[1], height=shape[0]
+                ) as vrt:
+                    for n, cell in enumerate(cells):
+                        if np.isnan(means[n]) and cell is not None:
+                            row, col = cell
+                            means[n] = vrt.read(
+                                1, window=Window(col, row, 1, 1), masked=True
+                            ).filled(np.nan)[0, 0]
+            means = np.nan_to_num(means)
+            values = values * means
+
+        return [
+            (cell[0], cell[1], [value])
+            for cell, value in zip(cells, values)
+            if cell is not None
+        ]
+
+    def extract_streams(
+        self,
+        stream_dst: str,
+        direction_dst: str,
+        min_area: float = 1e6,
+        min_length: float = 0,
+        mexp: float = None,
+    ):
+        """Extract streams where the contributing area, including inflows, reaches a
+        minimum area. Streams are labelled with unique segment ids.
+
+        Args:
+            stream_dst (str): Output streams raster path
+            direction_dst (str): Output flow direction raster path
+            min_area (float, optional): Minimum contributing area (m2) for streams.
+            Defaults to 1e6.
+            min_length (float, optional): First-order streams shorter than this
+            length (m) are removed. Defaults to 0.
+            mexp (float, optional): Not supported. Defaults to None.
+        """
+        if mexp is not None:
+            warning("mexp is not supported by ExpandedFlowAccumulation and is ignored")
+
+        print("Extracting streams")
+        extract_stream_cells(
+            self.modals,
+            self.direction,
+            stream_dst,
+            min_area / self.cell_area,
+            min_length,
+            tile_size=self.engine.tile_size,
+        )
+        translate_to_cog(self.direction, direction_dst)
+
+    def save_inflows(self, dst: str):
+        """Save snapped inflows to a GeoPackage for review
+
+        Args:
+            dst (str): Output GeoPackage path
+        """
+        r = Raster(self.direction)
+        records = self.inflows.records()
+
+        with fiona.open(
+            dst,
+            "w",
+            driver="GPKG",
+            crs=r.wkt,
+            schema={
+                "geometry": "Point",
+                "properties": {
+                    "hyriv_id": "int",
+                    "area_km2": "float",
+                    "subtracted_km2": "float",
+                    "upstream_reaches": "int",
+                    "upstream_polygons": "int",
+                    "snapped": "bool",
+                },
+            },
+        ) as out:
+            for cell, rec, (x, y) in zip(
+                self.cells,
+                records,
+                transform_points(self.inflows.points, "EPSG:4326", r.wkt),
+            ):
+                if cell is not None:
+                    x, y = r.left + (cell[1] + 0.5) * r.csx, r.top - (cell[0] + 0.5) * r.csy
+                out.write(
+                    {
+                        "geometry": {"type": "Point", "coordinates": (x, y)},
+                        "properties": {
+                            "hyriv_id": rec["hyriv_id"],
+                            "area_km2": rec["area_km2"],
+                            "subtracted_km2": rec["subtracted_km2"],
+                            "upstream_reaches": rec["upstream_reaches"],
+                            "upstream_polygons": rec["upstream_polygons"],
+                            "snapped": cell is not None,
+                        },
+                    }
+                )
+
+
+def extract_streams_expanded(
+    dem: str,
+    stream_dst: str,
+    direction_dst: str,
+    contributing_area_dst: str,
+    min_area: float = 1e6,
+    min_length: float = 0,
+    inflow_dst: Union[str, None] = None,
+    **kwargs,
+) -> ExpandedFlowAccumulation:
+    """Extract streams and contributing area from a DEM that does not extend to the
+    edges of its watershed(s). See `ExpandedFlowAccumulation`.
+
+    Args:
+        dem (str): Digital Elevation Model raster in a projected spatial reference with
+        units of metres.
+        stream_dst (str): Output streams raster path.
+        direction_dst (str): Output flow direction raster path.
+        contributing_area_dst (str): Output contributing area raster path (km2).
+        min_area (float, optional): Minimum contributing area (m2) for streams.
+        Defaults to 1e6.
+        min_length (float, optional): Minimum stream length (m). Defaults to 0.
+        inflow_dst (Union[str, None], optional): Output GeoPackage of snapped inflow
+        points for review. Defaults to None.
+
+    kwargs:
+        Arguments for `ExpandedFlowAccumulation`
+
+    Returns:
+        ExpandedFlowAccumulation: Use to calculate other statistics on the streams
+    """
+    efa = ExpandedFlowAccumulation(dem, **kwargs)
+    efa.extract_streams(stream_dst, direction_dst, min_area, min_length)
+    efa.contributing_area(contributing_area_dst)
+
+    if inflow_dst is not None:
+        efa.save_inflows(inflow_dst)
+
+    return efa
+
 
 
 class WatershedIndex:
