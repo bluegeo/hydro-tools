@@ -2,22 +2,20 @@
 
 import os
 import shutil
+from logging import warning
 from typing import Union
 from urllib.request import Request, urlopen
 
-from logging import warning
-
 import fiona
 import numpy as np
-from pyproj import CRS, Transformer
 import rasterio
-from rasterio import features
 import shapely
+from pyproj import CRS, Transformer
+from rasterio import features
 from shapely.geometry import shape
 
 from hydrotools.config import CACHE_DIR
 from hydrotools.raster import Raster, warp
-
 
 # Canada's Medium Resolution DEM (30 m DTM), read remotely as a COG
 MRDEM_DTM = (
@@ -26,8 +24,7 @@ MRDEM_DTM = (
 )
 
 HYDROBASINS_URL = (
-    "https://data.hydrosheds.org/file/HydroBASINS/standard/"
-    "hybas_{region}_lev12_v1c.zip"
+    "https://data.hydrosheds.org/file/HydroBASINS/standard/hybas_{region}_lev12_v1c.zip"
 )
 
 # HydroBASINS regions covering Canada and the transboundary basins that drain into it
@@ -104,14 +101,12 @@ def valid_footprint(src: str, crs="EPSG:4326"):
     if not mask.any():
         raise ValueError(f"{src} does not contain any valid data")
 
-    footprint = shapely.union_all(
-        [
-            shape(geom)
-            for geom, _ in features.shapes(
-                mask.astype(np.uint8), mask=mask, transform=transform
-            )
-        ]
-    )
+    footprint = shapely.union_all([
+        shape(geom)
+        for geom, _ in features.shapes(
+            mask.astype(np.uint8), mask=mask, transform=transform
+        )
+    ])
 
     # Densify edges so the footprint follows curves when transformed
     bounds = footprint.bounds
@@ -270,8 +265,8 @@ def collect_elevation(
     bounds: tuple,
     cs: float,
     crs: str,
-    sources: Union[str, list] = MRDEM_DTM,
-    resample_method: Union[str, None] = None,
+    sources: str | list = MRDEM_DTM,
+    resample_method: str | None = None,
     as_cog: bool = True,
 ):
     """Collect elevation data (Canada's MRDEM by default) onto a grid
@@ -314,6 +309,56 @@ def collect_elevation(
         additional_args=REMOTE_WARP_ARGS,
         as_cog=as_cog,
     )
+
+
+def collect_contributing_elevation(
+    dem: str,
+    dst: str,
+    sources: str | list = MRDEM_DTM,
+    regions: tuple = HYDROBASINS_REGIONS,
+    as_cog: bool = True,
+):
+    """Expand a DEM to cover the area that may drain into it. Elevation is collected
+    (Canada's MRDEM by default) over the bounds of the HydroBASINS draining into the
+    DEM (see `upstream_basins`), on the DEM grid. The DEM takes priority where it has
+    valid data.
+
+    Note, the output is the rectangular extent of the contributing basins, and may
+    include area that does not drain into the DEM.
+
+    Args:
+        dem (str): Input DEM.
+        dst (str): Output raster.
+        sources (Union[str, list], optional): Elevation source(s) used outside the DEM
+        (see `collect_elevation`). Defaults to MRDEM.
+        regions (tuple, optional): HydroBASINS regions to search. Defaults to
+        `HYDROBASINS_REGIONS`.
+        as_cog (bool, optional): Output a COG. Defaults to True.
+    """
+    if isinstance(sources, str):
+        sources = [sources]
+
+    with rasterio.open(dem) as ds:
+        crs = ds.crs
+        csx, csy = ds.res
+        left, top = ds.bounds.left, ds.bounds.top
+    if csx != csy:
+        raise ValueError("The DEM must have square cells")
+
+    contributing = upstream_basins(valid_footprint(dem), regions=regions)
+    c_left, c_bottom, c_right, c_top = transform_geom(
+        contributing, "EPSG:4326", crs
+    ).bounds
+
+    # Snap outwards to the DEM grid so the DEM is not resampled
+    bounds = (
+        left + np.floor((c_left - left) / csx) * csx,
+        top - np.ceil((top - c_bottom) / csy) * csy,
+        left + np.ceil((c_right - left) / csx) * csx,
+        top - np.floor((top - c_top) / csy) * csy,
+    )
+
+    collect_elevation(dst, bounds, csx, crs.to_wkt(), sources + [dem], as_cog=as_cog)
 
 
 def line_crossings(line, footprint) -> list:
@@ -360,15 +405,11 @@ def _cell_areas(ds, window) -> np.ndarray:
     dlon = abs(np.radians(transform.a))
 
     return (
-        EARTH_RADIUS**2
-        * dlon
-        * np.abs(np.sin(lat + dlat / 2) - np.sin(lat - dlat / 2))
+        EARTH_RADIUS**2 * dlon * np.abs(np.sin(lat + dlat / 2) - np.sin(lat - dlat / 2))
     )
 
 
-def zonal_sums(
-    raster: str, geoms: dict, exclude=None, window_size: int = 2048
-) -> dict:
+def zonal_sums(raster: str, geoms: dict, exclude=None, window_size: int = 2048) -> dict:
     """Sum raster values multiplied by cell area within polygons, read in windows
 
     Args:
@@ -416,9 +457,7 @@ def zonal_sums(
                 )
                 if exclude is not None:
                     labels[
-                        features.geometry_mask(
-                            [exclude], shape, transform, invert=True
-                        )
+                        features.geometry_mask([exclude], shape, transform, invert=True)
                     ] = 0
 
                 a = ds.read(1, window=window, masked=True)
@@ -428,9 +467,7 @@ def zonal_sums(
 
                 cell_area = np.broadcast_to(_cell_areas(ds, window)[:, None], shape)
                 idx = labels[valid] - 1
-                sums += np.bincount(
-                    idx, (a.data[valid] * cell_area[valid]), len(keys)
-                )
+                sums += np.bincount(idx, (a.data[valid] * cell_area[valid]), len(keys))
                 areas += np.bincount(idx, cell_area[valid], len(keys))
 
     return {k: (sums[i], areas[i]) for i, k in enumerate(keys) if areas[i] > 0}
@@ -453,9 +490,7 @@ def sample_lines(raster: str, lines: dict) -> dict:
         nodata = ds.nodata
         for key, line in lines.items():
             line = transform_geom(line, "EPSG:4326", crs)
-            coords = shapely.get_coordinates(
-                shapely.segmentize(line, min(ds.res))
-            )
+            coords = shapely.get_coordinates(shapely.segmentize(line, min(ds.res)))
             values = np.array([v[0] for v in ds.sample(coords)], dtype="float64")
             valid = ~np.isnan(values)
             if nodata is not None:
@@ -598,26 +633,23 @@ class Inflows:
                 hybas, counts = np.unique(
                     self.reaches["hybas"][upstream], return_counts=True
                 )
-                total = self._hybas_counts[
-                    np.searchsorted(self._hybas_ids, hybas)
-                ]
+                total = self._hybas_counts[np.searchsorted(self._hybas_ids, hybas)]
                 full = hybas[counts == total]
                 partial = upstream[~np.isin(self.reaches["hybas"][upstream], full)]
 
-                self.entries.append(
-                    {
-                        "reach": k,
-                        "fraction": fraction,
-                        "point": self.crossing_geoms[int(self.reaches["id"][k])]
-                        .interpolate(fraction, normalized=True)
-                        .coords[0],
-                        "area_km2": max(area - subtracted, 0.0),
-                        "subtracted_km2": subtracted,
-                        "upstream": upstream,
-                        "polygons": full,
-                        "partial": partial,
-                    }
-                )
+                self.entries.append({
+                    "reach": k,
+                    "fraction": fraction,
+                    "point": self
+                    .crossing_geoms[int(self.reaches["id"][k])]
+                    .interpolate(fraction, normalized=True)
+                    .coords[0],
+                    "area_km2": max(area - subtracted, 0.0),
+                    "subtracted_km2": subtracted,
+                    "upstream": upstream,
+                    "polygons": full,
+                    "partial": partial,
+                })
 
     def __len__(self):
         return len(self.entries)
@@ -640,9 +672,10 @@ class Inflows:
             if not remaining:
                 break
             found = _fetch_features(hydrobasins_path(region), "HYBAS_ID", remaining)
-            out.update(
-                {i: (shape(f.geometry), f.properties["SUB_AREA"]) for i, f in found.items()}
-            )
+            out.update({
+                i: (shape(f.geometry), f.properties["SUB_AREA"])
+                for i, f in found.items()
+            })
             remaining -= set(found)
         return out
 
@@ -655,9 +688,9 @@ class Inflows:
                 continue
             ids = self.reaches["id"][sel]
             found = _fetch_features(path, "HYRIV_ID", ids.tolist())
-            out.update(
-                {int(k): shape(found[int(i)].geometry) for k, i in zip(sel, ids)}
-            )
+            out.update({
+                int(k): shape(found[int(i)].geometry) for k, i in zip(sel, ids)
+            })
         return out
 
     def mean(self, raster: str) -> np.ndarray:
