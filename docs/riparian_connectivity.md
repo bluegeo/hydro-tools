@@ -747,12 +747,12 @@ rc.calc_connectivity(
 
 | Dependency   | Purpose |
 |--------------|---------|
-| GRASS GIS    | `r.watershed`, `r.stream.extract`, `r.cost`, `r.flowaccumulation` |
+| GRASS GIS    | `r.watershed`, `r.stream.extract`, `r.cost` |
 | GDAL         | `gdaldem slope`, raster I/O |
 | dask         | Lazy chunked array computation |
 | scipy        | `griddata` interpolation |
 | scikit-learn | `BallTree` for nearest-neighbour queries |
-| numba        | JIT compilation for pixel-level algorithms |
+| numba        | JIT compilation for pixel-level algorithms and tiled flow accumulation |
 | numpy        | Array operations |
 
 ---

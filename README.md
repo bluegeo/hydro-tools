@@ -157,7 +157,7 @@ Runtime constants are centralized in `hydrotools.config` and can be modified at 
 | `TMP_DIR` | Temporary directory for intermediate files | `os.gettempdir()` or `$HYDROTOOLS_TMP_DIR` |
 | `GRASS_TMP` | Temporary directory for GRASS sessions | `os.gettempdir()` |
 | `GRASS_FLAGS` | Default GRASS command flags | `{"quiet": True}` |
-| `GDALWARP_ARGS` | GDAL warp arguments (LZW, tiled 512×512, BigTIFF) | See `hydrotools.config` |
+| `GDALWARP_ARGS` | GDAL warp arguments (ZSTD, tiled 512×512, BigTIFF), without a predictor; prefer `gtiff_args(dtype)` | See `hydrotools.config` |
 | `COG_ARGS` | Cloud-Optimized GeoTIFF output arguments | See `hydrotools.config` |
 
 ## Dependencies

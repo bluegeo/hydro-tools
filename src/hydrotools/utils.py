@@ -15,8 +15,9 @@ from scipy.ndimage import distance_transform_edt
 from grass.script import core as grass  # noqa
 from grass.pygrass.modules.shortcuts import raster as graster  # noqa
 from grass.script import array as garray  # noqa
+from grass.script import raster as graster_info  # noqa
 
-from hydrotools.config import TMP_DIR, GRASS_TMP, GRASS_FLAGS, COG_ARGS
+from hydrotools.config import TMP_DIR, GRASS_TMP, GRASS_FLAGS, COG_ARGS, COMPRESSION, predictor
 
 warnings.filterwarnings("ignore")
 
@@ -158,6 +159,15 @@ class GrassRunner(Session):
 
         grass.run_command(cmd, **kwargs)
 
+    @staticmethod
+    def _gdal_type(dataset: str, kwargs: dict) -> str:
+        """The GDAL type `r.out.gdal` will write `dataset` as: the requested
+        `type`, or the one GRASS maps its storage type to."""
+        if kwargs.get("type"):
+            return str(kwargs["type"])
+        datatype = graster_info.raster_info(dataset)["datatype"]
+        return {"CELL": "Int32", "FCELL": "Float32", "DCELL": "Float64"}[datatype]
+
     def save_raster(self, dataset: str, out_path: str, **kwargs):
         """Save a dataset in the GRASS env to a GeoTiff
 
@@ -177,7 +187,8 @@ class GrassRunner(Session):
                 "createopt": [
                     "BIGTIFF=YES",
                     "TILED=YES",
-                    "COMPRESS=LZW",
+                    f"COMPRESS={COMPRESSION}",
+                    f"PREDICTOR={predictor(self._gdal_type(dataset, kwargs))}",
                     "BLOCKXSIZE=512",
                     "BLOCKYSIZE=512",
                 ],
