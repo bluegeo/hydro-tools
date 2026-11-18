@@ -17,7 +17,7 @@ from numba import njit
 import fiona
 from fiona.crs import from_string
 
-from hydrotools.config import TMP_DIR
+from hydrotools.config import COMPRESSION, TMP_DIR, predictor
 from hydrotools.data import HYDROBASINS_REGIONS, Inflows, valid_footprint
 from hydrotools.flow import TiledAccumulation, extract_streams as extract_stream_cells
 from hydrotools.utils import (
@@ -209,7 +209,8 @@ def breach_depressions(
                         tiled=True,
                         blockxsize=512,
                         blockysize=512,
-                        compress="LZW",
+                        compress=COMPRESSION,
+                        predictor=predictor(profile["dtype"]),
                         bigtiff="YES",
                     )
                     with rasterio.open(chunk_src, "w", **profile) as chunk:

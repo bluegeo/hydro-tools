@@ -17,7 +17,7 @@ from hydrotools.raster import (
     to_raster,
     warp_like,
 )
-from hydrotools.config import CHUNKS, GDALWARP_ARGS
+from hydrotools.config import CHUNKS, gtiff_args
 from hydrotools.interpolate import PointInterpolator
 
 
@@ -46,7 +46,7 @@ def slope(
             str(scale),
             dem,
             tmp_dst,
-        ] + GDALWARP_ARGS
+        ] + gtiff_args("Float32")
 
         if units.lower() == "percent":
             cmd += ["-p"]
@@ -73,7 +73,7 @@ def aspect(
             "-compute_edges",
             dem,
             tmp_dst,
-        ] + GDALWARP_ARGS
+        ] + gtiff_args("Float32")
 
         run(cmd, check=True)
 
@@ -121,7 +121,7 @@ def terrain_ruggedness_index(
             "-compute_edges",
             dem,
             tmp_dst,
-        ] + GDALWARP_ARGS
+        ] + gtiff_args("Float32")
 
         run(cmd, check=True)
 

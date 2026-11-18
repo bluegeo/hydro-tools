@@ -21,7 +21,7 @@ from hydrotools.utils import (
     transform_bounds,
 )
 from hydrotools.utils import GrassRunner, TempRasterFile
-from hydrotools.config import CHUNKS, TMP_DIR, GDALWARP_ARGS
+from hydrotools.config import CHUNKS, TMP_DIR, COMPRESSION, gtiff_args, predictor
 
 
 def warp(
@@ -73,7 +73,7 @@ def warp(
             "-ot",
             "Byte" if dtype == "uint8" else dtype,
         ]
-        + GDALWARP_ARGS
+        + gtiff_args(dtype)
         + additional_args
         + source
     )
@@ -485,7 +485,8 @@ class Raster:
             nodata=nodata,
             # -co
             tiled=True,
-            compress="LZW",
+            compress=COMPRESSION,
+            predictor=predictor(dtype),
             blockxsize=512,
             blockysize=512,
             bigtiff=True,
@@ -1166,7 +1167,9 @@ def vector_to_raster(
                     "-co",
                     "TILED=YES",
                     "-co",
-                    "COMPRESS=LZW",
+                    f"COMPRESS={COMPRESSION}",
+                    "-co",
+                    f"PREDICTOR={predictor(ot[1])}",
                     "-co",
                     "BIGTIFF=YES",
                 ]
